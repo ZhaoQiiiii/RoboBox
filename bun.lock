@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "diff-toolbox",
+      "name": "robobox",
       "dependencies": {
         "@mkkellogg/gaussian-splats-3d": "^0.4.7",
         "@react-three/drei": "^10.0.0",
