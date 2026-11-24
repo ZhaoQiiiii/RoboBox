@@ -1,0 +1,27 @@
+gear indicator	{"object": "Tap Position Indicator"}
+left insulation bushing	{"object": "Insulating Bushing"}
+oil tank	{"object": "Oil Conservator"}
+insulation bushing	{"object": "Insulating Bushing"}
+信号柜	{"object": "Signal Cabinet"}
+transformer	{"object": "Transformer"}
+signal cabinet	{"object": "Signal Cabinet"}
+on-load tap changer	{"object": "On-load tap-changer"}
+pressure relief valve	{"object": "Pressure Relief Indicator"}
+gas density relay	{"object": "Gas Density Relay"}
+top gas density relay	{"object": "Gas Density Relay"}
+current object	{"object": "no similar object"}
+绝缘套管	{"object": "Insulating Bushing"}
+油位计	{"object": "Oil Level Indicator"}
+to the 绝缘套管	{"object": "Insulating Bushing"}
+oil level gauge	{"object": "Oil Level Indicator"}
+insulation sleeve	{"object": "Insulating Bushing"}
+breather	{"object": "Breather"}
+to the 油位计	{"object": "Oil Level Indicator"}
+to the 信号柜	{"object": "Signal Control Cabinet"}
+transformer temperature controller	{"object": "Transformer Temperature Controller"}
+有载分接开关	{"object": "On-Load Tap-Changer"}
+to the 有载分接开关	{"object": "On-Load Tap-Changer"}
+to the insulation sleeve	{"object": "Insulating Bushing"}
+temperature controller of the transformer in front	{"object": "Transformer Temperature Controller"}
+gas density monitor	{"object": "Gas Density Monitor"}
+向前移动2米	no similar object
