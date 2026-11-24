@@ -1255,7 +1255,9 @@ function logToFile(scope: string, event: string, detail?: unknown): void {
 // ---- Vite plugin ----
 
 export function apiPlugin(): Plugin {
-  const PROJECT_ROOT = join(import.meta.dirname, "..");
+  // tools/3D-Toolbox/backend → Robobox root; scenes/, logs/ and
+  // bbox_result.json stay outside the tools directory.
+  const PROJECT_ROOT = join(import.meta.dirname, "..", "..", "..");
   // Fixed per-scene data root. Every initial data bucket lives under
   // scenes/<scene>/: cloud/splat assets (flat), bboxes/, scene_graph_saved/
   // and scene_graph_exported/. Runtime path switching was removed on

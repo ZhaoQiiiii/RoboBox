@@ -1,9 +1,9 @@
 # Build / vite
-/frontend/dist/
+/tools/3D-Toolbox/frontend/dist/
 
 # Node
 node_modules/
-/package-lock.json
+/tools/3D-Toolbox/package-lock.json
 
 # Logs
 logs/

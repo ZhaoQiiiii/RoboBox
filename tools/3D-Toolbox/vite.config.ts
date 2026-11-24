@@ -4,7 +4,7 @@ import { resolve } from "path";
 import { apiPlugin } from "./backend/api-plugin";
 
 export default defineConfig({
-  root: "frontend",
+  root: resolve(__dirname, "frontend"),
   plugins: [react(), apiPlugin()],
   build: {
     outDir: resolve(__dirname, "frontend", "dist"),

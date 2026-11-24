@@ -1,0 +1,17 @@
+render:
+  # Basic Params
+  width: 640              # 图像宽度 (像素)
+  height: 480             # 图像高度 (像素)
+  # publish_rate: 10.0      # 图像发布频率 (Hz)
+  publish_rate: 15.0      # 图像发布频率 (Hz)
+
+  # Intrinsic Params
+  # z1-mini
+  cx: 320.0               # 主点 X 坐标 (像素)
+  cy: 240.0               # 主点 Y 坐标 (像素)
+  fx: 618.6               # X 轴焦距 (像素)
+  fy: 618.6               # Y 轴焦距 (像素)
+  # cx: 320.0
+  # cy: 240.0
+  # fx: 464.0
+  # fy: 464.0
