@@ -34,6 +34,7 @@ LOGGER = logging.getLogger("gsplat_renderer_tcp")
 
 ACCEPT_TIMEOUT_SECONDS = 0.5
 THREAD_JOIN_SECONDS = 3.0
+STATUS_INTERVAL_SECONDS = 10.0
 
 
 class TcpRenderer:
@@ -58,6 +59,7 @@ class TcpRenderer:
         self.pose_connection_id = 0
         self.latest_pose = None  # type: Optional[PoseSample]
         self.rendered_pose = None  # type: Optional[tuple]
+        self.pose_messages = 0
 
         self.frame_lock = threading.Lock()
         self.frame_client = None  # type: Optional[socket.socket]
@@ -105,6 +107,7 @@ class TcpRenderer:
                                  name="frame-accept", daemon=True),
                 threading.Thread(target=self.send_frames, name="frame-send", daemon=True),
                 threading.Thread(target=self.render_loop, name="render", daemon=True),
+                threading.Thread(target=self.report_status, name="status", daemon=True),
             ]
             for thread in self.threads:
                 thread.start()
@@ -223,6 +226,7 @@ class TcpRenderer:
                     if self.pose_client is not client:
                         break
                     self.latest_pose = pose
+                    self.pose_messages += 1
         except EOFError:
             LOGGER.info("位姿连接 %d 断开", connection_id)
         except ValueError as error:
@@ -368,6 +372,25 @@ class TcpRenderer:
                         self.pending_frame = None
                         self.pending_event.clear()
                 self.close_socket(client)
+
+    # 周期状态
+    def report_status(self) -> None:
+        last_frames = 0
+        last_poses = 0
+        while not self.stop_event.wait(STATUS_INTERVAL_SECONDS):
+            with self.frame_lock:
+                frames = self.next_frame_serial
+                image_connected = self.frame_client is not None
+            with self.state_lock:
+                poses = self.pose_messages
+                pose_connected = self.pose_client is not None
+            LOGGER.info(
+                "状态：渲染 %.1f 帧/秒，位姿 %.1f 条/秒，位姿连接 %s，图像连接 %s",
+                (frames - last_frames) / STATUS_INTERVAL_SECONDS,
+                (poses - last_poses) / STATUS_INTERVAL_SECONDS,
+                "已建立" if pose_connected else "无",
+                "已建立" if image_connected else "无")
+            last_frames, last_poses = frames, poses
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:

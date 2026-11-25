@@ -27,6 +27,7 @@ CAMERA_NAMES = ["camera0", "camera1", "camera2", "camera3"]
 RECONNECT_INTERVAL_SECONDS = 1.0
 CONNECT_TIMEOUT_SECONDS = 3.0
 THREAD_JOIN_SECONDS = 3.0
+STATUS_INTERVAL_SECONDS = 10.0
 
 CV_BRIDGE = CvBridge()
 
@@ -146,6 +147,8 @@ class RosBridge:
 
         self.metadata_lock = threading.Lock()
         self.camera_info_count = 0
+        self.odom_messages = 0
+        self.frames_published = 0
 
         self.image_publishers = {
             "rgb_raw": rospy.Publisher(
@@ -182,6 +185,7 @@ class RosBridge:
                 threading.Thread(target=self.connect_frame_connection,
                                  name="frame-receive", daemon=True),
                 threading.Thread(target=self.publish_loop, name="frame-publish", daemon=True),
+                threading.Thread(target=self.report_status, name="status", daemon=True),
             ]
             for thread in self.threads:
                 thread.start()
@@ -249,6 +253,7 @@ class RosBridge:
     def odom_callback(self, message: Odometry) -> None:
         with self.pose_lock:
             self.pose_slot = message
+            self.odom_messages += 1
         self.pose_event.set()
 
     def connect_pose_connection(self) -> None:
@@ -372,6 +377,22 @@ class RosBridge:
         messages = frame_to_messages(header, payload)
         for name, publisher in self.image_publishers.items():
             publisher.publish(messages[name])
+        self.frames_published += 1
+
+    # 周期状态
+    def report_status(self) -> None:
+        last_frames = 0
+        last_odom = 0
+        while not self.stop_event.wait(STATUS_INTERVAL_SECONDS):
+            frames = self.frames_published
+            odom = self.odom_messages
+            rospy.loginfo(
+                "bridge 状态：发布 %.1f 帧/秒，odom %.1f 条/秒，位姿连接 %s，图像连接 %s",
+                (frames - last_frames) / STATUS_INTERVAL_SECONDS,
+                (odom - last_odom) / STATUS_INTERVAL_SECONDS,
+                "已建立" if self.pose_client is not None else "无",
+                "已建立" if self.frame_client is not None else "无")
+            last_frames, last_odom = frames, odom
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
