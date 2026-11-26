@@ -1,22 +1,3 @@
-# GsplatRender 独立镜像：同一容器内运行 TCP 3DGS renderer + ROS 1 bridge。
-#
-# 构建（在 tools/GsplatRender 目录执行，context 必须是本目录）：
-#   docker build -f docker/Dockerfile -t gsplat-render:noetic .
-#
-# 运行（需要宿主 NVIDIA 驱动 + nvidia-container-toolkit，以及可达的 ROS master）：
-#   docker run --gpus all --net=host \
-#     -v /path/to/scene.ply:/data/scene.ply:ro \
-#     gsplat-render:noetic /data/scene.ply
-#
-# 第一个参数是 PLY 路径，其余参数原样传给 renderer。云台模式默认开启：
-#   gsplat-render:noetic /data/scene.ply
-#
-# gsplat 从源码编译，构建时间主要在这里；只要目标机器架构时可加速：
-#   --build-arg TORCH_CUDA_ARCH_LIST=8.6
-#
-# 依赖版本与 docker/Dockerfile.base 保持一致：torch 2.7.0+cu128、gsplat 1.5.3
-# 源码编译、numpy 1.26.4、ROS Noetic + cv_bridge。
-
 # =====================================================================
 # Stage 1: builder —— 编译 gsplat，产出一个可整体复制的 Python 3.10 venv
 # =====================================================================
@@ -94,6 +75,8 @@ print('renderer deps ok:', torch_version, 'numpy', numpy_version)"
 # Stage 2: runtime —— ROS Noetic + Python 3.8 bridge + 复制 venv
 # =====================================================================
 FROM nvidia/cuda:12.8.1-runtime-ubuntu20.04 AS runtime
+
+LABEL maintainer="iinnoovo123@gmail.com"
 
 ARG HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy
 ARG UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn
