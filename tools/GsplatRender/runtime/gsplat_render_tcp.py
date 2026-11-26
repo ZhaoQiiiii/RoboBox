@@ -30,11 +30,11 @@ PoseSample = namedtuple(
     "PoseSample", "connection_id seq stamp_sec stamp_nsec position orientation")
 FrameSample = namedtuple("FrameSample", "serial header payload")
 
-LOGGER = logging.getLogger("gsplat_renderer_tcp")
+LOGGER = logging.getLogger("gsplat_render_tcp")
 
 ACCEPT_TIMEOUT_SECONDS = 0.5
 THREAD_JOIN_SECONDS = 3.0
-STATUS_INTERVAL_SECONDS = 10.0
+STATUS_INTERVAL_SECONDS = 5.0
 
 
 class TcpRenderer:
@@ -59,7 +59,6 @@ class TcpRenderer:
         self.pose_connection_id = 0
         self.latest_pose = None  # type: Optional[PoseSample]
         self.rendered_pose = None  # type: Optional[tuple]
-        self.pose_messages = 0
 
         self.frame_lock = threading.Lock()
         self.frame_client = None  # type: Optional[socket.socket]
@@ -226,7 +225,6 @@ class TcpRenderer:
                     if self.pose_client is not client:
                         break
                     self.latest_pose = pose
-                    self.pose_messages += 1
         except EOFError:
             LOGGER.info("位姿连接 %d 断开", connection_id)
         except ValueError as error:
@@ -376,28 +374,23 @@ class TcpRenderer:
     # 周期状态
     def report_status(self) -> None:
         last_frames = 0
-        last_poses = 0
         while not self.stop_event.wait(STATUS_INTERVAL_SECONDS):
             with self.frame_lock:
                 frames = self.next_frame_serial
-                image_connected = self.frame_client is not None
-            with self.state_lock:
-                poses = self.pose_messages
-                pose_connected = self.pose_client is not None
             LOGGER.info(
-                "状态：渲染 %.1f 帧/秒，位姿 %.1f 条/秒，位姿连接 %s，图像连接 %s",
+                "[render] %d x %d, %.1f fps, seq=%d",
+                self.width,
+                self.height,
                 (frames - last_frames) / STATUS_INTERVAL_SECONDS,
-                (poses - last_poses) / STATUS_INTERVAL_SECONDS,
-                "已建立" if pose_connected else "无",
-                "已建立" if image_connected else "无")
-            last_frames, last_poses = frames, poses
+                frames)
+            last_frames = frames
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TCP 3DGS Renderer")
     parser.add_argument("--ply_file", type=Path, default=Path("3dgs.ply"))
     parser.add_argument("--params_file", type=Path,
-                        default=Path(__file__).resolve().parent.parent / "config" / "renderer_params.yaml")
+                        default=Path(__file__).resolve().parent.parent / "config" / "params.yaml")
     parser.add_argument("--enable_gimbal", action="store_true", default=False)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--pose-port", type=int, default=19080)

@@ -1,6 +1,5 @@
 """非 ROS 的 3DGS 渲染核心。
 
-计算逻辑复制自同目录 ``gsplat_renderer_ros1.py``（该文件保持字节级不变）：
 PLY 加载、camera0 view matrix、``RGB+ED`` rasterization 以及 RGB/depth 编码。
 """
 
@@ -27,7 +26,7 @@ class GsplatCore:
         self.enable_gimbal = enable_gimbal
         self.device = str(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-        # 渲染参数默认值与原实现一致，随后被 renderer_params.yaml 覆盖。
+        # 渲染参数默认值与原实现一致，随后被 params.yaml 覆盖。
         self.width = 640
         self.height = 480
         self.publish_rate = 15.0

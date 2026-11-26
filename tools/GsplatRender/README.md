@@ -1,71 +1,72 @@
 # GsplatRender
 
-基于 3D Gaussian Splatting 的相机仿真。默认链路把渲染与 ROS 解耦成两个进程：纯 TCP
-renderer 不依赖 ROS，ROS bridge 负责恢复原有话题；旧的 ROS 单进程入口保留，可随时回退。
+基于 3D Gaussian Splatting 的相机仿真。TCP renderer 负责 GPU 渲染，ROS bridge 把
+RGB/depth 帧转成 ROS 1 话题；两者通过 TCP 解耦，也可以放在同一个容器里运行。
 
 ## 目录结构
 
 ```
-config/renderer_params.yaml       # 渲染分辨率、发布频率、相机内参
-renderer/gsplat_renderer_ros1.py  # 旧 ROS 1 单进程节点（保持兼容）
-renderer/tcp_protocol.py          # TCP 消息封装与校验（无 ROS/GPU 依赖）
-renderer/gsplat_core.py           # 非 ROS 渲染核心
-renderer/gsplat_renderer_tcp.py   # TCP renderer 服务端
-renderer/gsplat_ros_bridge.py     # TCP → ROS 1 bridge
-scripts/run.sh                    # 旧 ROS 入口
-scripts/run_tcp.sh                # TCP renderer 入口
-scripts/run_bridge.sh             # ROS bridge 入口
-tests/                            # 协议、渲染核心、运行时与 bridge 测试
+config/params.yaml             # 渲染分辨率、发布频率、相机内参
+runtime/tcp_protocol.py        # TCP 消息封装与校验（无 ROS/GPU 依赖）
+runtime/gsplat_core.py         # 非 ROS 渲染核心
+runtime/gsplat_render_tcp.py   # TCP renderer 服务端
+runtime/gsplat_ros_bridge.py   # TCP → ROS 1 bridge
+scripts/build.sh               # 构建容器镜像（只需一次）
+scripts/run.sh                 # 运行容器（renderer + bridge）
+scripts/stop.sh                # 停止并删除容器
+docker/                        # 容器 Dockerfile 与 entrypoint
 ```
 
 ## 依赖
 
 - TCP renderer：Python ≥ 3.8，`requirements.txt` 中的 torch/gsplat/numpy/scipy/plyfile/PyYAML；不需要 ROS。
-- ROS bridge：ROS 1（`rospy`、`cv_bridge`、`sensor_msgs`、`nav_msgs`、`std_msgs`）；不依赖 torch/gsplat。
+- ROS bridge：ROS 1（`rospy`、`cv_bridge`、`sensor_msgs`、`nav_msgs`）；不依赖 torch/gsplat。
 - 已验证环境：ROS Noetic、torch `2.7.0+cu128`、gsplat `1.5.3`、numpy `1.26.4`、scipy `1.15.3`。
 
 ## 运行
 
-主链路默认使用全 TCP：
+推荐用容器。镜像只提供依赖，`scripts/run.sh` 始终把宿主 `runtime/`、`config/` 和
+`docker/entrypoint.sh` 挂进容器，所以镜像只需要构建一次：
 
 ```bash
-bash scripts/main.sh                         # 默认 GSPLAT_TRANSPORT=tcp
-GSPLAT_TRANSPORT=ros1 bash scripts/main.sh   # 回退旧 ROS 单进程入口
+bash scripts/build.sh
+bash scripts/run.sh --detach /path/to/scene.ply
+docker logs -f gsplat-render
+bash scripts/stop.sh
 ```
 
-TCP 模式下 `scripts/main.sh` 启动两个独立进程，日志分别为 `gsplat_renderer_tcp.log`
-和 `gsplat_bridge.log`。也可以手工分别启动：
+容器内由 `docker/entrypoint.sh` 同时启动 renderer 和 bridge，云台模式默认开启；
+bridge 需要外部可达的 ROS master。修改 `runtime/`、`config/` 或 `docker/entrypoint.sh` 后：
+
+```bash
+docker restart gsplat-render
+```
+
+不需要重建镜像；只有改 `docker/Dockerfile` 或依赖时才重新执行 `scripts/build.sh`。
+
+已安装依赖时也可以手工启动两个进程：
 
 ```bash
 # 终端 1：TCP renderer，默认监听 127.0.0.1:19080（位姿）与 19081（图像）
-bash runtime/RoboBox/tools/GsplatRender/scripts/run_tcp.sh /path/to/scene.ply --enable_gimbal
+python3 runtime/gsplat_render_tcp.py --ply_file /path/to/scene.ply --enable_gimbal
 
 # 终端 2：ROS bridge，连接上述端口并订阅 /super/sim/lidar_slam/odom
-bash runtime/RoboBox/tools/GsplatRender/scripts/run_bridge.sh
+source /opt/ros/noetic/setup.bash
+python3 runtime/gsplat_ros_bridge.py
 ```
 
 | 参数/环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `GSPLAT_TRANSPORT` | `tcp` | `tcp` 双进程或 `ros1` 旧单进程 |
-| `GSPLAT_POSE_PORT` | 19080 | 位姿连接端口（bridge → renderer） |
-| `GSPLAT_FRAME_PORT` | 19081 | 图像连接端口（renderer → bridge） |
-| `--host` | `127.0.0.1` | 首版仅同机部署 |
+| `GSPLAT_POSE_PORT` / `GSPLAT_FRAME_PORT` | 19080 / 19081 | 容器 entrypoint 的端口，分别传给 `--pose-port` / `--frame-port` |
+| `--host` | `127.0.0.1` | renderer 绑定地址，也是 bridge 连接地址 |
 | `--ply_file` | `3dgs.ply` | 3DGS 场景 PLY |
-| `--params_file` | `config/renderer_params.yaml` | 渲染参数与内参 |
-| `--enable_gimbal` | 关闭 | 只使用 yaw，忽略 roll/pitch |
+| `--params_file` | `config/params.yaml` | 渲染参数与内参 |
+| `--enable_gimbal` | 关闭（容器内固定开启） | 只使用 yaw，忽略 roll/pitch |
 | `--odom-topic` | `/super/sim/lidar_slam/odom` | bridge 订阅的位姿话题 |
 
 连接行为：bridge 对位姿和图像连接分别自动重连，间隔 1 秒；启动顺序任意。renderer
 重启后 bridge 重新获取内参，不补发断开期间的旧帧；每种连接只接受一个客户端。TCP
 传输原始 RGB/depth，不做有损压缩；640×480、15 Hz 时有效载荷约 23.04 MB/s。
-
-旧 ROS 入口保持原行为，也可单独运行：
-
-```bash
-./scripts/run.sh /path/to/scene.ply --enable_gimbal
-```
-
-两个模式使用同名 topics，不能同时运行，否则会向 `/gsplat_render/*` 重复发布。
 
 ## 订阅
 
@@ -88,18 +89,12 @@ bash runtime/RoboBox/tools/GsplatRender/scripts/run_bridge.sh
 
 所有图像使用 odometry 的源时间戳与 `frame_id="camera"`。
 
-## 测试
+## 日志
 
-```bash
-# 协议与运行时：普通 Python 环境即可
-python3 -m unittest discover -s runtime/RoboBox/tools/GsplatRender/tests -p 'test_tcp_*.py' -v
-
-# 渲染核心：需要 torch/gsplat
-python3 -m unittest discover -s runtime/RoboBox/tools/GsplatRender/tests -p test_gsplat_core.py -v
-
-# bridge：需要已配置 ROS 1 的环境
-python3 -m unittest discover -s runtime/RoboBox/tools/GsplatRender/tests -p test_ros_bridge.py -v
-```
+- renderer：连接建立/断开时打印；运行中每 5 秒一行
+  `[INFO] [render] 640 x 480, 15.0 fps, seq=<累计图像数>`。
+- bridge：静默运行，只在连接建立时打印
+  `[INFO] <时间戳>: bridge 位姿连接已建立` / `bridge 图像连接已建立`。
 
 ## 已知限制
 
