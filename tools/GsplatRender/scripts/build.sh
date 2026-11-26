@@ -91,7 +91,7 @@ echo "上下文: $ROOT"
 [ -n "${TORCH_CUDA_ARCH_LIST:-}" ] && echo "GPU 架构: $TORCH_CUDA_ARCH_LIST"
 
 # BuildKit 默认在独立网络命名空间里构建，127.0.0.1 代理只有配合 --network host
-# 才能指向宿主；与 scripts/setup.sh image 的做法一致。
+# 才能指向宿主；与 scripts/build_docker.sh image 的做法一致。
 docker build \
     --network host \
     -f "$ROOT/docker/Dockerfile" \
