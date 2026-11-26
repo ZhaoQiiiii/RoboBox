@@ -250,7 +250,7 @@ export function parseBoxes(data: any): BBoxItem[] {
 }
 
 /**
- * Copy output in the BBOX_PRESETS format consumed by VLA_Diff's orbit planner
+ * Copy output in the BBOX_PRESETS format consumed by the orbit planner
  * (orbit_planner_scene_graph7.py): the full Python dict with one entry per
  * box. Associated boxes are keyed by their object id; unassociated boxes fall
  * back to the numeric part of an "object_N" label (list index otherwise). All

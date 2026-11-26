@@ -1,5 +1,5 @@
 /**
- * Vite plugin that adds every HTTP endpoint used by Robobox (dual mode).
+ * Vite plugin that adds every HTTP endpoint used by RoboKit (dual mode).
  *
  * ── Scene layout ──────────────────────────────────────────────────────
  * All initial data is bucketed per scene under scenes/<scene>/:
@@ -1255,7 +1255,7 @@ function logToFile(scope: string, event: string, detail?: unknown): void {
 // ---- Vite plugin ----
 
 export function apiPlugin(): Plugin {
-  // tools/3D-Toolbox/backend → Robobox root; scenes/, logs/ and
+  // tools/3D-Toolbox/backend → RoboKit root; scenes/, logs/ and
   // bbox_result.json stay outside the tools directory.
   const PROJECT_ROOT = join(import.meta.dirname, "..", "..", "..");
   // Fixed per-scene data root. Every initial data bucket lives under
@@ -1280,7 +1280,7 @@ export function apiPlugin(): Plugin {
   logToFile("server", "dev server starting", { scenesRoot: SCENES_ROOT });
 
   return {
-    name: "robobox-api",
+    name: "robokit-api",
     configureServer(server: ViteDevServer) {
       // ---- BBox mode: list + serve scene assets, persist boxes ----
 
