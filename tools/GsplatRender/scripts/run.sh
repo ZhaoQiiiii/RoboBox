@@ -18,7 +18,7 @@
 # 改完重跑本脚本或 docker restart gsplat-render 即生效，不需要重建镜像。
 #
 # 环境变量:
-#   IMAGE          镜像名，默认 gsplat-render:noetic
+#   IMAGE          镜像名，默认 robokit:latest
 #   ROS_MASTER_URI 设置时透传给容器；否则用容器默认 http://localhost:11311
 #
 # 示例:
@@ -30,7 +30,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${IMAGE:-gsplat-render:noetic}"
+IMAGE="${IMAGE:-robokit:latest}"
 NAME="${NAME:-gsplat-render}"
 HOST="127.0.0.1"
 POSE_PORT="19080"
@@ -181,7 +181,7 @@ DOCKER_ARGS+=(
     -v "$ROOT/docker/entrypoint.sh:/opt/gsplat-render/docker/entrypoint.sh:ro"
 )
 
-DOCKER_ARGS+=("$IMAGE" /data/scene.ply)
+DOCKER_ARGS+=("$IMAGE" gsplat /data/scene.ply)
 if [ "${#EXTRA[@]}" -gt 0 ]; then
     DOCKER_ARGS+=("${EXTRA[@]}")
 fi

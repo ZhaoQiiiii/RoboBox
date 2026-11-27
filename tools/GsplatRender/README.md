@@ -14,7 +14,7 @@ runtime/gsplat_ros_bridge.py   # TCP → ROS 1 bridge
 scripts/build.sh               # 构建容器镜像（只需一次）
 scripts/run.sh                 # 运行容器（renderer + bridge）
 scripts/stop.sh                # 停止并删除容器
-docker/                        # 容器 Dockerfile 与 entrypoint
+docker/entrypoint.sh           # 容器入口；Dockerfile 已合并到 runtime/RoboKit/docker/Dockerfile
 ```
 
 ## 依赖
@@ -35,6 +35,12 @@ docker logs -f gsplat-render
 bash scripts/stop.sh
 ```
 
+`scripts/build.sh` 现在委托 `runtime/RoboKit/docker/build.sh`；Dockerfile 已合并到
+`runtime/RoboKit/docker/Dockerfile`，统一构建镜像 `robokit:latest`（同时包含 LidarRender）。
+`run.sh` / `stop.sh` 的容器名 `gsplat-render` 保持不变，镜像名默认改为 `robokit:latest`。
+主仓库 `scripts/run.sh` 使用 `runtime/RoboKit/docker/run.sh` 把两个工具放在同一个
+`robokit` 容器里；本目录的脚本用于单独调试 GsplatRender。
+
 容器内由 `docker/entrypoint.sh` 同时启动 renderer 和 bridge，云台模式默认开启；
 bridge 需要外部可达的 ROS master。修改 `runtime/`、`config/` 或 `docker/entrypoint.sh` 后：
 
@@ -42,7 +48,7 @@ bridge 需要外部可达的 ROS master。修改 `runtime/`、`config/` 或 `doc
 docker restart gsplat-render
 ```
 
-不需要重建镜像；只有改 `docker/Dockerfile` 或依赖时才重新执行 `scripts/build.sh`。
+不需要重建镜像；只有改 `runtime/RoboKit/docker/Dockerfile` 或依赖时才重新执行 `scripts/build.sh`。
 
 已安装依赖时也可以手工启动两个进程：
 
