@@ -20,6 +20,13 @@ scenes/*
 !scenes/.gitkeep
 /plans
 
+# Python
+__pycache__/
+*.py[cod]
+
+# CMake / CTest
+Testing/
+
 # Editors / misc
 .DS_Store
 Thumbs.db
