@@ -1,0 +1,13 @@
+is_360lidar: true
+polar_resolution: 0.2
+downsample_res: 0.1
+vertical_fov: 105.0
+sensing_blind: 0.1
+sensing_horizon: 10.0
+sensing_rate: 10
+lidar_type: 3
+depth_image_en: false
+inf_point_en: false
+print_time_consumption: false
+pcd_name: ""
+pcd_path: ""
