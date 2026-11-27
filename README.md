@@ -19,6 +19,17 @@ RoboKit 把三种彼此独立却又共用同一套场景资产的工作流整合
 - **轨迹可视化**：只读浏览 `scenes/<scene>/trajectories/` 下的任意 `*.json` 轨迹文件（无需特定目录名），以及 worldmodel `flight_*` / `step_*` 目录；查看 `prompt.json` 等结果与 `anchor.jpg` / `video.mp4` 资产。
 - **内置后端 API**：Vite 插件直接在开发服务器中提供场景 / 包围框 / 场景图 / 轨迹相关 REST 接口。
 
+## 🧰 工具
+
+`tools/` 下除 Web 编辑器外还有两个独立工具，统一使用 `docker/build.sh` 构建的
+`robokit:latest` 镜像：
+
+- `tools/GsplatRender`：3DGS 相机仿真（TCP renderer + ROS bridge）。
+- `tools/LidarRender`：PCD 激光雷达仿真（TCP renderer + ROS bridge）。
+
+主链路用 `docker/run.sh` 把两个工具启动在同一个 `robokit` 容器中；也可以分别用各自的
+`scripts/run.sh` 单独启动调试。
+
 ## 📋 环境要求
 
 - Bun（本仓库的规范包管理器与测试运行器，见 `bun.lock`）
