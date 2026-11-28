@@ -1,32 +1,39 @@
-# Build / vite
-/tools/3D-Toolbox/frontend/dist/
-
-# Node
+# ==================== Web 编辑器（tools/3D-Toolbox） ====================
+# 依赖与构建产物
 node_modules/
+/tools/3D-Toolbox/frontend/dist/
 /tools/3D-Toolbox/package-lock.json
 
-# Logs
+# ==================== 传感器工具构建 / 测试产物 ====================
+# C++ CMake / CTest
+/tools/*/build/
+Testing/
+__pycache__/
+*.py[cod]
+# LidarRender 测试生成的点云
+/tools/LidarRender/tests/data/
+
+# ==================== 运行时数据 ====================
 logs/
 *.log
+/bbox_result.json
+/.runtime-state.json
+# 场景数据默认不入库，只保留目录占位
+scenes/*
+!scenes/.gitkeep
+# Web 编辑器默认场景目录
+/tools/3D-Toolbox/scenes/*
+!/tools/3D-Toolbox/scenes/.gitkeep
 
-# Assets / secrets
+# ==================== 本地配置 / 密钥 ====================
 .env
 .env.*
 !.env.example
 *.local
-/bbox_result.json
-/.runtime-state.json
-scenes/*
-!scenes/.gitkeep
+
+# ==================== 本地文档 ====================
 /plans
 
-# Python
-__pycache__/
-*.py[cod]
-
-# CMake / CTest
-Testing/
-
-# Editors / misc
+# ==================== 编辑器 / 系统 ====================
 .DS_Store
 Thumbs.db
