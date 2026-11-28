@@ -1255,15 +1255,16 @@ function logToFile(scope: string, event: string, detail?: unknown): void {
 // ---- Vite plugin ----
 
 export function apiPlugin(): Plugin {
-  // tools/3D-Toolbox/backend → RoboKit root; scenes/, logs/ and
-  // bbox_result.json stay outside the tools directory.
+  // logs/ and bbox_result.json stay at the RoboKit root; scene data lives
+  // inside the tool so the web editor is self-contained.
   const PROJECT_ROOT = join(import.meta.dirname, "..", "..", "..");
-  // Fixed per-scene data root. Every initial data bucket lives under
-  // scenes/<scene>/: cloud/splat assets (flat), bboxes/, scene_graph_saved/
-  // and scene_graph_exported/. Runtime path switching was removed on
-  // purpose — every asset the tool visualizes lives in its designated
-  // folder under the project.
-  const SCENES_ROOT = join(PROJECT_ROOT, "scenes");
+  const APP_ROOT = join(import.meta.dirname, "..");
+  // Fixed per-scene data root: tools/3D-Toolbox/scenes/<scene>/.
+  // Every initial data bucket lives under scenes/<scene>/: cloud/splat assets
+  // (flat), bboxes/, scene_graph_saved/ and scene_graph_exported/. Runtime
+  // path switching was removed on purpose — every asset the tool visualizes
+  // lives in its designated folder under the tool.
+  const SCENES_ROOT = join(APP_ROOT, "scenes");
 
   // Trajectory browsing is per-scene: worldmodel flight_/step_ directories
   // live under scenes/<scene>/trajectories/. The `scene` param selects the root.
