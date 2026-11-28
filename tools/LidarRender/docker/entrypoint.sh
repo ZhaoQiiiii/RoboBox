@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [ "$#" -lt 1 ]; then
-    echo "用法: entrypoint.sh <pcd_file>" >&2
+    echo "用法: entrypoint.sh <pcd_file|ply_file>" >&2
     exit 2
 fi
 PCD_FILE="$1"
@@ -18,7 +18,16 @@ LIDAR_FRAME_ID="${LIDAR_FRAME_ID:-world}"
 LIDAR_CONFIG="${LIDAR_CONFIG:-/opt/lidar-render/config/params.yaml}"
 LIDAR_USE_XVFB="${LIDAR_USE_XVFB:-0}"
 
-[ -f "$PCD_FILE" ] || { echo "错误: PCD 不存在: $PCD_FILE" >&2; exit 2; }
+[ -f "$PCD_FILE" ] || { echo "错误: 场景文件不存在: $PCD_FILE" >&2; exit 2; }
+
+# PLY 点云先转成 binary PCD；renderer 和 bridge 都只读 PCD。
+if [ "$(head -c 3 "$PCD_FILE" 2>/dev/null)" = "ply" ]; then
+    CONVERTED_PCD="/tmp/lidar_render_scene.pcd"
+    echo "[LidarRender] 转换 PLY -> PCD: $PCD_FILE"
+    /usr/bin/python3 -u /opt/lidar-render/runtime/ply_to_pcd.py \
+        "$PCD_FILE" "$CONVERTED_PCD"
+    PCD_FILE="$CONVERTED_PCD"
+fi
 
 RENDER_CMD=()
 if [ "$LIDAR_USE_XVFB" = "1" ]; then
