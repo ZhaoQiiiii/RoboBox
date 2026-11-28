@@ -35,10 +35,10 @@ docker logs -f gsplat-render
 bash scripts/stop.sh
 ```
 
-`scripts/build.sh` 现在委托 `runtime/RoboKit/docker/build.sh`；Dockerfile 已合并到
+`scripts/build.sh` 现在委托 `runtime/RoboKit/scripts/build.sh`；Dockerfile 已合并到
 `runtime/RoboKit/docker/Dockerfile`，统一构建镜像 `robokit:latest`（同时包含 LidarRender）。
 `run.sh` / `stop.sh` 的容器名 `gsplat-render` 保持不变，镜像名默认改为 `robokit:latest`。
-主仓库 `scripts/run.sh` 使用 `runtime/RoboKit/docker/run.sh` 把两个工具放在同一个
+主仓库 `scripts/run.sh` 使用 `runtime/RoboKit/scripts/run.sh` 把两个工具放在同一个
 `robokit` 容器里；本目录的脚本用于单独调试 GsplatRender。
 
 容器内由 `docker/entrypoint.sh` 同时启动 renderer 和 bridge，云台模式默认开启；

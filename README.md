@@ -1,77 +1,200 @@
 # RoboKit
 
-三维 Web 编辑器，集成了三种可切换的工作模式：**3D 包围框标注**、**场景图编辑**、**三维轨迹可视化**。底层使用 React Three Fiber / Three.js 与 3D Gaussian Splatting，可在浏览器中直接渲染点云（`.pcd` / `.ply`）与高斯泼溅（`.splat` / `.ply`）资产。
+RoboKit 是本地机器人仿真工具集：`tools/3D-Toolbox` 是三维场景 Web 编辑器；
+`tools/GsplatRender` 和 `tools/LidarRender` 是两个传感器渲染工具，共用
+`robokit:latest` 镜像和同一个 `robokit` 容器。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-## 📜 简介
+## 仓库组成
 
-RoboKit 把三种彼此独立却又共用同一套场景资产的工作流整合进一个浏览器应用：标注包围框、编辑场景图、回看飞行轨迹。三种模式都挂载在 App 层唯一的持久 WebGL `<Canvas>` 上，因此切换模式不会重建场景，高斯泼溅纹理与点云 GPU 缓冲得以保留；相机位姿以及点大小、栅格、坐标轴、配色等可视化参数在模式之间共享并跨会话记忆。应用没有独立后端进程——场景 / 包围框 / 场景图 / 轨迹的 REST 接口由 Vite 开发服务器的内置插件提供，数据按 `scenes/<scene>/` 分桶存放。
+| 路径 | 说明 |
+|---|---|
+| `tools/3D-Toolbox/` | 三维 Web 编辑器（React + Vite + 内置后端 API） |
+| `tools/GsplatRender/` | 3DGS 相机仿真：PLY → RGB/深度图（TCP + ROS bridge） |
+| `tools/LidarRender/` | 激光雷达仿真：PCD/点云 PLY → 扫描点云（TCP + ROS bridge） |
+| `tools/RerunBridge/` | 可选：把 Gsplat/Lidar 的 ROS 图像与点云转发到 Rerun |
+| `scripts/build.sh` | 构建统一镜像 `robokit:latest` |
+| `scripts/run.sh` | 启动统一容器 `robokit`（`gsplat` / `lidar` / `both`） |
+| `docker/` | Dockerfile 与 dispatcher entrypoint |
+| `tools/3D-Toolbox/scenes/` | Web 编辑器场景数据桶（gitignore，仅保留 `.gitkeep`） |
+| `logs/` | 运行日志（gitignore） |
 
-## 功能
+## 快速开始
 
-- **三种懒加载模式**：`3D-BBox Annotator`（包围框标注）、`SceneGraph Editor`（场景图编辑）、`3D-Trajectory Viewer`（轨迹查看），通过右上角按钮或 URL hash `#mode=bbox|scenegraph|traj` 切换。
-- **持久 WebGL Canvas**：三个模式共用一个画布，切换模式不重新加载场景，保留高斯泼溅 GPU 资源与点云缓冲。
-- **点云 / 高斯泼溅渲染**：基于 `@mkkellogg/gaussian-splats-3d`，支持 `.pcd` / `.ply` / `.splat` 等资产格式。
-- **点云按高度着色**：点云支持多种配色方案（Flat / Rainbow / Cool-Warm / Grayscale / X-Ray / Y-Ray，其中 Rainbow / Cool-Warm / Grayscale 按 Z 高度着色）。
-- **共享可视化参数**：三种模式共享同一套场景可视化参数——点大小、栅格尺度、坐标系显示、配色方案与不透明度，跨模式一致、跨会话持久化。
-- **场景图编辑**：节点、区域（Area）、多面体（Poly）与对象（Object）的创建 / 移动 / 重命名 / 删除，以及撤销（`Ctrl/Cmd + Z`）、重做（`Ctrl/Cmd + Shift + Z` / `Ctrl/Cmd + R` / `Ctrl/Cmd + Y`）、连接（`E`）等快捷键，编辑结果可导出为新的场景图快照。
-- **轨迹可视化**：只读浏览 `scenes/<scene>/trajectories/` 下的任意 `*.json` 轨迹文件（无需特定目录名），以及 worldmodel `flight_*` / `step_*` 目录；查看 `prompt.json` 等结果与 `anchor.jpg` / `video.mp4` 资产。
-- **内置后端 API**：Vite 插件直接在开发服务器中提供场景 / 包围框 / 场景图 / 轨迹相关 REST 接口。
-
-## 🧰 工具
-
-`tools/` 下除 Web 编辑器外还有两个独立工具，统一使用 `docker/build.sh` 构建的
-`robokit:latest` 镜像：
-
-- `tools/GsplatRender`：3DGS 相机仿真（TCP renderer + ROS bridge）。
-- `tools/LidarRender`：PCD 激光雷达仿真（TCP renderer + ROS bridge）。
-
-主链路用 `docker/run.sh` 把两个工具启动在同一个 `robokit` 容器中；也可以分别用各自的
-`scripts/run.sh` 单独启动调试。
-
-## 📋 环境要求
-
-- Bun（本仓库的规范包管理器与测试运行器，见 `bun.lock`）
-- 主要依赖（版本取自 `package.json`）：`react ^19.0.0`、`three ^0.170.0`、`@react-three/fiber ^9.0.0`、`@react-three/drei ^10.0.0`、`@mkkellogg/gaussian-splats-3d ^0.4.7`、`vite ^6.0.0`、`typescript ^5.7.0`
-
-## 📦 安装
+### 传感器工具（Docker）
 
 ```bash
+bash scripts/build.sh
+bash scripts/run.sh --ply /path/to/scene.ply --pcd /path/to/scene.pcd
+```
+
+- `--ply`：3DGS 场景，给 GsplatRender；
+- `--pcd`：激光地图，给 LidarRender，接受 `.pcd` 或点云 `.ply`（启动时转成 binary PCD）；
+- 至少给一个；只给一个时只启动对应工具；两个都给时在同一容器内并行运行；
+- 默认容器名 `robokit`，前台运行；加 `-d` 后台运行，`docker logs -f robokit` 查看日志；
+- 需要外部 ROS master 与 odom 源；ZeroSim 主链路由仓库根目录的 `scripts/run.sh` 负责启动它们并调用本目录的脚本。
+
+### Rerun 可视化（可选）
+
+`tools/RerunBridge` 在同一个容器里额外启动一个 Python 3.10 的 Rerun sink 和一个
+Python 3.8 的 ROS tee，把渲染结果实时转发到 Rerun：
+
+```bash
+bash scripts/run.sh --ply /path/to/scene.ply --pcd /path/to/scene.pcd --rerun
+```
+
+- 默认连接 `rerun+http://127.0.0.1:9877/proxy`，application id 为 `robokit`，在 viewer
+  里是一条独立 recording（与 DiMOS 主 recording 分开，可在 recordings 列表切换）；
+- 实体路径：`/robokit/gsplat/color`、`/robokit/gsplat/depth`、`/robokit/lidar/cloud`；
+- 默认只转发彩色图（`/gsplat_render/camera0/color/image/compressed`，最高 15 Hz）和
+  点云（`--rerun-cloud-topic`，默认取 `--lidar-local-topic`，5 Hz、最多 2 万点）；
+  深度默认关闭，用 `--rerun-depth-topic` 打开并配合 `--rerun-image-topic` 调整；
+- standalone 使用：先启动自己的 Rerun viewer，再给 `--rerun` 或 `--rerun-url`；
+  需要 RoboKit 自己起 gRPC server 时用 `--rerun-serve --rerun-port 9880`，然后用
+  `rerun rerun+http://127.0.0.1:9880/proxy` 连接；
+- 布局修改：viewer 里调好的布局由 `--persist-state` 跨运行保留；要固定或共享时用
+  **Save blueprint** 导出 `.rbl`，并通过 `DIMOS_VIEWER_BLUEPRINTS`（`:` 分隔）在
+  `dimos-viewer` 启动时加载。sink 发送 blueprint 时不会覆盖已保存的布局；
+- 版本约定：镜像内固定 `rerun-sdk==0.32.0`（独立 venv，不影响 gsplat 的 numpy 1.x），
+  viewer/server 需要用同版本；
+- bridge 需要 ROS master 已启动；tee 会在 master 不可达时每 2 秒重试，sink 在 Rerun
+  server 不可达时也会持续重试。`--rerun` 默认关闭，不影响四旋翼链路。
+
+### 三维编辑器
+
+```bash
+cd tools/3D-Toolbox
 bun install
+bun run dev      # http://localhost:5173
 ```
 
-## 🚀 使用
+| 命令 | 说明 |
+|---|---|
+| `bun run dev` | 启动 Vite 开发服务器与内置后端 API（端口占用时自动回退） |
+| `bun run build` | 类型检查并构建生产产物到 `frontend/dist/` |
+| `bun run preview` | 预览已构建的产物 |
+| `bunx tsc -p frontend --noEmit` | 仅类型检查 |
+| `bun test` | 运行 `bun:test` 测试 |
 
-| Name | Purpose | Example |
+## 场景数据
+
+Web 编辑器后端固定读取 **`tools/3D-Toolbox/scenes/`**：
+
+```ts
+const APP_ROOT = join(import.meta.dirname, "..");
+const SCENES_ROOT = join(APP_ROOT, "scenes");
+```
+
+```text
+tools/3D-Toolbox/scenes/<scene>/
+  <asset>.pcd / <asset>.ply / <asset>.splat   # 点云/高斯资产（扁平存放）
+  bboxes/<asset>.json                          # 包围框标注
+  scene_graph_saved/<snapshot>/                # 场景图快照（只读来源）
+  scene_graph_exported/<snapshot>/             # 场景图导出结果
+  trajectories/                                # 轨迹（*.json 或 flight_* / step_*）
+```
+
+`tools/3D-Toolbox/scenes/` 默认被 `.gitignore` 忽略，只保留 `.gitkeep`。
+
+## 传感器工具
+
+### GsplatRender
+
+- 输入：3DGS PLY（高斯泼溅）；
+- TCP：`19080`（位姿）、`19081`（图像）；
+- ROS bridge：发布 `/gsplat_render/camera0/color/image`、`/gsplat_render/camera0/depth/image`
+  等，订阅 odom（默认 `/super/sim/lidar_slam/odom`）；
+- 单独运行：`bash tools/GsplatRender/scripts/run.sh /path/scene.ply`。
+
+### LidarRender
+
+- 输入：PCD 或点云 PLY（`x y z` 必需，`intensity` 可选）；PLY 在容器启动时由
+  `runtime/ply_to_pcd.py` 转成 binary PCD；
+- TCP：`19082`（位姿）、`19083`（点云）；
+- ROS bridge：发布 `/super/sim/cloud_registered`（局部扫描）与 `/super/sim/global_pc`
+  （整图，首个订阅者出现时发布一次），订阅 odom；
+- 默认参数：`lidar_type=3`（MID_360）、`sensing_rate=10`、`sensing_horizon=10`；
+- 单独运行：`bash tools/LidarRender/scripts/run.sh /path/scene.pcd`；
+- 3DGS PLY 也能转换，但只取高斯中心点、`intensity=0`，不是真正的表面地图；优先使用
+  专用 PCD 或点云 PLY。
+
+### 统一容器
+
+`scripts/run.sh` 通过 dispatcher 选择 `gsplat` / `lidar` / `both`；`both` 会在同一容器内
+并行启动两个工具，日志分别写到 `/logs/gsplat_renderer.log`、`/logs/lidar_render.log`。
+宿主 `tools/*/runtime`、`tools/*/config` 与 `docker/entrypoint.sh` 会挂载进容器；修改这些
+文件后重启容器即可生效，不需要重新构建镜像。
+
+## 镜像构建
+
+`bash scripts/build.sh` 等价于 `docker build -f docker/Dockerfile -t robokit:latest .`，
+并处理构建代理与 Ubuntu/ROS 镜像源。Dockerfile 分四个阶段：
+
+| 阶段 | 基础镜像 | 作用 |
 |---|---|---|
-| `bun run dev` | 启动 Vite 开发服务器与内置后端 API（默认 `http://localhost:5173`，端口占用时自动回退） | `bun run dev` |
-| `bun run build` | 类型检查并构建生产产物到 `frontend/dist/` | `bun run build` |
-| `bun run preview` | 预览已构建的产物 | `bun run preview` |
-| `bunx tsc -p frontend --noEmit` | 仅类型检查（tsconfig 位于 `frontend/`） | `bunx tsc -p frontend --noEmit` |
-| `bun test` | 运行 `bun:test` 测试 | `bun test` |
+| `gsplat-builder` | CUDA 12.8.1 devel（Ubuntu 20.04） | 编译 gsplat 并生成 `/opt/gsplat-venv` |
+| `lidar-builder` | Ubuntu 20.04 | 编译 C++ `lidar_render_tcp` |
+| `robokit-runtime-base` | CUDA 12.8.1 runtime（Ubuntu 20.04） | ROS Noetic + PCL/OpenCV/GL 等运行依赖 |
+| `robokit` | 上述 runtime base | 复制两个工具的产物与 dispatcher，生成最终镜像 |
 
-场景数据按场景分桶存放于 `scenes/<scene>/` 下；把轨迹数据放入 `scenes/<scene>/trajectories/`（`flight_*` / `step_*` 目录）后，即可在轨迹模式中浏览。
+## 三维编辑器功能
 
-## 📁 项目结构
+- **三种懒加载模式**：`3D-BBox Annotator`（包围框标注）、`SceneGraph Editor`（场景图编辑）、
+  `3D-Trajectory Viewer`（轨迹查看），通过右上角按钮或 URL hash `#mode=bbox|scenegraph|traj`
+  切换。
+- **持久 WebGL Canvas**：三个模式共用一个画布，切换模式不重新加载场景，保留高斯泼溅 GPU
+  资源与点云缓冲。
+- **点云 / 高斯泼溅渲染**：基于 `@mkkellogg/gaussian-splats-3d`，支持 `.pcd` / `.ply` /
+  `.splat` 等资产格式。
+- **点云按高度着色**：Flat / Rainbow / Cool-Warm / Grayscale / X-Ray / Y-Ray 等配色方案。
+- **共享可视化参数**：点大小、栅格尺度、坐标系显示、配色与不透明度跨模式一致、跨会话持久化。
+- **场景图编辑**：节点、区域、多面体与对象的增删改，撤销/重做、连接等快捷键，可导出为新的
+  场景图快照。
+- **轨迹可视化**：只读浏览 `scenes/<scene>/trajectories/` 下的 `*.json` 与 worldmodel
+  `flight_*` / `step_*` 目录。
+- **内置后端 API**：Vite 开发服务器的插件直接提供场景 / 包围框 / 场景图 / 轨迹相关 REST 接口。
 
+## 项目结构
+
+```text
+tools/3D-Toolbox/
+  backend/            # Vite 插件形式的 REST API
+    api-plugin.ts
+  frontend/           # React + Vite（Vite root）
+    src/
+      App.tsx         # 持久 WebGL <Canvas> 与模式切换
+      modes/          # bbox / scenegraph / traj
+      shared/         # 跨模式组件、hook 与工具
+  scenes/             # 场景数据桶
+  package.json
+  bun.lock
+
+tools/GsplatRender/   # 相机渲染 + ROS bridge
+tools/LidarRender/    # 雷达渲染 + ROS bridge
+scripts/              # build.sh / run.sh
+docker/               # Dockerfile / entrypoint.sh
+logs/                 # 运行日志
 ```
-backend/            # Vite 后端 API 插件（场景 / 包围框 / 场景图 / 轨迹接口）
-  api-plugin.ts     # 单文件路由实现
-frontend/           # React 前端（Vite root；构建产物在 dist/）
-  index.html
-  tsconfig.json
-  src/
-    App.tsx         # App 层唯一的持久 WebGL <Canvas> 与模式切换
-    main.tsx        # 入口
-    modes/          # 三种模式：bbox / scenegraph / traj
-    shared/         # 跨模式共享组件、hook 与工具
-scenes/             # 场景数据桶（默认 gitignore，仅保留 .gitkeep）
-  <scene>/
-    bboxes/                # 包围框标注 (<asset>.json)
-    scene_graph_saved/     # 场景图快照（只读来源）
-    scene_graph_exported/  # 场景图导出结果
-    trajectories/          # 轨迹数据 (*.json 文件, 或 flight_* / step_* 目录)
-logs/               # 运行时日志（默认 gitignore）
-plans/              # 设计 / 方案文档（默认 gitignore）
+
+## 测试与验证
+
+```bash
+# 编辑器
+cd tools/3D-Toolbox
+bunx tsc -p frontend --noEmit
+bun test
+
+# LidarRender（容器内，需要 numpy / rospy）
+cd tools/LidarRender
+PYTHONPATH=runtime /usr/bin/python3 -m unittest discover -s tests -p 'test_tcp_protocol.py'
+PYTHONPATH=runtime /usr/bin/python3 -m unittest discover -s tests -p 'test_ply_to_pcd.py'
+
+# Dockerfile 静态检查
+docker build --check -f docker/Dockerfile .
 ```
+
+## 许可
+
+RoboKit 自有代码沿用根目录的 MIT。`tools/LidarRender/marsim_render/` 复制自 SUPER，
+保留 LGPL-3.0；见 `tools/LidarRender/README-SOURCE.md`。

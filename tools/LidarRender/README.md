@@ -42,9 +42,10 @@ GsplatRender）：
 bash runtime/RoboKit/tools/LidarRender/scripts/build.sh
 ```
 
-主仓库 `scripts/run.sh` 在 `--robot drone` 且 `SCENE_PCD` 非空时，会在统一的 `robokit`
-容器中同时启动 GsplatRender 与 LidarRender（端口 `19082/19083`），并让 SUPER 仿真器只发
-odom/TF、由 LidarRender 接管 `/super/sim/cloud_registered` 与 `/super/sim/global_pc`。
+主仓库 `scripts/run.sh` 在 `--robot drone` 时，会在统一的 `robokit` 容器中同时启动
+GsplatRender 与 LidarRender（端口 `19082/19083`）；激光地图默认复用 `SCENE_PLY`，也可用
+`SCENE_PCD` 单独指定。SUPER 仿真器只发 odom/TF，由 LidarRender 接管
+`/super/sim/cloud_registered` 与 `/super/sim/global_pc`。
 
 手动运行（需要宿主 X11；ROS master 由外部提供）：
 
@@ -86,6 +87,15 @@ odom 话题并发布点云。不要让 `perfect_drone_sim` 和 LidarRender 同�
 全局点云由 bridge 解析 PCD 的 `DATA binary`，要求 `FIELDS` 含 `x y z`，`intensity`
 可选（缺失时补 0）。`ascii` / `binary_compressed` 会记录警告并只发布局部云；局部云由
 renderer 用 PCL 加载，支持 PCL 能读的 PCD 格式。
+
+### PLY 输入
+
+入口脚本也接受点云 PLY：`ascii`、`binary_little_endian` 或 `binary_big_endian`，至少含
+`x y z`，`intensity` 缺失时补 0。容器启动时用 `runtime/ply_to_pcd.py` 转成 binary PCD，
+再交给 renderer 和 bridge；通过 `runtime/RoboKit/scripts/run.sh` 启动时不需要重建镜像。
+
+注意：3DGS 场景的 PLY（含 `f_dc_*`、`opacity`、`scale_*`、`rot_*`）不是激光点云，
+转换出来只是高斯中心点，不建议作为 LidarRender 的地图输入。
 
 ## 测试
 
