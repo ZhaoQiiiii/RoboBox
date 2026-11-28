@@ -1,0 +1,44 @@
+[project]
+name = "dataloader"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "rerun-sdk[dataloader,catalog,tracing]",
+  "huggingface-hub>=1.0",
+  # LeRobot 0.7.0 requires torch<2.16 and setuptools<85. Raise the dependabot
+  # ignore ranges once LeRobot supports newer versions
+  # No `dataset` extra: it caps datasets<5
+  "lerobot==0.7.0",
+]
+
+[tool.rerun-example]
+# Picked up by scripts/ci/isolated_examples.py and the `py-lint-isolated-examples` pixi task.
+isolated = true
+
+[tool.uv]
+# The example is flat scripts, not a wheel — skip project build, just sync deps.
+package = false
+# pyarrow 24.0.0 segfaults rerun on import.
+# Isolated examples don't inherit the workspace root's constraint-dependencies, so pin it here.
+# pyarrow arrives transitively (via rerun-sdk), hence a constraint rather than a direct dependency.
+constraint-dependencies = ["pyarrow>=23.0.1,<24"]
+override-dependencies = ["pillow>=13.0.0,<14"]
+
+# Default `uv sync` uses the in-repo editable rerun-sdk (monorepo dev mode).
+# After syncing, also run `uv pip install ../../../rerun_py/rerun_dev_fixup` to
+# point the `rerun` CLI at the in-repo `target/debug/rerun` build.
+#
+# Standalone users (e.g. sparse-checkout of just this example) run instead:
+#   uv sync --no-sources --no-dev
+# That ignores the path source below and resolves `rerun-sdk` from PyPI.
+# rerun-dev-fixup is intentionally absent from this file: uv 0.7.x resolves all
+# dependency groups and extras unconditionally, so any path-only package here would
+# block standalone `--no-sources` resolution.
+[tool.uv.sources]
+rerun-sdk = { path = "../../../rerun_py", editable = true }
+
+# Makes ty treat this example as its own project instead of walking up to the workspace config.
+[tool.ty.environment]
+python = ".venv"
+extra-paths = ["../../../rerun_py", "../../../rerun_py/rerun_sdk"]

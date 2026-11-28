@@ -1,0 +1,165 @@
+//! Integration tests for rerun and the in memory server.
+
+#![expect(clippy::print_stdout, clippy::print_stderr)] // This is only a test
+
+mod inspection;
+mod kittest_harness_ext;
+mod test_data;
+mod viewer_harness_ext;
+mod viewer_section;
+
+use std::net::TcpListener;
+
+pub use inspection::{HarnessConfig, InspectionHarness, TargetViewer};
+pub use kittest_harness_ext::HarnessExt;
+use re_catalog_client::CatalogClient;
+use re_redap_client::{ApiResult, ConnectionClient, ConnectionRegistry};
+use re_sdk_types::SegmentId;
+use re_server::ServerHandle;
+use re_uri::external::url::Host;
+pub use test_data::{
+    TEST_DATASET_ID, asset_rrd, file_url, register_asset, register_blueprint_segment,
+    register_dataset_blueprint, register_table_blueprint, spatial_3d_blueprint_rbl,
+};
+pub use viewer_harness_ext::ViewerHarnessExt;
+// pub use viewer_section::GetSection;
+pub use viewer_section::ViewerSection;
+
+pub struct TestServer {
+    server_handle: Option<ServerHandle>,
+    runtime: re_viewer::AsyncRuntimeHandle,
+    port: u16,
+}
+
+impl TestServer {
+    pub async fn spawn() -> Self {
+        // Get a random free port
+        let port = get_free_port();
+
+        let args = re_server::Args {
+            host: "127.0.0.1".to_owned(),
+            port,
+            ..Default::default()
+        };
+        let server_handle = args
+            .create_server_handle(re_build_info::cargo_build_info!())
+            .await
+            .expect("Can't create server");
+
+        Self {
+            port,
+            server_handle: Some(server_handle),
+            runtime: re_viewer::AsyncRuntimeHandle::from_current_tokio_runtime_or_wasmbindgen()
+                .expect("test runtime is running"),
+        }
+    }
+
+    pub async fn with_test_data(self) -> (Self, SegmentId) {
+        let url = self.add_test_data().await;
+        (self, url)
+    }
+
+    pub async fn with_named_test_data(
+        self,
+        dataset_name: &str,
+        dataset_id: &str,
+        new_recording_id: &str,
+    ) -> (Self, SegmentId) {
+        let segment_id = {
+            let this = &self;
+            async move {
+                let catalog_client = this.catalog_client();
+                test_data::load_test_data_with_name(
+                    &catalog_client,
+                    dataset_name,
+                    dataset_id,
+                    new_recording_id,
+                )
+                .await
+                .expect("Failed to load test data")
+            }
+            .await
+        };
+        (self, segment_id)
+    }
+
+    /// Register `count` recordings with time-invariant data in a fresh dataset, suitable for
+    /// stable segment-preview snapshots. Returns the segment ids in registration order.
+    pub async fn with_static_preview_data(
+        self,
+        dataset_name: &str,
+        dataset_id: &str,
+        recording_id_prefix: &str,
+        count: usize,
+    ) -> (Self, Vec<SegmentId>) {
+        let segment_ids = {
+            let catalog_client = self.catalog_client();
+            test_data::load_static_preview_data(
+                &catalog_client,
+                dataset_name,
+                dataset_id,
+                recording_id_prefix,
+                count,
+            )
+            .await
+            .expect("Failed to load static preview data")
+        };
+        (self, segment_ids)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// For testing: get a reference to the injected errors, which can be used to make specific
+    /// gRPC endpoints fail.
+    pub fn injected_errors(&self) -> &re_server::InjectedErrors {
+        self.server_handle
+            .as_ref()
+            .expect("Server handle not initialized")
+            .injected_errors()
+    }
+
+    pub fn catalog_client(&self) -> CatalogClient {
+        let origin = re_uri::Origin {
+            host: Host::Domain("localhost".to_owned()),
+            port: self.port,
+            scheme: re_uri::Scheme::RerunHttp,
+        };
+        CatalogClient::new(
+            ConnectionRegistry::new_without_stored_credentials().connection_handle(origin),
+            self.runtime.clone(),
+        )
+    }
+
+    pub async fn client(&self) -> ApiResult<ConnectionClient> {
+        self.catalog_client().client().await
+    }
+
+    pub async fn add_test_data(&self) -> SegmentId {
+        test_data::load_test_data(&self.catalog_client())
+            .await
+            .expect("Failed to load test data")
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        let server_handle = self
+            .server_handle
+            .take()
+            .expect("Server handle not initialized");
+        tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                server_handle.shutdown_and_wait().await;
+            });
+        });
+    }
+}
+
+/// Get a free port from the OS.
+pub(crate) fn get_free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to a random port");
+    let addr = listener.local_addr().expect("Failed to get local address");
+    addr.port()
+}

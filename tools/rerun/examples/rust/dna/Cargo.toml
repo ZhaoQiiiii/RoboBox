@@ -1,0 +1,20 @@
+[package]
+name = "dna"
+version = "0.45.0-alpha.1+dev"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "dna"
+test = false
+
+[dependencies]
+rerun = { path = "../../../crates/top/rerun", features = ["log_setup"] }
+
+itertools.workspace = true
+rand = { workspace = true, features = ["std", "thread_rng"] }
+
+[target.'cfg(rerun_workspace_hack)'.dependencies]
+re_workspace_hack.workspace = true

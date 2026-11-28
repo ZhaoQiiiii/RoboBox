@@ -1,0 +1,1595 @@
+// This file is linked to in a number of places, do not move/rename it without updating all the links!
+
+//! All analytics events collected by the Rerun viewer are defined in this file.
+//!
+//! Analytics can be completely disabled with `rerun analytics disable`,
+//! or by compiling rerun without the `analytics` feature flag.
+//!
+//! All collected analytics data is anonymized, stripping all personal identifiable information
+//! as well as information about user data.
+//! Read more about our analytics policy at <https://github.com/rerun-io/rerun/tree/main/crates/utils/re_analytics>.
+
+use std::collections::HashMap;
+
+use re_build_info::{BuildInfo, CrateVersion};
+use url::Url;
+use uuid::Uuid;
+
+use crate::{AnalyticsEvent, Event, EventKind, Properties, Property};
+
+// ---------------------------------------------------------------
+
+/// Records a crash caused by a panic.
+///
+/// Used in `re_crash_handler`.
+pub struct CrashPanic {
+    pub build_info: BuildInfo,
+
+    /// Anonymized
+    pub callstack: String,
+    pub message: Option<String>,
+    pub file_line: Option<String>,
+}
+
+impl Event for CrashPanic {
+    const NAME: &'static str = "crash-panic";
+}
+
+impl Properties for CrashPanic {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            build_info,
+            callstack,
+            message,
+            file_line,
+        } = self;
+
+        build_info.serialize(event);
+        event.insert("callstack", callstack);
+        event.insert_opt("message", message);
+        event.insert_opt("file_line", file_line);
+    }
+}
+
+// ---------------------------------------------------------------
+
+pub struct CrashSignal {
+    pub build_info: BuildInfo,
+    pub signal: String,
+    pub callstack: String,
+}
+
+impl Event for CrashSignal {
+    const NAME: &'static str = "crash-signal";
+}
+
+impl Properties for CrashSignal {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            build_info,
+            signal,
+            callstack,
+        } = self;
+
+        build_info.serialize(event);
+        event.insert("signal", signal.clone());
+        event.insert("callstack", callstack.clone());
+    }
+}
+
+// ---------------------------------------------------------------
+
+/// Holds information about the user's environment.
+///
+/// Used in `re_viewer`.
+pub struct Identify {
+    /// Info on how the `re_viewer` crate was built.
+    pub build_info: re_build_info::BuildInfo,
+
+    // If we happen to know the Python or Rust version used on the _host machine_, i.e. the
+    // machine running the viewer, then override the versions from `build_info`.
+    //
+    // The Python/Rust versions appearing in user profiles always apply to the host
+    // environment, _not_ the environment in which the data logging is taking place!
+    pub rust_version: Option<String>,
+    pub llvm_version: Option<String>,
+    pub python_version: Option<String>,
+
+    /// Opt-in meta-data you can set via `rerun analytics`.
+    ///
+    /// For instance, Rerun employees are encouraged to set `rerun analytics email`.
+    /// For real users, this is usually empty.
+    pub opt_in_metadata: HashMap<String, Property>,
+}
+
+impl Event for Identify {
+    const NAME: &'static str = "$identify";
+
+    const KIND: EventKind = EventKind::Identify;
+}
+
+impl Properties for Identify {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            build_info,
+            rust_version,
+            llvm_version,
+            python_version,
+            opt_in_metadata,
+        } = self;
+
+        build_info.serialize(event);
+        event.insert_opt("rust_version", rust_version);
+        event.insert_opt("llvm_version", llvm_version);
+        event.insert_opt("python_version", python_version);
+        #[expect(clippy::iter_over_hash_type)] // Insertion order is irrelevant.
+        for (name, value) in opt_in_metadata {
+            event.insert(name, value);
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+
+/// Some sparse information about the runtime environment the viewer is running in.
+pub struct ViewerRuntimeInformation {
+    /// Does it look like the viewer is running inside a Docker container?
+    pub is_docker: bool,
+
+    /// Whether the viewer is started directly from within Windows Subsystem for Linux (WSL).
+    pub is_wsl: bool,
+
+    /// The wgpu graphics backend used by the viewer.
+    ///
+    /// For possible values see [`wgpu::Backend`](https://docs.rs/wgpu/latest/wgpu/enum.Backend.html).
+    pub graphics_adapter_backend: String,
+
+    /// The device tier `re_renderer` identified for the graphics adapter.
+    ///
+    /// For possible values see [`re_renderer::config::DeviceTier`](https://docs.rs/re_renderer/latest/re_renderer/config/enum.DeviceTier.html).
+    /// This is a very rough indication of the capabilities of the graphics adapter.
+    /// We do not want to send details graphics driver/capability information here since
+    /// it's too detailed (could be used for fingerprinting which we don't want) and not as useful
+    /// anyways since it's hard to learn about the typically identified capabilities.
+    pub re_renderer_device_tier: String,
+
+    pub screen_info: ScreenInfo,
+}
+
+impl Properties for ViewerRuntimeInformation {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            is_docker,
+            is_wsl,
+            graphics_adapter_backend,
+            re_renderer_device_tier,
+            screen_info,
+        } = self;
+
+        event.insert("is_docker", is_docker);
+        event.insert("is_wsl", is_wsl);
+        event.insert("graphics_adapter_backend", graphics_adapter_backend);
+        event.insert("re_renderer_device_tier", re_renderer_device_tier);
+        screen_info.serialize(event);
+    }
+}
+
+// ---------------------------------------------------------------
+/// Information about the user's monitor.
+pub struct ScreenInfo {
+    //// zoom_factor * native_pixels_per_point
+    ///
+    /// Is it usually 1.0 or 2.0, but could be anything.
+    pub pixels_per_point: f32,
+
+    /// OS pixel density
+    pub native_pixels_per_point: Option<f32>,
+
+    /// Chosen zoom, with cmd +/-.
+    ///
+    /// Default is 1.0, but the user can change it.
+    pub zoom_factor: f32,
+}
+
+impl Properties for ScreenInfo {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            pixels_per_point,
+            native_pixels_per_point,
+            zoom_factor,
+        } = self;
+
+        event.insert("pixels_per_point", pixels_per_point);
+        event.insert_opt("native_pixels_per_point", native_pixels_per_point);
+        event.insert("zoom_factor", zoom_factor);
+    }
+}
+
+// -----------------------------------------------
+
+/// Basic information about a recording's chunk store.
+pub struct StoreInfo {
+    /// Name of the application.
+    ///
+    /// In case the recording does not come from an official example, the id is hashed.
+    pub application_id: Id,
+
+    /// Name of the recording.
+    ///
+    /// In case the recording does not come from an official example, the id is hashed.
+    pub recording_id: Id,
+
+    /// Where data is being logged.
+    pub store_source: String,
+
+    /// The Rerun version that was used to encode the RRD data.
+    pub store_version: String,
+
+    // Various versions of the host environment.
+    pub rust_version: Option<String>,
+    pub llvm_version: Option<String>,
+    pub python_version: Option<String>,
+
+    // Whether or not the data is coming from one of the Rerun example applications.
+    pub app_id_starts_with_rerun_example: bool,
+}
+
+#[derive(Clone)]
+pub enum Id {
+    /// When running an example application we record the full id.
+    Official(String),
+
+    /// For user applications we hash the id.
+    Hashed(Property),
+}
+
+impl From<Id> for Property {
+    fn from(val: Id) -> Self {
+        match val {
+            Id::Official(id) => Self::String(id),
+            Id::Hashed(id) => id,
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+/// Sent when a Wasm file is served.
+///
+/// Used in `re_web_viewer_server`.
+pub struct ServeWasm;
+
+impl Event for ServeWasm {
+    const NAME: &'static str = "serve_wasm";
+}
+
+impl Properties for ServeWasm {
+    // No properties.
+}
+
+// ----------------------------------------------------------------------------
+
+// ---------------------------------------------------------------
+
+/// Sent when the viewer is first started.
+///
+/// Used in `re_viewer`.
+pub struct ViewerStarted {
+    /// The URL on which the web viewer is running.
+    ///
+    /// Sent as the `web_host` category, and as `rerun_url` on Rerun's own sites.
+    pub url: Option<String>,
+
+    /// The environment in which the viewer is running.
+    pub app_env: &'static str,
+
+    /// Sparse information about the runtime environment the viewer is running in.
+    pub runtime_info: ViewerRuntimeInformation,
+}
+
+impl Event for ViewerStarted {
+    const NAME: &'static str = "viewer_started";
+}
+
+/// The only hosts whose page URL is sent, as `rerun_url`.
+///
+/// Must not match other `*.rerun.io` hosts: Rerun Hub viewers are served from
+/// `<stack>.cloud.rerun.io`, where the stack name identifies a customer.
+const RERUN_URL_HOSTS: [&str; 3] = ["rerun.io", "www.rerun.io", "app.rerun.io"];
+
+/// Public hosting platforms whose name is sent as `web_host`.
+///
+/// They say where a web viewer runs without identifying who runs it.
+/// A host matches an entry if it is the entry or one of its subdomains.
+const PUBLIC_WEB_HOSTS: [&str; 12] = [
+    "cloud.rerun.io", // Rerun Hub; the subdomain is the stack, which is never sent
+    "cloudfront.net",
+    "github.dev",
+    "github.io",
+    "googleusercontent.com", // Google Colab
+    "hf.space",
+    "kaggleusercontent.com",
+    "netlify.app",
+    "pages.dev",
+    "rerun.io",
+    "ts.net",
+    "vercel.app",
+];
+
+/// Where a web viewer runs, coarse enough to never identify a site or its owner.
+///
+/// One of [`PUBLIC_WEB_HOSTS`], `"local"` for this machine or a private network, or `"other"`.
+fn web_host(url: &str) -> Option<&'static str> {
+    // `Url` lowercases the host of `http` and `https` URLs.
+    let host = Url::parse(url).ok()?.host()?.to_owned();
+    let is_local = match &host {
+        url::Host::Domain(domain) => {
+            matches!(domain.rsplit('.').next(), Some("localhost" | "local"))
+        }
+        url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        url::Host::Ipv6(ip) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+    };
+    if is_local {
+        return Some("local");
+    }
+    let url::Host::Domain(domain) = host else {
+        return Some("other");
+    };
+
+    // The longest match wins, so that Rerun Hub is not counted as `rerun.io`.
+    let public = PUBLIC_WEB_HOSTS
+        .into_iter()
+        .filter(|public| {
+            domain == *public
+                || domain
+                    .strip_suffix(public)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+        .max_by_key(|public| public.len());
+    Some(public.unwrap_or("other"))
+}
+
+/// The page URL to send as `rerun_url`: only for [`RERUN_URL_HOSTS`], and without the query or
+/// fragment, which can name the data being viewed.
+fn sanitized_rerun_url(url: &str) -> Option<String> {
+    let mut parsed = Url::parse(url).ok()?;
+    if !RERUN_URL_HOSTS.contains(&parsed.domain()?) {
+        return None;
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.into())
+}
+
+fn add_sanitized_url_properties(event: &mut AnalyticsEvent, url: Option<String>) {
+    let Some(url) = url else {
+        return;
+    };
+
+    event.insert_opt("rerun_url", sanitized_rerun_url(&url));
+    event.insert_opt("web_host", web_host(&url));
+}
+
+impl Properties for ViewerStarted {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            url,
+            app_env,
+            runtime_info,
+        } = self;
+
+        event.insert("app_env", app_env);
+        add_sanitized_url_properties(event, url);
+        runtime_info.serialize(event);
+    }
+}
+
+// ---------------------------------------------------------------
+
+/// Sent when a new recording is opened.
+///
+/// Used in `re_viewer`.
+pub struct OpenRecording {
+    /// The URL on which the web viewer is running.
+    ///
+    /// Sent as the `web_host` category, and as `rerun_url` on Rerun's own sites.
+    pub url: Option<String>,
+
+    /// The environment in which the viewer is running.
+    pub app_env: &'static str,
+
+    pub store_info: Option<StoreInfo>,
+
+    /// How data is being loaded into the viewer.
+    pub data_source: Option<&'static str>,
+}
+
+impl Event for OpenRecording {
+    const NAME: &'static str = "open_recording";
+}
+
+impl Properties for OpenRecording {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            url,
+            app_env,
+            store_info,
+            data_source,
+        } = self;
+
+        add_sanitized_url_properties(event, url);
+
+        event.insert("app_env", app_env);
+
+        if let Some(store_info) = store_info {
+            let StoreInfo {
+                application_id,
+                recording_id,
+                store_source,
+                store_version,
+                rust_version,
+                llvm_version,
+                python_version,
+
+                app_id_starts_with_rerun_example,
+            } = store_info;
+
+            event.insert("application_id", application_id);
+            event.insert("recording_id", recording_id);
+            event.insert("store_source", store_source);
+            event.insert("store_version", store_version);
+            event.insert_opt("rust_version", rust_version);
+            event.insert_opt("llvm_version", llvm_version);
+            event.insert_opt("python_version", python_version);
+            event.insert(
+                "app_id_starts_with_rerun_example",
+                app_id_starts_with_rerun_example,
+            );
+        }
+
+        if let Some(data_source) = data_source {
+            event.insert("data_source", data_source);
+        }
+    }
+}
+
+// -----------------------------------------------
+
+// -----------------------------------------------
+
+/// Sent the first time a `?` help button is clicked.
+///
+/// Is used to track how many users find the help button.
+pub struct HelpButtonFirstClicked {}
+
+impl Event for HelpButtonFirstClicked {
+    const NAME: &'static str = "help-button-clicked";
+}
+
+impl Properties for HelpButtonFirstClicked {
+    fn serialize(self, _event: &mut AnalyticsEvent) {
+        let Self {} = self;
+    }
+}
+
+// -----------------------------------------------
+
+/// An agent in the Rerun Viewer's agent panel was started, and either opened a session or failed to.
+///
+/// This event contains no text from the agent or its errors.
+/// It is emitted regardless of whether the user shares redacted prompts and responses.
+pub struct AgentStartup {
+    /// How the agent runs: `agent_harness` (a subprocess such as Claude Code) or `model_api`.
+    pub backend: String,
+
+    /// Which agent was started, e.g. "Claude Code", if it introduced itself before the outcome.
+    pub agent: Option<String>,
+
+    /// The model the agent reported when the session opened, e.g. "Opus 5.5".
+    pub model: Option<String>,
+
+    /// From starting the agent to the outcome.
+    pub duration_secs: f64,
+
+    /// How the start ended: `ready`, `failed`, `exited`, or `stopped`.
+    pub outcome: String,
+
+    /// Whether the agent asked the user to log in before the outcome.
+    pub auth_required: bool,
+}
+
+impl Event for AgentStartup {
+    const NAME: &'static str = "agent_startup";
+}
+
+impl Properties for AgentStartup {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            backend,
+            agent,
+            model,
+            duration_secs,
+            outcome,
+            auth_required,
+        } = self;
+        event.insert("backend", backend);
+        event.insert_opt("agent", agent);
+        event.insert_opt("model", model);
+        event.insert("duration_secs", duration_secs);
+        event.insert("outcome", outcome);
+        event.insert("auth_required", auth_required);
+    }
+}
+
+// -----------------------------------------------
+
+/// Which MCP server an [`AgentMcpStartupFailure`] is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Server {
+    /// `rerun mcp`, through which the agent drives the viewer.
+    Rerun,
+
+    /// Any other server, e.g. one the user configured.
+    /// Its name is not sent for privacy reasons.
+    Other,
+}
+
+impl Server {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rerun => "rerun",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// An MCP server that the agent in the Rerun Viewer's agent panel was asked to start did not start.
+///
+/// This event contains no server name (other than whether it is ours), command, or error text.
+/// Only Codex and Claude Code report MCP startup failures, so only their sessions emit it.
+/// Codex reports them when the session opens, Claude Code only once the first prompt is sent.
+pub struct AgentMcpStartupFailure {
+    /// Which agent reported the failure, e.g. "Claude Code", if it introduced itself.
+    pub agent: Option<String>,
+
+    /// Which server failed to start.
+    pub server: Server,
+
+    /// Whether the agent's own config defines a server of the same name, which took precedence.
+    ///
+    /// This does not mean a replacement server ran: that config entry may be disabled.
+    pub replaced_by_agent_config: bool,
+}
+
+impl Event for AgentMcpStartupFailure {
+    const NAME: &'static str = "agent_mcp_startup_failure";
+}
+
+impl Properties for AgentMcpStartupFailure {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            agent,
+            server,
+            replaced_by_agent_config,
+        } = self;
+        event.insert_opt("agent", agent);
+        event.insert("server", server.as_str());
+        event.insert("replaced_by_agent_config", replaced_by_agent_config);
+    }
+}
+
+// -----------------------------------------------
+
+/// Non-content usage statistics for a finished turn in the Rerun Viewer's agent panel.
+///
+/// This event contains no prompt, response, tool output, or error text. It is emitted regardless
+/// of whether the user shares redacted prompts and responses.
+pub struct AgentTurnUsage {
+    /// Which agent handled the prompt, e.g. "Claude Code".
+    pub agent: Option<String>,
+
+    /// Which model handled the prompt, e.g. "Opus 5.5".
+    pub model: Option<String>,
+
+    /// From sending the prompt to the agent finishing.
+    pub duration_secs: f64,
+
+    /// How the turn ended: `completed`, `cancelled`, `truncated`, `refused`, `error`, or `aborted`.
+    pub outcome: String,
+
+    /// Tool calls the agent made during the turn.
+    pub tool_calls: u32,
+
+    /// Context-window usage the agent last reported, in tokens.
+    pub tokens_used: Option<u64>,
+    pub token_limit: Option<u64>,
+
+    /// Tool calls and transcript errors that failed, without their text.
+    pub failed_tool_calls: u32,
+    pub errors: u32,
+
+    /// Permission requests the user was asked about, and how many they rejected.
+    pub permissions_requested: u32,
+    pub permissions_rejected: u32,
+}
+
+impl Event for AgentTurnUsage {
+    const NAME: &'static str = "agent_turn_usage";
+}
+
+impl Properties for AgentTurnUsage {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            agent,
+            model,
+            duration_secs,
+            outcome,
+            tool_calls,
+            tokens_used,
+            token_limit,
+            failed_tool_calls,
+            errors,
+            permissions_requested,
+            permissions_rejected,
+        } = self;
+        if let Some(agent) = agent {
+            event.insert("agent", agent);
+        }
+        if let Some(model) = model {
+            event.insert("model", model);
+        }
+        event.insert("duration_secs", duration_secs);
+        event.insert("outcome", outcome);
+        event.insert("tool_calls", i64::from(tool_calls));
+        event.insert_opt(
+            "tokens_used",
+            tokens_used.and_then(|count| i64::try_from(count).ok()),
+        );
+        event.insert_opt(
+            "token_limit",
+            token_limit.and_then(|count| i64::try_from(count).ok()),
+        );
+        event.insert("failed_tool_calls", i64::from(failed_tool_calls));
+        event.insert("errors", i64::from(errors));
+        event.insert("permissions_requested", i64::from(permissions_requested));
+        event.insert("permissions_rejected", i64::from(permissions_rejected));
+    }
+}
+
+// -----------------------------------------------
+
+/// A coding agent in the Rerun Viewer's agent panel finished a turn (one prompt and its answer).
+///
+/// This event is only emitted by the agent panel, not by standalone users of `re_agent`.
+/// It carries the full prompt and response text, which is processed according to the
+/// [redaction instructions](https://github.com/rerun-io/rerun/blob/main/crates/panels/re_agent_panel/src/agent_analytics/redactor.rs)
+/// before sending. The agent settings explain this and ask the user to opt in.
+pub struct AgentTurn {
+    /// Non-content statistics about the turn.
+    pub usage: AgentTurnUsage,
+
+    /// What the user typed.
+    pub prompt: String,
+
+    /// The agent's final answer.
+    pub response: String,
+
+    /// Tool calls that failed, as `title: first line of the output`.
+    ///
+    /// Sent as `failed_tool_call_text`, since [`AgentTurnUsage`] already counts them
+    /// under `failed_tool_calls`.
+    pub failed_tool_calls: Vec<String>,
+
+    /// Errors shown in the transcript during the turn.
+    ///
+    /// Sent as `error_text`, since [`AgentTurnUsage`] already counts them under `errors`.
+    pub errors: Vec<String>,
+}
+
+impl Event for AgentTurn {
+    const NAME: &'static str = "agent_turn";
+}
+
+impl Properties for AgentTurn {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            usage,
+            prompt,
+            response,
+            failed_tool_calls,
+            errors,
+        } = self;
+        usage.serialize(event);
+        event.insert("prompt", prompt);
+        event.insert("response", response);
+        event.insert("failed_tool_call_text", failed_tool_calls.join("\n"));
+        event.insert("error_text", errors.join("\n"));
+    }
+}
+
+// -----------------------------------------------
+
+/// Who wrote a [`Feedback`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedbackAuthor {
+    /// The user, for example in the agent panel's feedback dialog.
+    User,
+
+    /// An agent, for example through a viewer control or MCP tool.
+    Agent,
+}
+
+impl FeedbackAuthor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+/// Feedback sent from the Rerun Viewer or the `rerun` CLI.
+///
+/// All feedback is one event. [`Self::author`] says who wrote it, [`Self::about`] says what it
+/// is about, and [`Self::source`] says where it came from.
+///
+/// ## User feedback on an agent session
+///
+/// `author: user`, `subject: session`, `source: viewer_panel`.
+///
+/// It carries the user's feedback text and the whole conversation: the user's prompts,
+/// the agent's answers, and its tool calls.
+/// It is only sent when the user clicks Send in the feedback dialog.
+///
+/// Before sending, the viewer redacts all of it with a new session of the user's own agent.
+/// That session runs in an empty directory, without tools, and gets only the JSON to redact.
+/// It replaces names, organizations, project names, contact details, hostnames, ids, and secrets
+/// with placeholders such as `<name>` or `<secret>`, and keeps everything else.
+/// Nothing is sent when the session fails, takes more than two minutes, or returns JSON in
+/// another shape.
+pub struct Feedback {
+    /// A random id for this feedback.
+    ///
+    /// When there is a trajectory, it also carries the id as `extra.feedback_id`, so the event
+    /// can be joined with the trajectory wherever the trajectory is stored.
+    pub feedback_id: Uuid,
+
+    /// Who wrote the feedback.
+    pub author: FeedbackAuthor,
+
+    /// Where the feedback was given, e.g. `viewer_panel`.
+    pub source: &'static str,
+
+    /// Which agent handled the conversation or wrote the feedback, e.g. "Claude Code".
+    pub agent: String,
+
+    pub about: FeedbackAbout,
+}
+
+pub enum FeedbackAbout {
+    Session(SessionFeedback),
+    Product(ProductFeedback),
+}
+
+pub struct SessionFeedback {
+    /// The feedback text.
+    pub feedback: String,
+
+    /// The conversation as ATIF JSON, or `None` when there is none or it was too large to send.
+    ///
+    /// ATIF is the [Agent Trajectory Interchange Format](https://docs.harborframework.com/agents/atif)
+    /// of the Harbor eval framework.
+    pub trajectory: Option<String>,
+
+    /// Size of the trajectory JSON in bytes, also when [`Self::trajectory`] is left out
+    /// because it was too large. `None` when there is no conversation.
+    pub trajectory_bytes: Option<usize>,
+
+    /// Images in the conversation: pasted by the user or shown by the agent.
+    ///
+    /// The trajectory does not carry them. The count tells how much of the conversation is missing.
+    pub image_count: Option<usize>,
+}
+
+/// Feedback from an agent about Rerun, modeled after the feedback.now protocol.
+///
+/// The fields and their limits use the names of the protocol, flattened into event properties:
+/// `signal.category`, `signal.severity`, `signal.reproducibility`, `signal.confidence`,
+/// `subject.surface`, `subject.kind`, `content.title`, and `content.summary`.
+pub struct ProductFeedback {
+    /// What kind of problem it is.
+    pub category: Option<FeedbackCategory>,
+
+    /// How much the problem got in the way.
+    pub severity: Option<FeedbackSeverity>,
+
+    /// How often the problem happens.
+    pub reproducibility: Option<FeedbackReproducibility>,
+
+    /// How sure the author is of the report.
+    pub confidence: Option<Confidence>,
+
+    /// The tool, command, or API that the feedback is about.
+    pub surface: Surface,
+
+    /// What kind of thing [`Self::surface`] names.
+    pub kind: Option<FeedbackSurfaceKind>,
+
+    /// The free text, only sent after redaction.
+    pub content: Option<ProductFeedbackContent>,
+}
+
+pub struct ProductFeedbackContent {
+    pub title: String,
+    pub summary: Option<String>,
+}
+
+impl ProductFeedback {
+    pub const MAX_TITLE_CHARS: usize = 256;
+    pub const MAX_SUMMARY_CHARS: usize = 4096;
+
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            category,
+            severity,
+            reproducibility,
+            confidence,
+            surface,
+            kind,
+            content,
+        } = self;
+        event.insert_opt("category", category.map(FeedbackCategory::as_str));
+        event.insert_opt("severity", severity.map(FeedbackSeverity::as_str));
+        event.insert_opt(
+            "reproducibility",
+            reproducibility.map(FeedbackReproducibility::as_str),
+        );
+        event.insert_opt("confidence", confidence.map(Confidence::get));
+        event.insert("surface", surface.0);
+        event.insert_opt("kind", kind.map(FeedbackSurfaceKind::as_str));
+        if let Some(ProductFeedbackContent { title, summary }) = content {
+            event.insert("title", truncate(title, Self::MAX_TITLE_CHARS));
+            event.insert_opt(
+                "summary",
+                summary.map(|summary| truncate(summary, Self::MAX_SUMMARY_CHARS)),
+            );
+        }
+    }
+}
+
+/// The tool, command, or API that the feedback is about, such as `rr.log`.
+///
+/// It is sent without redaction. [`Self::new`] keeps it an identifier, never free text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Surface(String);
+
+/// Why a name is not a [`Surface`].
+#[derive(thiserror::Error, Debug)]
+#[error(
+    "must be 1 to {} characters: letters, digits, `_`, `.`, `:`, and `-`",
+    Surface::MAX_CHARS
+)]
+pub struct InvalidSurface;
+
+impl Surface {
+    /// The longest a surface can be, in characters.
+    pub const MAX_CHARS: usize = 64;
+
+    pub fn new(name: String) -> Result<Self, InvalidSurface> {
+        let is_valid = !name.is_empty()
+            && name.chars().count() <= Self::MAX_CHARS
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'));
+        if is_valid {
+            Ok(Self(name))
+        } else {
+            Err(InvalidSurface)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// How sure the author is of the feedback. Always from 0 to 1 inclusive, never NaN.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Confidence(f64);
+
+/// Why a number is not a [`Confidence`].
+#[derive(thiserror::Error, Debug)]
+#[error("must be from 0 to 1")]
+pub struct InvalidConfidence;
+
+impl Confidence {
+    pub fn new(value: f64) -> Result<Self, InvalidConfidence> {
+        if (0.0..=1.0).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidConfidence)
+        }
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+fn truncate(text: String, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => text[..end].to_owned(),
+        None => text,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedbackCategory {
+    Bug,
+    DocsMismatch,
+    Friction,
+    FeatureGap,
+    QualityDegradation,
+    Other,
+}
+
+impl FeedbackCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bug => "bug",
+            Self::DocsMismatch => "docs_mismatch",
+            Self::Friction => "friction",
+            Self::FeatureGap => "feature_gap",
+            Self::QualityDegradation => "quality_degradation",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedbackSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+impl FeedbackSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+/// How often the problem of a [`ProductFeedback`] happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedbackReproducibility {
+    Always,
+    Sometimes,
+    Intermittent,
+    Once,
+}
+
+impl FeedbackReproducibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Sometimes => "sometimes",
+            Self::Intermittent => "intermittent",
+            Self::Once => "once",
+        }
+    }
+}
+
+/// What kind of thing the [`Surface`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedbackSurfaceKind {
+    ApiEndpoint,
+    DocsPage,
+    CliCommand,
+    SdkMethod,
+    Other,
+}
+
+impl FeedbackSurfaceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiEndpoint => "api_endpoint",
+            Self::DocsPage => "docs_page",
+            Self::CliCommand => "cli_command",
+            Self::SdkMethod => "sdk_method",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl Event for Feedback {
+    const NAME: &'static str = "feedback";
+}
+
+impl Properties for Feedback {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            feedback_id,
+            author,
+            source,
+            agent,
+            about,
+        } = self;
+        event.insert("feedback_id", feedback_id.to_string());
+        event.insert("author", author.as_str());
+        event.insert("source", source);
+        event.insert("agent", agent);
+        match about {
+            FeedbackAbout::Session(SessionFeedback {
+                feedback,
+                trajectory,
+                trajectory_bytes,
+                image_count,
+            }) => {
+                event.insert("subject", "session");
+                event.insert("feedback", feedback);
+                event.insert_opt("trajectory", trajectory);
+                event.insert_opt(
+                    "trajectory_bytes",
+                    trajectory_bytes.and_then(|bytes| i64::try_from(bytes).ok()),
+                );
+                event.insert_opt(
+                    "image_count",
+                    image_count.and_then(|count| i64::try_from(count).ok()),
+                );
+            }
+            FeedbackAbout::Product(product) => {
+                event.insert("subject", "product");
+                product.serialize(event);
+            }
+        }
+    }
+}
+
+// -----------------------------------------------
+
+/// The user opened the settings screen.
+pub struct SettingsOpened {}
+
+impl Event for SettingsOpened {
+    const NAME: &'static str = "settings-opened";
+}
+
+impl Properties for SettingsOpened {
+    fn serialize(self, _event: &mut AnalyticsEvent) {
+        let Self {} = self;
+    }
+}
+
+// -----------------------------------------------
+
+/// Sent the first time a table filter bar shows a "Custom" filter.
+///
+/// A "Custom" filter is SQL from the table blueprint that the filter bar can't edit.
+/// Sent at most once per viewer session.
+pub struct CustomTableFilterShown {}
+
+impl Event for CustomTableFilterShown {
+    const NAME: &'static str = "custom-table-filter-shown";
+}
+
+impl Properties for CustomTableFilterShown {
+    fn serialize(self, _event: &mut AnalyticsEvent) {
+        let Self {} = self;
+    }
+}
+
+// -----------------------------------------------
+
+/// Sent when incoming viewer data contains a component with both static and temporal data.
+///
+/// Sent at most once per process. Contains no entity or component identifiers.
+pub struct StaticTemporalComponentDetected {}
+
+impl Event for StaticTemporalComponentDetected {
+    const NAME: &'static str = "static-temporal-component-detected";
+}
+
+impl Properties for StaticTemporalComponentDetected {
+    fn serialize(self, _event: &mut AnalyticsEvent) {
+        let Self {} = self;
+    }
+}
+
+// -----------------------------------------------
+
+/// Links the current anonymous analytics ID to an authenticated user.
+///
+/// This is sent when a user logs in, allowing us to connect their
+/// pre-login anonymous activity with their authenticated identity.
+pub struct SetPersonProperty {
+    pub email: String,
+
+    /// The user's organization ID from the JWT claims.
+    pub organization_id: String,
+}
+
+impl Event for SetPersonProperty {
+    const NAME: &'static str = "$set";
+
+    const KIND: EventKind = EventKind::SetPersonProperties;
+}
+
+impl Properties for SetPersonProperty {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            email,
+            organization_id,
+        } = self;
+        event.insert("email", email);
+        event.insert("organization_id", organization_id);
+    }
+}
+
+// -----------------------------------------------
+
+/// Tracks when a data source is loaded from the viewer.
+///
+/// This is sent when a user opens a file, URL, or other data source.
+pub struct LoadDataSource {
+    /// The type of data source being loaded (e.g., "file", "http" etc.).
+    pub source_type: &'static str,
+
+    /// The file extension if applicable (e.g., "rrd", "png", "glb").
+    /// None for non-file sources like stdin or gRPC streams.
+    pub file_extension: Option<String>,
+
+    /// How the file was opened (e.g., "cli", "`file_dialog`" etc.).
+    /// Only applicable for file-based sources.
+    pub file_source: Option<&'static str>,
+
+    /// The kind of catalog that handled the load, if any.
+    pub catalog_kind: Option<&'static str>,
+
+    /// Whether the data source stream was started successfully.
+    pub started_successfully: bool,
+}
+
+impl Event for LoadDataSource {
+    const NAME: &'static str = "load_data_source";
+}
+
+impl Properties for LoadDataSource {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            source_type,
+            file_extension,
+            file_source,
+            catalog_kind,
+            started_successfully,
+        } = self;
+
+        event.insert("source_type", source_type);
+        event.insert_opt("file_extension", file_extension);
+        event.insert_opt("file_source", file_source.map(|s| s.to_owned()));
+        event.insert_opt("catalog_kind", catalog_kind.map(|s| s.to_owned()));
+        event.insert("started_successfully", started_successfully);
+    }
+}
+
+// -----------------------------------------------
+
+/// Tracks CLI command invocations.
+///
+/// This is sent when a user runs the Rerun CLI with any command.
+pub struct CliCommandInvoked {
+    pub build_info: BuildInfo,
+
+    /// The main command (e.g., "rrd", "auth", "mcap").
+    /// "viewer" is used when no subcommand is specified.
+    pub command: &'static str,
+
+    /// The subcommand if any (e.g., "compact", "merge", "login").
+    pub subcommand: Option<&'static str>,
+
+    // --- Flags ---
+    pub web_viewer: bool,
+    pub serve_web: bool,
+    pub serve_grpc: bool,
+    pub connect: bool,
+    pub save: bool,
+    pub screenshot_to: bool,
+    pub newest_first: bool,
+    pub persist_state_disabled: bool,
+    pub profile: bool,
+    pub expect_data_soon: bool,
+    pub hide_welcome_screen: bool,
+    pub detach_process: bool,
+    pub test_receive: bool,
+
+    /// `Some` only for the `mcp` command.
+    pub mcp_launcher: Option<McpLauncher>,
+}
+
+impl Event for CliCommandInvoked {
+    const NAME: &'static str = "cli_command_invoked";
+}
+
+impl Properties for CliCommandInvoked {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            build_info,
+            command,
+            subcommand,
+            web_viewer,
+            serve_web,
+            serve_grpc,
+            connect,
+            save,
+            screenshot_to,
+            newest_first,
+            persist_state_disabled,
+            profile,
+            expect_data_soon,
+            hide_welcome_screen,
+            detach_process,
+            test_receive,
+            mcp_launcher,
+        } = self;
+
+        build_info.serialize(event);
+        event.insert("command", command);
+        event.insert_opt("subcommand", subcommand.map(|s| s.to_owned()));
+        event.insert("web_viewer", web_viewer);
+        event.insert("serve_web", serve_web);
+        event.insert("serve_grpc", serve_grpc);
+        event.insert("connect", connect);
+        event.insert("save", save);
+        event.insert("screenshot_to", screenshot_to);
+        event.insert("newest_first", newest_first);
+        event.insert("persist_state_disabled", persist_state_disabled);
+        event.insert("profile", profile);
+        event.insert("expect_data_soon", expect_data_soon);
+        event.insert("hide_welcome_screen", hide_welcome_screen);
+        event.insert("detach_process", detach_process);
+        event.insert("test_receive", test_receive);
+        event.insert_opt("mcp_launcher", mcp_launcher.map(McpLauncher::as_str));
+    }
+}
+
+/// What started a `rerun mcp` process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpLauncher {
+    /// The process got `--from-agent-panel`, which only the viewer's agent panel passes.
+    AgentPanel,
+
+    /// The process did not get `--from-agent-panel`.
+    ///
+    /// The agent panel also lands here when it runs a `rerun` from `PATH`,
+    /// so `AgentPanel` counts are a lower bound on agent panel launches.
+    Unknown,
+}
+
+impl McpLauncher {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentPanel => "agent_panel",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+// -----------------------------------------------
+
+/// Sent by `rerun mcp` for each tool call it answers with a tool result.
+///
+/// Only calls to this server's own tools are sent.
+/// An agent calls other MCP servers, such as a Linear integration, directly, so those calls never reach this event.
+/// A tool call that ends in a JSON-RPC error sends no event.
+/// This event contains no tool arguments, tool output, or error text.
+pub struct McpToolCalled {
+    /// A name from [`RerunMcpServer::all_tools`](https://github.com/rerun-io/rerun/blob/main/crates/top/re_rerun_mcp/src/lib.rs), or `unknown`.
+    ///
+    /// A client can send any text as a tool name, so other names are replaced.
+    pub tool: String,
+    pub is_error: bool,
+}
+
+impl Event for McpToolCalled {
+    const NAME: &'static str = "mcp_tool_called";
+}
+
+impl Properties for McpToolCalled {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self { tool, is_error } = self;
+        event.insert("tool", tool);
+        event.insert("is_error", is_error);
+        event.insert("rerun_version", CrateVersion::LOCAL.to_string());
+    }
+}
+
+// -----------------------------------------------
+
+/// Tracks navigation clicks on the welcome screen cards.
+///
+/// This event is sent when users click on cards on the welcome screen,
+/// such as documentation links or cloud-related call-to-actions (CTAs).
+pub struct WelcomeScreenNavigation {
+    /// Type of the card. E.g. "docs", "redap".
+    pub card_type: String,
+
+    /// The destination URL that was navigated to.
+    /// Empty string if the click was on a CTA that opened a modal instead.
+    pub destination: String,
+
+    /// Whether this was a click on a cloud modal CTA (e.g. "Add server", "Login").
+    pub cta_cloud: bool,
+
+    /// Whether the user is logged in.
+    pub is_logged_in: bool,
+
+    /// Whether there is a server added.
+    pub has_server: bool,
+}
+
+impl Event for WelcomeScreenNavigation {
+    const NAME: &'static str = "welcome_navigation";
+}
+
+impl Properties for WelcomeScreenNavigation {
+    fn serialize(self, event: &mut AnalyticsEvent) {
+        let Self {
+            card_type,
+            destination,
+            cta_cloud,
+            is_logged_in,
+            has_server,
+        } = self;
+
+        event.insert("card_type", card_type);
+        event.insert("destination", destination);
+        event.insert("cta_cloud", cta_cloud);
+        event.insert("is_logged_in", is_logged_in);
+        event.insert("has_server", has_server);
+        event.insert("rerun_version", CrateVersion::LOCAL.to_string());
+    }
+}
+
+// -----------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use super::*;
+
+    fn cli_event(command: &'static str, mcp_launcher: Option<McpLauncher>) -> AnalyticsEvent {
+        let mut event = AnalyticsEvent::new(CliCommandInvoked::NAME, CliCommandInvoked::KIND);
+        CliCommandInvoked {
+            build_info: re_build_info::cargo_build_info!(),
+            command,
+            subcommand: None,
+            web_viewer: false,
+            serve_web: false,
+            serve_grpc: false,
+            connect: false,
+            save: false,
+            screenshot_to: false,
+            newest_first: false,
+            persist_state_disabled: false,
+            profile: false,
+            expect_data_soon: false,
+            hide_welcome_screen: false,
+            detach_process: false,
+            test_receive: false,
+            mcp_launcher,
+        }
+        .serialize(&mut event);
+        event
+    }
+
+    #[test]
+    fn mcp_reports_its_launcher() {
+        let event = cli_event("mcp", Some(McpLauncher::AgentPanel));
+        assert_matches!(&event.props["mcp_launcher"],
+            Property::String(launcher) if launcher == "agent_panel");
+    }
+
+    #[test]
+    fn other_commands_send_no_launcher() {
+        let event = cli_event("viewer", None);
+        assert!(
+            !event.props.contains_key("mcp_launcher"),
+            "expected no mcp_launcher, got {:?}",
+            event.props.get("mcp_launcher")
+        );
+    }
+
+    /// The text fields must not overwrite the counts that [`AgentTurnUsage`] already inserted.
+    #[test]
+    fn agent_turn_keeps_both_the_counts_and_the_text() {
+        let usage = AgentTurnUsage {
+            agent: None,
+            model: None,
+            duration_secs: 1.0,
+            outcome: "completed".to_owned(),
+            tool_calls: 3,
+            tokens_used: None,
+            token_limit: None,
+            failed_tool_calls: 2,
+            errors: 1,
+            permissions_requested: 0,
+            permissions_rejected: 0,
+        };
+        let mut event = AnalyticsEvent::new(AgentTurn::NAME, AgentTurn::KIND);
+        AgentTurn {
+            usage,
+            prompt: "hi".to_owned(),
+            response: "ho".to_owned(),
+            failed_tool_calls: vec!["a: boom".to_owned(), "b: bang".to_owned()],
+            errors: vec!["oh no".to_owned()],
+        }
+        .serialize(&mut event);
+
+        assert_matches!(event.props["failed_tool_calls"], Property::Integer(2));
+        assert_matches!(event.props["errors"], Property::Integer(1));
+        assert_matches!(&event.props["failed_tool_call_text"],
+            Property::String(text) if text == "a: boom\nb: bang");
+        assert_matches!(&event.props["error_text"],
+            Property::String(text) if text == "oh no");
+    }
+
+    fn product_event(product: ProductFeedback) -> AnalyticsEvent {
+        let mut event = AnalyticsEvent::new(Feedback::NAME, Feedback::KIND);
+        Feedback {
+            feedback_id: Uuid::nil(),
+            author: FeedbackAuthor::Agent,
+            source: "mcp",
+            agent: "Test Agent".to_owned(),
+            about: FeedbackAbout::Product(product),
+        }
+        .serialize(&mut event);
+        event
+    }
+
+    #[test]
+    fn product_feedback_without_content_sends_no_text() {
+        let event = product_event(ProductFeedback {
+            category: Some(FeedbackCategory::DocsMismatch),
+            severity: None,
+            reproducibility: None,
+            confidence: None,
+            surface: surface("viewer_set_blueprint"),
+            kind: None,
+            content: None,
+        });
+        assert!(matches!(&event.props["subject"], Property::String(s) if s == "product"));
+        assert!(matches!(&event.props["category"], Property::String(s) if s == "docs_mismatch"));
+        assert!(
+            matches!(&event.props["surface"], Property::String(s) if s == "viewer_set_blueprint")
+        );
+        assert!(!event.props.contains_key("severity"));
+        assert!(!event.props.contains_key("reproducibility"));
+        assert!(!event.props.contains_key("confidence"));
+        assert!(!event.props.contains_key("kind"));
+        assert!(!event.props.contains_key("title"));
+        assert!(!event.props.contains_key("summary"));
+    }
+
+    #[test]
+    fn product_feedback_content_is_cut_to_the_limits() {
+        let event = product_event(ProductFeedback {
+            category: None,
+            severity: Some(FeedbackSeverity::Low),
+            reproducibility: None,
+            confidence: None,
+            surface: surface("rr.log"),
+            kind: None,
+            content: Some(ProductFeedbackContent {
+                title: "é".repeat(ProductFeedback::MAX_TITLE_CHARS + 1),
+                summary: Some("x".repeat(ProductFeedback::MAX_SUMMARY_CHARS + 1)),
+            }),
+        });
+        assert!(matches!(
+            &event.props["title"],
+            Property::String(s) if s.chars().count() == ProductFeedback::MAX_TITLE_CHARS
+        ));
+        assert!(matches!(
+            &event.props["summary"],
+            Property::String(s) if s.chars().count() == ProductFeedback::MAX_SUMMARY_CHARS
+        ));
+    }
+
+    #[test]
+    fn product_feedback_sends_reproducibility_kind_and_confidence() {
+        let event = product_event(ProductFeedback {
+            category: None,
+            severity: None,
+            reproducibility: Some(FeedbackReproducibility::Intermittent),
+            confidence: Some(Confidence::new(0.1).expect("in range")),
+            surface: surface("rr.log"),
+            kind: Some(FeedbackSurfaceKind::SdkMethod),
+            content: None,
+        });
+        assert!(
+            matches!(&event.props["reproducibility"], Property::String(s) if s == "intermittent")
+        );
+        assert!(matches!(&event.props["kind"], Property::String(s) if s == "sdk_method"));
+        assert!(matches!(event.props["confidence"], Property::Float(c) if c == 0.1));
+    }
+
+    fn surface(name: &str) -> Surface {
+        Surface::new(name.to_owned()).expect("a valid surface")
+    }
+
+    #[test]
+    fn only_a_short_name_is_a_surface() {
+        for name in [
+            "viewer_set_blueprint",
+            "rr.log",
+            "rerun::RecordingStream",
+            &"x".repeat(64),
+        ] {
+            assert!(Surface::new(name.to_owned()).is_ok(), "{name}");
+        }
+        for name in ["", "rr.log(\"/home/me/data\")", "a tool", &"x".repeat(65)] {
+            assert!(Surface::new(name.to_owned()).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn only_zero_to_one_is_a_confidence() {
+        for value in [0.0, 0.1, 1.0] {
+            assert!(Confidence::new(value).is_ok(), "{value}");
+        }
+        for value in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert!(Confidence::new(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn web_host_never_names_a_private_site() {
+        for (url, expected) in [
+            ("https://rerun.io/viewer?url=x", Some("rerun.io")),
+            ("https://App.Rerun.io/version/0.15.1/", Some("rerun.io")),
+            ("https://my-stack.cloud.rerun.io/", Some("cloud.rerun.io")),
+            ("https://someone-demo.hf.space/", Some("hf.space")),
+            ("https://lab-pc.tail1234.ts.net:9090/", Some("ts.net")),
+            ("http://localhost:9090/", Some("local")),
+            ("http://robot.local:9090/", Some("local")),
+            ("http://127.0.0.1:9090/", Some("local")),
+            ("http://192.168.1.20:9090/", Some("local")),
+            ("http://[::1]:9090/", Some("local")),
+            ("https://viewer.example.com/", Some("other")),
+            ("https://notrerun.io/", Some("other")),
+            ("http://8.8.8.8/", Some("other")),
+            ("not a url", None),
+        ] {
+            assert_eq!(web_host(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn rerun_url_is_only_sent_for_rerun_hosts_and_without_the_query() {
+        assert_eq!(
+            sanitized_rerun_url(
+                "https://rerun.io/viewer?url=rerun://api.example.cloud.rerun.io/dataset/1#frag"
+            ),
+            Some("https://rerun.io/viewer".to_owned())
+        );
+        assert_eq!(
+            sanitized_rerun_url("https://app.rerun.io/version/0.15.1/"),
+            Some("https://app.rerun.io/version/0.15.1/".to_owned())
+        );
+
+        // Hub viewers, other domains and local servers send no page URL.
+        assert_eq!(
+            sanitized_rerun_url("https://example.cloud.rerun.io/?url=rerun://example"),
+            None
+        );
+        assert_eq!(sanitized_rerun_url("https://example.com/viewer"), None);
+        assert_eq!(sanitized_rerun_url("http://localhost:9090/"), None);
+    }
+}

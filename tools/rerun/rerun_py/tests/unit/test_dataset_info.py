@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import numpy as np
+import pyarrow as pa
+import pytest
+from inline_snapshot import snapshot
+from rerun.catalog import DatasetInfo, LayerInfo, TimelineInfo, TimelineKind
+
+
+def _info(**overrides: object) -> DatasetInfo:
+    fields: dict[str, object] = {
+        "dataset_name": "robot_runs",
+        "num_segments": 120,
+        "size_bytes": 410_602_113_024,
+        "layers": frozenset({
+            LayerInfo(name="predictions-v1", num_segments=118),
+            LayerInfo(name="base", num_segments=120),
+            LayerInfo(name="annotations", num_segments=1),
+        }),
+        "timelines": frozenset({
+            TimelineInfo(
+                name="log_time",
+                kind=TimelineKind.TIMESTAMP,
+                num_segments=120,
+                min=np.datetime64("2026-09-01T08:12:03.120000000", "ns"),
+                max=np.datetime64("2026-09-30T17:45:59.004000000", "ns"),
+            ),
+            TimelineInfo(name="step", kind=TimelineKind.SEQUENCE, num_segments=120, min=np.int64(0), max=np.int64(184)),
+            TimelineInfo(
+                name="sim_time",
+                kind=TimelineKind.DURATION,
+                num_segments=3,
+                min=np.timedelta64(1_500_000_000, "ns"),
+                max=np.timedelta64(90_000_000_000, "ns"),
+            ),
+        }),
+        "num_entities": 37,
+        "num_component_columns": 112,
+        "property_columns": frozenset({"property:episode:success", "property:episode:operator"}),
+    }
+    fields.update(overrides)
+    return DatasetInfo(**fields)  # type: ignore[arg-type]
+
+
+def test_repr() -> None:
+    assert repr(_info()) == snapshot("""\
+DatasetInfo(robot_runs: 120 segments, 382 GiB)
+  contents: 37 entities, 112 component columns
+  properties: property:episode:operator, property:episode:success
+  layers:
+    annotations: in 1 segment
+    base: in 120 segments
+    predictions-v1: in 118 segments
+  timelines:
+    log_time: timestamp, 2026-09-01 08:12:03.120Z … 2026-09-30 17:45:59.004Z, in 120 segments
+    sim_time: duration, +1.5s … +90s, in 3 segments
+    step: sequence, #0 … #184, in 120 segments\
+""")
+
+
+def test_repr_empty() -> None:
+    info = _info(
+        num_segments=0,
+        size_bytes=0,
+        layers=frozenset(),
+        timelines=frozenset(),
+        property_columns=frozenset(),
+    )
+    assert repr(info) == snapshot("""\
+DatasetInfo(robot_runs: 0 segments, 0 B)
+  contents: 37 entities, 112 component columns
+  properties: (none)\
+""")
+
+
+def test_child_reprs() -> None:
+    assert repr(LayerInfo(name="base", num_segments=120)) == snapshot("LayerInfo(base: in 120 segments)")
+    assert repr(
+        TimelineInfo(name="step", kind=TimelineKind.SEQUENCE, num_segments=120, min=np.int64(0), max=np.int64(184))
+    ) == (snapshot("TimelineInfo(step: sequence, #0 … #184, in 120 segments)"))
+
+
+def test_is_hashable() -> None:
+    hash(_info())
+
+
+@pytest.mark.parametrize("kind", list(TimelineKind))
+def test_timeline_kind_datatype_round_trips(kind: TimelineKind) -> None:
+    assert TimelineKind.from_datatype(kind.datatype) is kind
+
+
+def test_timeline_kind_from_timestamp_ignores_timezone() -> None:
+    assert TimelineKind.from_datatype(pa.timestamp("ns", tz="Europe/Zurich")) is TimelineKind.TIMESTAMP
+
+
+@pytest.mark.parametrize("datatype", [pa.int32(), pa.duration("us"), pa.timestamp("ms"), pa.string()])
+def test_timeline_kind_rejects_other_datatypes(datatype: pa.DataType) -> None:
+    with pytest.raises(ValueError, match="Not a timeline datatype"):
+        TimelineKind.from_datatype(datatype)

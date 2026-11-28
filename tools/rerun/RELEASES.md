@@ -1,0 +1,247 @@
+# Releases and versioning
+
+This document describes the current release and versioning strategy. This strategy is likely to change as Rerun matures.
+
+> [!IMPORTANT]
+> All releases are run by Rerun maintainers with the `oss-release` Claude Code skill, which lives in our private monorepo (`.claude/skills/oss-release/`).
+> The skill drives the whole process: pre-flight checks, confirmation points, triggering the release workflow, verifying the published packages, and the post-release chores.
+> This document describes the mechanics the skill relies on: versioning, branches, and what the release workflow does.
+
+## See also
+
+-   [`ARCHITECTURE.md`](ARCHITECTURE.md)
+-   [`BUILD.md`](BUILD.md)
+-   [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+-   [`CODE_STYLE.md`](CODE_STYLE.md)
+-   [`CONTRIBUTING.md`](CONTRIBUTING.md)
+
+## Repository
+
+:warning: The steps & workflows in this document are targeting the open-source Rerun repository (https://github.com/rerun-io/rerun), not our internal monorepo.
+
+## Release cadence
+
+New Rerun versions are released every two weeks. Sometimes we do out-of-schedule patch releases.
+We do not block a release on a PR. Incomplete work should be hidden behind a feature flag.
+
+## Library versioning and release cadence
+
+Each release include new versions of:
+
+-   All Rust crates
+-   The Python SDK
+-   The Rust SDK
+-   The C++ SDK
+
+We use semantic versioning. All versions are increased in lockstep, with a minor version bump each time (`0.1.0`, `0.2.0`, `0.3.0`, …).
+
+This means we might add breaking changes in each new release.
+
+In rare cases we will do patch releases, e.g. `0.3.1`, when there is a critical bug fix. These patch releases will not contain any breaking changes.
+
+We sometimes do pre-releases. Then we use the versioning `0.2.0-alpha.0` etc.
+
+The version on our `main` branch is always an `-alpha.N+dev` version. We build artifacts from `main` every day, though these are not published on package registries.
+Install the latest build of `main` with `uv pip install --index https://build.rerun.io/version/main/simple --reinstall-package rerun-sdk rerun-sdk`, and see [`BUILD.md`](BUILD.md) for more.
+
+## Rust version policy
+
+Our Minimum Supported Rust Version (MSRV) is always _at least_ one minor release behind the latest Rust version, and ideally two releases.
+
+-   This means users of our libraries aren't forced to update to the very latest Rust version
+-   This lets us sometimes avoid new bugs in the newly released Rust compiler
+
+## Data and communication versioning
+
+We have not yet committed to any backwards or forwards compatibility.
+
+We tag all data files (`.rrd` files) and communication protocols with the Rerun version number. If there is a version mismatch, a warning is logged, but an attempt is still made to load the older or newer data.
+As of 0.23, we automatically migrate data from older versions, with an N-1 compatibility policy. That means `0.24` supports migrating `0.23` data, `0.25` supports migrating `0.24` data, etc.
+
+# Release process
+
+These are the steps of a release, and what has to be true after each one.
+The `oss-release` skill runs them in order, with the checks and confirmations around them.
+
+### 1. Determine what the next version should be
+
+There usually isn't any ambiguity, as releases are planned ahead of time.
+See [library versioning](#library-versioning-and-release-cadence) for the version scheme.
+
+### 2. Create a release branch
+
+The branch name is the single source of truth for the _release version_. Our release workflow automatically updates all versions
+in the repository to what is specified in the branch name, so the format is important:
+
+- `prepare-release-0.x.y` for minor and patch releases.
+- `prepare-release-0.x.y-alpha.N` for alpha releases.
+
+Note that `prepare-release-0.x` is _invalid_. Always specify the `y`, even if it is `0`, e.g. `prepare-release-0.15.0` instead of `prepare-release-0.15`.
+
+The _base_ of the branch should depends on what kind of release it is:
+
+- For a _minor_ release, the branch is created from `main`.
+- For a _patch_ release, the branch is created from `docs-latest` ( :warning: branching off `docs-latest` instead of the latest release tag ensures that documentation patches will be included)
+- For an _alpha_ release, the branch is created from `main`.
+
+**NOTE (for patch releases)**: upon creation of the branch, the version is set to the final version of the previous release. This can create issues when testing the patch release, since it has a non-"+dev" version identical to/conflicting with an existing release. Because of that, an RC (release candidate) should preferably be created before testing.
+Create the RC (`rc` release type, see step 6) once the patch-release branch is ready for testing.
+
+### 3. If this is a patch release, cherry-pick commits for inclusion in the release into the branch
+
+In GitHub we have a `consider-patch` label that we put on PRs that we might want to include in the release.
+The fastest way to get an overview of all the patch candidate PRs from both repositories and their corresponding commit hashes is to run this script:
+
+```
+uv run scripts/fetch_patch_candidates.py
+```
+
+After cherry-picking a commit into the patch, please make sure to remove the `consider-patch` label.
+
+### 4. Finalize the changeset and update [`CHANGELOG.md`](./CHANGELOG.md)
+
+⚠️ Skip this step when preparing an alpha release.
+
+The curated part of the release notes — highlights, new features, other items, and breaking changes &
+migration guides, including any screenshots/GIFs — is written incrementally **during the cycle, per PR**:
+every `include in changelog` PR drops one file in [`docs/content/changelog/upcoming/`](./docs/content/changelog/upcoming)
+(one file per PR avoids merge conflicts).
+At release, assemble those entries into the release's changeset:
+
+This whole step is an agent-friendly task — run the `/assemble-changelog` skill (Claude Code), which
+does it end to end:
+
+-   Assembles `upcoming/*.md` into `docs/content/changelog/changeset-0-xx.md`, grouping each entry by
+    its `type:` hint (`highlight` / `misc` / `breaking` / `feature`), merging and de-duplicating the entries.
+-   Checks that the assembled changeset has no unresolved `TODO(name)` placeholders.
+-   Generates the detail sections (bug fixes + the full list of changes) into `CHANGELOG.md`,
+    via `pixi run uvpy scripts/generate_changelog.py --version 0.x.y` — edit PR titles/labels to
+    improve the output.
+-   Points the `redirect:` in [`docs/content/changelog.md`](./docs/content/changelog.md) at this
+    release's changeset (`scripts/ci/check_changelog_redirect.py` requires the newest changeset to be
+    the redirect target, so this must land together with the new changeset).
+-   Deletes the merged files from `upcoming/` (leaving `_template.md`).
+
+Every `TODO(name)` in the changeset (docs links, example links, screenshots/GIFs, migration guides) must then be resolved.
+**The release is blocked until all of these are resolved.**
+A maintainer reviews and approves the assembled changelog on the release branch before the final release.
+
+The changeset is *not* copied into `CHANGELOG.md`. The script summarizes it instead — the section
+headings plus links to the changeset on the website — so the full prose lives in exactly one place.
+
+Do *not* create the next release's changeset yet: an empty changeset for an unreleased version would
+fail the redirect check in CI. The next changeset is created from
+[`docs/content/changelog/_template.md`](./docs/content/changelog/_template.md) when that release is
+assembled. Until then the now-empty [`upcoming/`](./docs/content/changelog/upcoming) folder collects
+the next release's per-PR entries.
+
+### 5. Clean up documentation links
+
+⚠️ Skip this step when preparing an alpha release.
+
+Delete every file in [`docs/speculative_links/`](./docs/speculative_links/_template.txt) except `_template.txt`: the release puts their links live.
+The release workflow fails if any are left.
+
+Update the [python support table](./rerun_py/docs/gen_common_index.py) for the major release.
+
+Once you're done, commit and push onto the release branch.
+
+### 6. Run the [release workflow](https://github.com/rerun-io/rerun/actions/workflows/release.yml)
+
+The workflow is dispatched on the release branch from step 2, with these inputs:
+
+-   `release-type`:
+    - `alpha` if the branch name is `prepare-release-x.y.z-alpha.N`.
+      This will create a one-off alpha release.
+    - `rc` if the branch name is `prepare-release-x.y.z`.
+      This will publish a release candidate.
+    - `final` for the final public release.
+-   `publish-crates` (default `true`): `false` skips publishing to crates.io.
+    With `true`, the workflow fails before publishing anything if `Cargo.toml` has a `[patch.crates-io]` override, since crates.io cannot resolve it.
+-   `increase-rc` (default `true`, `rc` only): `false` publishes the branch's current `-rc.N` again instead of the next one.
+    See "Running the release again" below.
+
+The workflow refuses to run when the branch name and `release-type` disagree.
+In all three cases, the workflow opens (or updates) a release pull request against `main`.
+A patch's release PR is opened before the workflow runs, against the previous release's `prepare-release-0.x.y` branch so its diff shows exactly the patch, and labeled `do-not-merge`; the workflow reuses it.
+
+#### Running the release again
+
+- A `final` can be dispatched again at any time before it is tagged: its version comes from the branch name, and every publish job skips what is already published.
+- Every `rc` dispatch publishes the next `-rc.N`, unless `increase-rc` is `false`.
+  Turning it off is for a run that failed partway through publishing, followed by a small fix that unblocks it, such as a file missing from a crate's `include`.
+  The rc then mixes code: what the failed run published keeps the old code, since registries never accept a second upload of the same version, and only what was missing gets the fix.
+  Any bigger change needs a new rc.
+  The workflow refuses this once the rc is tagged, i.e. once it published everything.
+- Re-running failed jobs of a run (`gh run rerun --failed`) reuses that run's version and release commit, so it does not pick up commits pushed since.
+  Use it for flaky failures, and dispatch again for anything that needs a fix on the branch.
+
+### 7. Wait for the release workflow to finish
+
+Once the release workflow is started, it will create a pull request for the release, unless one already exists.
+The pull request description lists the follow-up steps.
+
+[The `Release` workflow](https://github.com/rerun-io/rerun/actions/workflows/release.yml) will build artifacts, run PR checks, and publish them to PyPI, crates.io, npm, etc.
+For `rc` and `final` releases it also creates a **draft** [GitHub release](https://github.com/rerun-io/rerun/releases) (in the `tag-release` job) and attaches a comment to the release PR pointing at it.
+The draft's description is pre-filled with the standard preamble (what Rerun is, plus install instructions) and the release's section of `CHANGELOG.md`.
+
+Once the `Release` workflow has finished successfully and you've sanity-checked the artifacts, check the draft's description, then click `Publish release`.
+Publishing the release triggers the [`GitHub Release` workflow](https://github.com/rerun-io/rerun/actions/workflows/on_gh_release.yml), which syncs the binary assets from `build.rerun.io` onto the published GitHub release.
+**Make sure that workflow also finishes successfully** so the release ends up with all of its assets attached.
+
+For a final release, the same workflow also does the post-release chores:
+
+- Removes `consider-patch` (rerun-io/rerun) and `consider-oss-patch` (rerun-io/reality) from the PRs that shipped in this release.
+- Waits for the website to redeploy, then runs [`scripts/ci/verify_release.py`](./scripts/ci/verify_release.py), which fails the job if anything is missing and writes its summary to the workflow run.
+  It checks PyPI, npm, crates.io and conda-forge, the GitHub release, rerun.io/docs, rerun.io/viewer, app.rerun.io, the web viewer embedded by `rerun-io/landing`, `docs-latest`, and the gradio-rerun-viewer release.
+  conda-forge often lags behind by hours, so a missing conda-forge version is only a warning.
+  The same goes for `rerun-io/landing`: Dependabot opens its `@rerun-io/web-viewer` bump PR within a day, and it merges itself once its CI is green.
+
+Follow up on anything the check reports as failed.
+The `#ship-room` Slack announcement is done by the release captain, or the release agent via the `oss-release` skill.
+The Discord announcement is drafted by the `oss-release` skill, and then edited and posted by the release captain.
+To re-run the check later, run `python3 scripts/ci/verify_release.py 0.x.y`.
+
+### 8. Merge changes to `main`
+
+The release branch will contain a post-release version bump commit made by the release bot.
+For example, `prepare-release-0.25.0` will be bumped to `0.26.0-alpha.1+dev` once everything has been released.
+Additionally, it's common for us to push small changes and bug fixes directly to the release branch.
+
+We want all of this to land back on `main`.
+This happens in our internal monorepo, which `main` is exported from, not by merging the release PR: the version bump also changes lockfiles that only exist there.
+
+- For a minor or patch release, the release branch's commits are cherry-picked onto `main`, except the release bot's version bumps and fixes that are already on `main`.
+  `main` then gets bumped to the next `-alpha.N+dev` version, and its lockfiles are refreshed.
+- For a final release, close the release PR without merging once every post-release chore is verified done, including the merge-back and the `rerun-io/landing` web viewer bump.
+  A closed release PR marks the release as done.
+- For an alpha release, close the release PR without merging, whether or not the release job succeeded.
+  Its version bump commit points documentation links at the alpha version, which must not land on `main`.
+  Cherry-pick any fixes made on the release branch into `reality` instead, but not the version bump commit.
+
+The `consider-patch` and `consider-oss-patch` labels are removed automatically from the PRs that shipped in a final release (see step 7).
+
+### 9. Clean up PR labels
+
+This is automated for final releases (see step 7).
+`uv run scripts/fetch_patch_candidates.py` still shows a warning for patch-labeled PRs that were merged before a release, e.g. if the `Remove patch labels` job failed.
+Remove the label from PRs that are already part of a release.
+
+## PyPI project size limit
+
+PyPI rejects every upload to `rerun-sdk` once the project reaches its size limit (50 GiB), which blocks a release halfway through.
+The `Check PyPI project size` step at the start of the release workflow fails when the next release would not fit, and warns when headroom runs low.
+
+To free up space, delete alphas (`aN`) and release candidates (`rcN`) that are older than the latest stable release:
+
+```sh
+pixi run pypi-prune-prereleases                                  # dry run: lists what would be deleted and how much it frees
+pixi run pypi-prune-prereleases --delete --username <pypi-user>  # prompts for the pypi.org password and TOTP code
+```
+
+`<pypi-user>` is your own pypi.org user account, which needs the Owner role on `rerun-sdk`.
+The password prompt is for that account's pypi.org login password, not an API token.
+
+Deletion goes through the PyPI web UI (there is no API for it), so it has to be run by a project owner with TOTP 2FA.
+Owners who only have a security key can delete the listed releases by hand on the [project's release page](https://pypi.org/manage/project/rerun-sdk/releases/).
+Stable releases are never deleted, and a deleted version can never be re-uploaded.

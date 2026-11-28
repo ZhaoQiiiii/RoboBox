@@ -12,6 +12,8 @@ __pycache__/
 *.py[cod]
 # LidarRender 测试生成的点云
 /tools/LidarRender/tests/data/
+# 内置 rerun 源码的测试素材（约 660MB），不入库
+/tools/rerun/tests/assets/
 
 # ==================== 运行时数据 ====================
 logs/

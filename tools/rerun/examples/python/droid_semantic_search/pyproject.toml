@@ -1,0 +1,44 @@
+[project]
+name = "droid_semantic_search"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  # `catalog` brings datafusion + pandas; `dataloader` brings torch, torchvision, av, pillow.
+  "rerun-sdk[catalog,dataloader]",
+  "lancedb", # default local vector store + ANN index (--backend lance)
+  "qdrant-client", # alternative local vector store (--backend qdrant)
+  "transformers>=5.23.0", # SigLIP-2 model + processor
+  "pyarrow<27", # building the vector-index table
+  "huggingface-hub", # prepare_dataset.py: download DROID sample episodes from the Hub
+  "tqdm", # progress bars for download/register/ingest
+]
+
+[dependency-groups]
+dev = ["types-tqdm"]
+
+[tool.rerun-example]
+# Picked up by scripts/ci/isolated_examples.py and the `py-lint-isolated-examples` pixi task.
+isolated = true
+
+[tool.uv]
+# The example is flat scripts, not a wheel — skip project build, just sync deps.
+package = false
+
+# Default `uv sync` uses the in-repo editable rerun-sdk (monorepo dev mode).
+# After syncing, also run `uv pip install ../../../rerun_py/rerun_dev_fixup` to
+# point the `rerun` CLI at the in-repo `target/debug/rerun` build.
+#
+# Standalone users (e.g. sparse-checkout of just this example) run instead:
+#   uv sync --no-sources --no-dev
+# That ignores the path source below and resolves `rerun-sdk` from PyPI.
+# rerun-dev-fixup is intentionally absent from this file: uv 0.7.x resolves all
+# dependency groups and extras unconditionally, so any path-only package here would
+# block standalone `--no-sources` resolution.
+[tool.uv.sources]
+rerun-sdk = { path = "../../../rerun_py", editable = true }
+
+# Makes ty treat this example as its own project instead of walking up to the workspace config.
+[tool.ty.environment]
+python = ".venv"
+extra-paths = ["../../../rerun_py", "../../../rerun_py/rerun_sdk"]

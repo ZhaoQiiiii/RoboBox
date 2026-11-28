@@ -1,0 +1,116 @@
+"""
+Experimental features for Rerun.
+
+These features are not yet stable and may change in future releases without
+going through the normal deprecation cycle.
+
+The stable chunk API and readers (`RrdReader`, `McapReader`, …) now live in `rerun.chunk`.
+The old `rerun.experimental` names still work for one release but warn on use.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from . import video as video
+from ._hdf5_reader import DatasetInfo as DatasetInfo, Hdf5Reader as Hdf5Reader
+from ._lerobot_reader import LeRobotReader as LeRobotReader
+from ._mp4_reader import Mp4Info as Mp4Info, Mp4Reader as Mp4Reader, Mp4TranscodeOptions as Mp4TranscodeOptions
+from ._object_store import BearerTokenObjectStoreAuth as BearerTokenObjectStoreAuth, ObjectStoreAuth as ObjectStoreAuth
+from ._optimizer_settings import (
+    _GopBatchingRule as _GopBatchingRule,
+    _MergeSplitSettings as _MergeSplitSettings,
+    _OwnChunkRule as _OwnChunkRule,
+)
+from ._parquet_reader import ParquetReader as ParquetReader
+from ._query_metrics import (
+    MetricsCollector as MetricsCollector,
+    QueryMetrics as QueryMetrics,
+    query_metrics as query_metrics,
+)
+from ._viewer_client import (
+    Blueprint as Blueprint,
+    BlueprintInfo as BlueprintInfo,
+    Command as Command,
+    ComponentSchema as ComponentSchema,
+    DatasetAssetSchema as DatasetAssetSchema,
+    DatasetSchema as DatasetSchema,
+    EntitySchema as EntitySchema,
+    LoadingSource as LoadingSource,
+    LogEntry as LogEntry,
+    OpenResult as OpenResult,
+    ProfileTrace as ProfileTrace,
+    Recording as Recording,
+    RecordingSchema as RecordingSchema,
+    SelectedComponent as SelectedComponent,
+    SelectedContainer as SelectedContainer,
+    SelectedEntity as SelectedEntity,
+    SelectedItem as SelectedItem,
+    SelectedRecording as SelectedRecording,
+    SelectedView as SelectedView,
+    Selection as Selection,
+    StoreId as StoreId,
+    TableColumnSchema as TableColumnSchema,
+    Timeline as Timeline,
+    View as View,
+    ViewerClient as ViewerClient,
+    ViewerState as ViewerState,
+    ViewerViewType as ViewerViewType,
+    ViewReport as ViewReport,
+)
+
+# TODO(RR-5534): remove this deprecation shim one release after the chunk API move ships.
+# The names below moved to `rerun.chunk`; `send_chunks` moved to the top-level `rerun`.
+# Forward them with a warning for one release.
+_MOVED_TO_CHUNK = frozenset({
+    "Chunk",
+    "ChunkStore",
+    "LazyChunkStream",
+    "LazyStore",
+    "StoreEntry",
+    "Lens",
+    "DeriveLens",
+    "MutateLens",
+    "Selector",
+    "IndexColumn",
+    "OptimizationProfile",
+    "RrdReader",
+    "McapReader",
+    "McapChannelInfo",
+    "McapChunkInfo",
+    "McapCompressionInfo",
+    "McapInfo",
+    "McapSchemaInfo",
+    "StreamingReader",
+    "IndexedReader",
+})
+
+
+# Type checkers give every forwarded name this return type, so it must be `Any` (PEP 562).
+def __getattr__(name: str) -> Any:  # noqa: ANN401
+    """Forward moved names to their new home with a deprecation warning (see PEP 562)."""
+    if name == "send_chunks":
+        import warnings
+
+        import rerun
+
+        warnings.warn(
+            "`rerun.experimental.send_chunks` moved to `rerun.send_chunks`. "
+            "The `rerun.experimental` alias is deprecated and will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return rerun.send_chunks
+    if name in _MOVED_TO_CHUNK:
+        import warnings
+
+        from .. import chunk
+
+        warnings.warn(
+            f"`rerun.experimental.{name}` moved to `rerun.chunk.{name}`. "
+            f"The `rerun.experimental` alias is deprecated and will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return getattr(chunk, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

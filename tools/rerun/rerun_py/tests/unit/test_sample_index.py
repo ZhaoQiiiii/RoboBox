@@ -1,0 +1,360 @@
+"""Tests for `SampleIndex` in `rerun.experimental.dataloader._sample_index`."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, cast
+
+import numpy as np
+import pyarrow as pa
+import pytest
+from datafusion import SessionContext
+from rerun.experimental.dataloader import DataSource, Field, FixedRateSampling, TimeAlignedSampling
+from rerun.experimental.dataloader._sample_index import SampleIndex, SegmentMetadata
+from rerun.experimental.dataloader.decoders import NumericDecoder
+
+if TYPE_CHECKING:
+    from datafusion import DataFrame
+    from rerun.catalog import DatasetEntry
+
+
+class _DatasetWithIndexRanges:
+    def __init__(self, table: pa.Table) -> None:
+        self._table = table
+        self._ctx = SessionContext()
+        self.segment_ids_call_count = 0
+
+    def segment_ids(self) -> list[str]:
+        self.segment_ids_call_count += 1
+        return cast("list[str]", self._table.column("rerun_segment_id").to_pylist())
+
+    def filter_segments(self, segment_ids: list[str]) -> _DatasetWithIndexRanges:
+        assert set(segment_ids) == set(self.segment_ids())
+        return self
+
+    def get_index_ranges(self) -> DataFrame:
+        batches = self._table.to_batches()
+        if not batches:
+            batches = [
+                pa.RecordBatch.from_arrays(
+                    [column.combine_chunks() for column in self._table.columns],
+                    schema=self._table.schema,
+                )
+            ]
+        return self._ctx.create_dataframe([batches])
+
+
+def _build_sample_index(
+    ranges_table: pa.Table,
+    *,
+    timeline_sampling: TimeAlignedSampling | FixedRateSampling | None = None,
+) -> SampleIndex:
+    dataset = cast("DatasetEntry", _DatasetWithIndexRanges(ranges_table))
+    return SampleIndex.build(
+        DataSource(dataset=dataset),
+        index="frame",
+        fields={},
+        timeline_sampling=timeline_sampling,
+    )
+
+
+def _global_mapping(sample_index: SampleIndex) -> list[tuple[str, object]]:
+    mapping: list[tuple[str, object]] = []
+    for global_index in range(sample_index.total_samples):
+        segment, index_value = sample_index.global_to_local(global_index)
+        mapping.append((segment.segment_id, index_value))
+    return mapping
+
+
+def _integer_segment(segment_id: str, index_start: int, index_end: int) -> SegmentMetadata:
+    return SegmentMetadata(
+        segment_id=segment_id,
+        index_start=index_start,
+        index_end=index_end,
+        num_samples=index_end - index_start + 1,
+    )
+
+
+def _fixed_rate_segment(
+    segment_id: str,
+    index_start: int,
+    num_samples: int,
+    ns_per_sample: int,
+) -> SegmentMetadata:
+    return SegmentMetadata(
+        segment_id=segment_id,
+        index_start=index_start,
+        index_end=index_start + (num_samples - 1) * ns_per_sample,
+        num_samples=num_samples,
+    )
+
+
+def test_build_does_not_fetch_all_segment_ids() -> None:
+    ranges_table = pa.table({
+        "rerun_segment_id": ["segment-a"],
+        "frame:start": pa.array([10], type=pa.int64()),
+        "frame:end": pa.array([11], type=pa.int64()),
+    })
+    dataset = _DatasetWithIndexRanges(ranges_table)
+
+    sample_index = SampleIndex.build(DataSource(dataset=cast("DatasetEntry", dataset)), index="frame", fields={})
+
+    assert sample_index.total_samples == 2
+    assert dataset.segment_ids_call_count == 0
+
+
+@pytest.mark.parametrize("index_type", [pa.int64(), pa.timestamp("ns"), pa.duration("ns")])
+def test_window_trim_preserves_the_raw_segment_minimum(index_type: pa.DataType) -> None:
+    temporal = not pa.types.is_integer(index_type)
+    table = pa.table({
+        "rerun_segment_id": ["segment-a"],
+        "frame:start": pa.array([10], type=index_type),
+        "frame:end": pa.array([30], type=index_type),
+    })
+    source = DataSource(dataset=cast("DatasetEntry", _DatasetWithIndexRanges(table)))
+    field = Field("/state:Scalars:scalars", decode=NumericDecoder(), window=(-2e-9 if temporal else -2, 0))
+
+    sample_index = SampleIndex.build(
+        source,
+        index="frame",
+        fields={"state": field},
+        timeline_sampling=FixedRateSampling(rate_hz=1e9) if temporal else None,
+    )
+
+    (segment,) = sample_index.segments
+    assert segment.index_start == 12
+    assert segment.index_min == 10
+
+
+def test_build_empty_dataset_without_index_columns() -> None:
+    ranges_table = pa.table({"rerun_segment_id": pa.array([], type=pa.string())})
+
+    sample_index = _build_sample_index(ranges_table)
+
+    assert sample_index.total_samples == 0
+    assert sample_index.segments == []
+
+
+@pytest.mark.parametrize("timeline_sampling", [None, TimeAlignedSampling(keyframe_interval=10)])
+def test_build_integer_mapping_is_independent_of_range_row_order(timeline_sampling: TimeAlignedSampling | None) -> None:
+    ranges_table = pa.table({
+        "rerun_segment_id": ["segment-a", "segment-b"],
+        "frame:start": pa.array([10, 20], type=pa.int64()),
+        "frame:end": pa.array([11, 22], type=pa.int64()),
+    })
+    reversed_ranges_table = ranges_table.take(pa.array([1, 0]))
+    expected_mapping = [
+        ("segment-a", 10),
+        ("segment-a", 11),
+        ("segment-b", 20),
+        ("segment-b", 21),
+        ("segment-b", 22),
+    ]
+
+    assert _global_mapping(_build_sample_index(ranges_table, timeline_sampling=timeline_sampling)) == expected_mapping
+    assert (
+        _global_mapping(_build_sample_index(reversed_ranges_table, timeline_sampling=timeline_sampling))
+        == expected_mapping
+    )
+
+
+@pytest.mark.parametrize(
+    ("index_type", "timeline_sampling", "error", "message"),
+    [
+        (pa.int64(), FixedRateSampling(rate_hz=1), ValueError, "timestamp or duration"),
+        (pa.timestamp("ns"), TimeAlignedSampling(keyframe_interval=10), ValueError, "integer timeline"),
+        (pa.duration("ns"), TimeAlignedSampling(keyframe_interval=10), ValueError, "integer timeline"),
+        (pa.timestamp("ns"), None, TypeError, "timeline_sampling=FixedRateSampling"),
+    ],
+)
+def test_build_rejects_sampling_for_the_wrong_timeline(
+    index_type: pa.DataType,
+    timeline_sampling: TimeAlignedSampling | FixedRateSampling | None,
+    error: type[Exception],
+    message: str,
+) -> None:
+    ranges_table = pa.table({
+        "rerun_segment_id": ["segment-a"],
+        "frame:start": pa.array([0], type=index_type),
+        "frame:end": pa.array([1_000_000_000], type=index_type),
+    })
+
+    with pytest.raises(error, match=message):
+        _build_sample_index(ranges_table, timeline_sampling=timeline_sampling)
+
+
+@pytest.mark.parametrize("rate_hz", [0, -1, float("inf"), float("nan"), 1_000_000_001])
+def test_fixed_rate_sampling_rejects_invalid_rates(rate_hz: float) -> None:
+    with pytest.raises(ValueError, match="rate_hz"):
+        FixedRateSampling(rate_hz=rate_hz)
+
+
+def test_build_fixed_rate_mapping_is_independent_of_range_row_order() -> None:
+    ranges_table = pa.table({
+        "rerun_segment_id": ["segment-a", "segment-b"],
+        "frame:start": pa.array([10_000_000_000, 20_000_000_000], type=pa.timestamp("ns")),
+        "frame:end": pa.array([11_000_000_000, 22_000_000_000], type=pa.timestamp("ns")),
+    })
+    reversed_ranges_table = ranges_table.take(pa.array([1, 0]))
+    expected_mapping = [
+        ("segment-a", np.datetime64(10_000_000_000, "ns")),
+        ("segment-a", np.datetime64(11_000_000_000, "ns")),
+        ("segment-b", np.datetime64(20_000_000_000, "ns")),
+        ("segment-b", np.datetime64(21_000_000_000, "ns")),
+        ("segment-b", np.datetime64(22_000_000_000, "ns")),
+    ]
+
+    timeline_sampling = FixedRateSampling(rate_hz=1.0)
+    assert _global_mapping(_build_sample_index(ranges_table, timeline_sampling=timeline_sampling)) == expected_mapping
+    assert (
+        _global_mapping(_build_sample_index(reversed_ranges_table, timeline_sampling=timeline_sampling))
+        == expected_mapping
+    )
+
+
+@pytest.mark.parametrize("index_type", [pa.timestamp("ns"), pa.duration("ns")])
+def test_live_temporal_sampling_keeps_the_window_trimmed_segment_origin(index_type: pa.DataType) -> None:
+    table = pa.table({
+        "rerun_segment_id": ["segment-a"],
+        "frame:start": pa.array([250_000_000], type=index_type),
+        "frame:end": pa.array([450_000_000], type=index_type),
+    })
+    source = DataSource(dataset=cast("DatasetEntry", _DatasetWithIndexRanges(table)))
+    fields = {"state": Field("/state:Scalars:scalars", decode=NumericDecoder(), window=(-0.1, 0))}
+
+    sample_index = SampleIndex.build(source, "frame", fields, timeline_sampling=FixedRateSampling(rate_hz=1))
+
+    assert sample_index.total_samples == 1
+    segment, anchor = sample_index.global_to_local(0)
+    assert segment.index_start == segment.index_end == 350_000_000
+    assert isinstance(anchor, (np.datetime64, np.timedelta64))
+    assert int(anchor.astype(np.int64)) == 350_000_000
+
+
+def test_global_to_local_integer_single_segment() -> None:
+    seg = _integer_segment("seg-a", index_start=10, index_end=14)
+    sample_index = SampleIndex([seg])
+
+    for pos in range(seg.num_samples):
+        resolved_seg, value = sample_index.global_to_local(pos)
+        assert resolved_seg is seg
+        assert value == 10 + pos
+        assert isinstance(value, int)
+
+
+def test_global_to_local_integer_multiple_segments() -> None:
+    seg_a = _integer_segment("seg-a", index_start=0, index_end=2)  # 3 samples: 0,1,2
+    seg_b = _integer_segment("seg-b", index_start=100, index_end=101)  # 2 samples: 100,101
+    seg_c = _integer_segment("seg-c", index_start=50, index_end=50)  # 1 sample: 50
+    sample_index = SampleIndex([seg_a, seg_b, seg_c])
+
+    assert sample_index.total_samples == 6
+
+    expected = [
+        (seg_a, 0),
+        (seg_a, 1),
+        (seg_a, 2),
+        (seg_b, 100),
+        (seg_b, 101),
+        (seg_c, 50),
+    ]
+    for global_idx, (expected_seg, expected_value) in enumerate(expected):
+        resolved_seg, value = sample_index.global_to_local(global_idx)
+        assert resolved_seg is expected_seg
+        assert value == expected_value
+        assert isinstance(value, int)
+
+
+def test_global_to_local_fixed_rate_timestamp() -> None:
+    ns_per_sample = 10_000_000  # 100 Hz
+    seg_a = _fixed_rate_segment("seg-a", index_start=1_000_000_000, num_samples=3, ns_per_sample=ns_per_sample)
+    seg_b = _fixed_rate_segment("seg-b", index_start=2_000_000_000, num_samples=2, ns_per_sample=ns_per_sample)
+    sample_index = SampleIndex([seg_a, seg_b], ns_per_sample=ns_per_sample, ns_dtype="datetime64[ns]")
+
+    assert sample_index.total_samples == 5
+    assert sample_index.is_timestamp
+    assert not sample_index.is_duration
+
+    expected = [
+        (seg_a, np.datetime64(1_000_000_000, "ns")),
+        (seg_a, np.datetime64(1_010_000_000, "ns")),
+        (seg_a, np.datetime64(1_020_000_000, "ns")),
+        (seg_b, np.datetime64(2_000_000_000, "ns")),
+        (seg_b, np.datetime64(2_010_000_000, "ns")),
+    ]
+    for global_idx, (expected_seg, expected_value) in enumerate(expected):
+        resolved_seg, value = sample_index.global_to_local(global_idx)
+        assert resolved_seg is expected_seg
+        assert isinstance(value, np.datetime64)
+        assert value == expected_value
+
+
+def test_global_to_local_fixed_rate_duration() -> None:
+    ns_per_sample = 10_000_000  # 100 Hz
+    seg_a = _fixed_rate_segment("seg-a", index_start=0, num_samples=3, ns_per_sample=ns_per_sample)
+    seg_b = _fixed_rate_segment("seg-b", index_start=500_000_000, num_samples=2, ns_per_sample=ns_per_sample)
+    sample_index = SampleIndex([seg_a, seg_b], ns_per_sample=ns_per_sample, ns_dtype="timedelta64[ns]")
+
+    assert sample_index.total_samples == 5
+    assert sample_index.is_duration
+    assert not sample_index.is_timestamp
+
+    expected = [
+        (seg_a, np.timedelta64(0, "ns")),
+        (seg_a, np.timedelta64(10_000_000, "ns")),
+        (seg_a, np.timedelta64(20_000_000, "ns")),
+        (seg_b, np.timedelta64(500_000_000, "ns")),
+        (seg_b, np.timedelta64(510_000_000, "ns")),
+    ]
+    for global_idx, (expected_seg, expected_value) in enumerate(expected):
+        resolved_seg, value = sample_index.global_to_local(global_idx)
+        assert resolved_seg is expected_seg
+        assert isinstance(value, np.timedelta64)
+        assert value == expected_value
+
+
+@pytest.mark.parametrize("bad_idx", [-1, 6, 100])
+def test_global_to_local_out_of_range_raises(bad_idx: int) -> None:
+    seg_a = _integer_segment("seg-a", index_start=0, index_end=2)
+    seg_b = _integer_segment("seg-b", index_start=10, index_end=12)
+    sample_index = SampleIndex([seg_a, seg_b])
+
+    assert sample_index.total_samples == 6
+    with pytest.raises(IndexError):
+        sample_index.global_to_local(bad_idx)
+
+
+def test_global_to_local_empty_raises() -> None:
+    sample_index = SampleIndex([])
+    assert sample_index.total_samples == 0
+    with pytest.raises(IndexError):
+        sample_index.global_to_local(0)
+
+
+def test_global_to_local_segment_boundaries() -> None:
+    # Three segments with distinct sizes to catch off-by-one at boundaries.
+    seg_a = _integer_segment("seg-a", index_start=0, index_end=0)  # 1 sample
+    seg_b = _integer_segment("seg-b", index_start=10, index_end=13)  # 4 samples
+    seg_c = _integer_segment("seg-c", index_start=100, index_end=101)  # 2 samples
+    sample_index = SampleIndex([seg_a, seg_b, seg_c])
+
+    # Last index of each segment.
+    last_a_seg, last_a_value = sample_index.global_to_local(0)
+    assert last_a_seg is seg_a
+    assert last_a_value == 0
+
+    last_b_seg, last_b_value = sample_index.global_to_local(4)
+    assert last_b_seg is seg_b
+    assert last_b_value == 13
+
+    last_c_seg, last_c_value = sample_index.global_to_local(6)
+    assert last_c_seg is seg_c
+    assert last_c_value == 101
+
+    # First index of each non-initial segment.
+    first_b_seg, first_b_value = sample_index.global_to_local(1)
+    assert first_b_seg is seg_b
+    assert first_b_value == 10
+
+    first_c_seg, first_c_value = sample_index.global_to_local(5)
+    assert first_c_seg is seg_c
+    assert first_c_value == 100

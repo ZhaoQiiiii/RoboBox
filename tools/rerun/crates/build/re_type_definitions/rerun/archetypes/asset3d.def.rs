@@ -1,0 +1,48 @@
+// This is a Rerun type definition for the SDK, not executable code.
+// It is parsed by `re_types_builder` to generate the Rust, Python and C++ bindings.
+
+/// A prepacked 3D asset (`.gltf`, `.glb`, `.obj`, `.stl`, etc.).
+///
+/// See also [`rerun::archetypes::Mesh3D`].
+///
+/// If there are multiple [`rerun::archetypes::InstancePoses3D`] instances logged to the same entity as a mesh,
+/// an instance of the mesh will be drawn for each transform.
+///
+/// Meshes, or parts of meshes, without vertex normals get flat normals computed by the Viewer,
+/// i.e. each triangle is shaded with its own face normal.
+/// To render an asset unlit instead, give it all-zero vertex normals.
+///
+/// \example archetypes/asset3d_simple title="Simple 3D asset" image="https://static.rerun.io/asset3d_simple/af238578188d3fd0de3e330212120e2842a8ddb2/1200w.png" alt="3D view of a textured mesh asset: a wooden post with a lantern hanging from its crossbeam"
+#[rerun::rerun_type]
+#[docs(category = "Spatial 3D")]
+#[docs(view_types = "Spatial3DView, Spatial2DView: if logged above active projection")]
+#[rerun(state = "stable")]
+#[rerun(visualizer = "Asset3D")]
+#[rust(derive(PartialEq))]
+pub struct Asset3D {
+    /// The asset's bytes.
+    #[rerun(no_ui_edit)]
+    #[rerun(required)]
+    pub blob: rerun::components::Blob,
+
+    /// The Media Type of the asset.
+    ///
+    /// Supported values:
+    /// * `application/x-ply`
+    /// * `model/gltf-binary`
+    /// * `model/gltf+json`
+    /// * `model/obj` (.mtl material files are not supported yet, references are silently ignored)
+    /// * `model/stl`
+    ///
+    /// If omitted, the viewer will try to guess from the data blob.
+    /// If it cannot guess, it won't be able to render the asset.
+    #[rerun(recommended)]
+    pub media_type: Option<rerun::components::MediaType>,
+
+    /// A color multiplier applied to the whole asset.
+    ///
+    /// For mesh who already have `albedo_factor` in materials,
+    /// it will be overwritten by actual `albedo_factor` of [`rerun::archetypes::Asset3D`] (if specified).
+    #[rerun(optional)]
+    pub albedo_factor: Option<rerun::components::AlbedoFactor>,
+}

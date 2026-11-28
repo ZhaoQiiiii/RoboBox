@@ -1,0 +1,318 @@
+use std::fmt::Formatter;
+
+use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr as SqlExpr};
+use re_ui::syntax_highlighting::SyntaxHighlightedBuilder;
+use re_ui::{SyntaxHighlighting, UiExt as _};
+use strum::VariantArray as _;
+
+use super::{
+    Filter, FilterUiAction, SqlColumn, SqlValue, bool_literal, is_same_sql, negated_sql,
+    strip_negation,
+};
+
+/// Filter for non-nullable boolean columns.
+///
+/// This represents both the filter itself, and the state of the corresponding UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum NonNullableBooleanFilter {
+    #[default]
+    IsTrue,
+    IsFalse,
+}
+
+impl NonNullableBooleanFilter {
+    pub fn as_bool(&self) -> bool {
+        match self {
+            Self::IsTrue => true,
+            Self::IsFalse => false,
+        }
+    }
+
+    /// Parse the SQL written by `Filter::to_sql`.
+    pub fn from_sql(expr: &SqlExpr, column: &SqlColumn<'_>) -> Option<Self> {
+        let (predicate, value) = column.match_predicate(expr)?;
+        Some(if bool_comparison_from_sql(predicate, &value)? {
+            Self::IsTrue
+        } else {
+            Self::IsFalse
+        })
+    }
+}
+
+/// Parse `value = true` or `value = false`.
+fn bool_comparison_from_sql(predicate: &SqlExpr, value: &SqlValue) -> Option<bool> {
+    match value.comparison(predicate)? {
+        (BinaryOperator::Eq, right) => bool_literal(right),
+        _ => None,
+    }
+}
+
+impl Filter for NonNullableBooleanFilter {
+    fn to_sql(&self, column: &SqlColumn<'_>) -> Option<String> {
+        Some(column.predicate_sql(|value| format!("{value} = {}", self.as_bool())))
+    }
+
+    fn popup_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        _timestamp_format: re_log_types::TimestampFormat,
+        column_name: &str,
+        _popup_just_opened: bool,
+    ) -> FilterUiAction {
+        ui.label(
+            SyntaxHighlightedBuilder::body_default(column_name)
+                .with_keyword(" is")
+                .into_widget_text(ui.style()),
+        );
+
+        let mut clicked = false;
+
+        clicked |= ui
+            .re_radio_value(self, Self::IsTrue, primitive_widget_text(ui, "true"))
+            .clicked();
+
+        clicked |= ui
+            .re_radio_value(self, Self::IsFalse, primitive_widget_text(ui, "false"))
+            .clicked();
+
+        if clicked {
+            FilterUiAction::CommitStateToBlueprint
+        } else {
+            FilterUiAction::None
+        }
+    }
+}
+
+impl SyntaxHighlighting for NonNullableBooleanFilter {
+    fn syntax_highlight_into(&self, builder: &mut SyntaxHighlightedBuilder) {
+        builder.append_keyword("is ");
+        builder.append_primitive(&self.as_bool().to_string());
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, strum::VariantArray)]
+#[expect(clippy::enum_variant_names)]
+pub enum NullableBooleanValue {
+    #[default]
+    IsTrue,
+    IsFalse,
+    IsNull,
+}
+
+impl NullableBooleanValue {
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::IsTrue => Some(true),
+            Self::IsFalse => Some(false),
+            Self::IsNull => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, strum::VariantArray)]
+pub enum NullableBooleanOperator {
+    #[default]
+    Is,
+    IsNot,
+}
+
+impl std::fmt::Display for NullableBooleanOperator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Is => "is".fmt(f),
+            Self::IsNot => "is not".fmt(f),
+        }
+    }
+}
+
+/// Filter for nullable boolean columns.
+///
+/// This represents both the filter itself, and the state of the corresponding UI.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct NullableBooleanFilter {
+    value: NullableBooleanValue,
+    operator: NullableBooleanOperator,
+}
+
+// to make snapshot more compact
+impl std::fmt::Debug for NullableBooleanFilter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let op = match self.operator {
+            NullableBooleanOperator::Is => "",
+            NullableBooleanOperator::IsNot => "not ",
+        };
+
+        f.write_str(&format!("NullableBooleanFilter({op}{:?})", self.value))
+    }
+}
+
+impl NullableBooleanFilter {
+    pub fn new_is_true() -> Self {
+        Self {
+            value: NullableBooleanValue::IsTrue,
+            operator: NullableBooleanOperator::Is,
+        }
+    }
+
+    pub fn new_is_false() -> Self {
+        Self {
+            value: NullableBooleanValue::IsFalse,
+            operator: NullableBooleanOperator::Is,
+        }
+    }
+
+    pub fn new_is_null() -> Self {
+        Self {
+            value: NullableBooleanValue::IsNull,
+            operator: NullableBooleanOperator::Is,
+        }
+    }
+
+    pub fn with_is_not(mut self) -> Self {
+        self.operator = NullableBooleanOperator::IsNot;
+        self
+    }
+
+    pub fn operand_text(&self) -> String {
+        if let Some(value) = self.value.as_bool() {
+            value.to_string()
+        } else {
+            "null".to_owned()
+        }
+    }
+
+    /// Parse the SQL written by `Filter::to_sql`.
+    pub fn from_sql(expr: &SqlExpr, column: &SqlColumn<'_>) -> Option<Self> {
+        let (expr, negated) = strip_negation(expr);
+
+        let filter_value = if is_same_sql(expr, &is_null_sql(column)) {
+            NullableBooleanValue::IsNull
+        } else {
+            let (predicate, value) = column.match_predicate(expr)?;
+            if bool_comparison_from_sql(predicate, &value)? {
+                NullableBooleanValue::IsTrue
+            } else {
+                NullableBooleanValue::IsFalse
+            }
+        };
+
+        Some(Self {
+            value: filter_value,
+            operator: if negated {
+                NullableBooleanOperator::IsNot
+            } else {
+                NullableBooleanOperator::Is
+            },
+        })
+    }
+}
+
+/// The SQL selecting null values.
+///
+/// For a list column this selects null rows, empty lists, and lists that contain a null.
+fn is_null_sql(column: &SqlColumn<'_>) -> String {
+    let sql = column.predicate_sql(|value| format!("{value} IS NULL"));
+    if column.is_list() {
+        // `NOT any_match(…, x -> true)` selects empty lists.
+        let is_empty = format!("NOT {}", column.predicate_sql(|_| "true".to_owned()));
+        let column = column.sql();
+        format!("{column} IS NULL OR {is_empty} OR {sql}")
+    } else {
+        sql
+    }
+}
+
+impl Filter for NullableBooleanFilter {
+    fn to_sql(&self, column: &SqlColumn<'_>) -> Option<String> {
+        let sql = match self.value.as_bool() {
+            Some(bool_value) => column.predicate_sql(|value| format!("{value} = {bool_value}")),
+            None => is_null_sql(column),
+        };
+
+        Some(match self.operator {
+            NullableBooleanOperator::Is => sql,
+            NullableBooleanOperator::IsNot => negated_sql(&sql),
+        })
+    }
+
+    fn popup_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        _timestamp_format: re_log_types::TimestampFormat,
+        column_name: &str,
+        _popup_just_opened: bool,
+    ) -> FilterUiAction {
+        ui.horizontal(|ui| {
+            ui.label(
+                SyntaxHighlightedBuilder::body_default(column_name).into_widget_text(ui.style()),
+            );
+
+            egui::ComboBox::new("null_bool_op", "")
+                .selected_text(
+                    SyntaxHighlightedBuilder::keyword(&self.operator.to_string())
+                        .into_widget_text(ui.style()),
+                )
+                .show_ui(ui, |ui| {
+                    for possible_op in NullableBooleanOperator::VARIANTS {
+                        if ui
+                            .button(
+                                SyntaxHighlightedBuilder::keyword(&possible_op.to_string())
+                                    .into_widget_text(ui.style()),
+                            )
+                            .clicked()
+                        {
+                            self.operator = *possible_op;
+                        }
+                    }
+                })
+                .response
+                .accessible_name("Operator");
+        });
+
+        let mut clicked = false;
+
+        clicked |= ui
+            .re_radio_value(
+                &mut self.value,
+                NullableBooleanValue::IsTrue,
+                primitive_widget_text(ui, "true"),
+            )
+            .clicked();
+        clicked |= ui
+            .re_radio_value(
+                &mut self.value,
+                NullableBooleanValue::IsFalse,
+                primitive_widget_text(ui, "false"),
+            )
+            .clicked();
+        clicked |= ui
+            .re_radio_value(
+                &mut self.value,
+                NullableBooleanValue::IsNull,
+                null_widget_text(ui),
+            )
+            .clicked();
+
+        if clicked {
+            FilterUiAction::CommitStateToBlueprint
+        } else {
+            FilterUiAction::None
+        }
+    }
+}
+
+impl SyntaxHighlighting for NullableBooleanFilter {
+    fn syntax_highlight_into(&self, builder: &mut SyntaxHighlightedBuilder) {
+        builder.append_keyword(&self.operator.to_string());
+        builder.append_keyword(" ");
+        builder.append_primitive(&self.operand_text());
+    }
+}
+
+fn null_widget_text(ui: &egui::Ui) -> egui::WidgetText {
+    SyntaxHighlightedBuilder::null("null").into_widget_text(ui.style())
+}
+
+fn primitive_widget_text(ui: &egui::Ui, s: &str) -> egui::WidgetText {
+    SyntaxHighlightedBuilder::primitive(s).into_widget_text(ui.style())
+}

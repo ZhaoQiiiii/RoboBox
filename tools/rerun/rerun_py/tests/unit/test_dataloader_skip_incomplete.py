@@ -1,0 +1,169 @@
+"""Tests for the iterable dataloader's missing-sample handling."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import pytest
+import torch
+from rerun.experimental.dataloader import DataloaderMetrics
+from rerun.experimental.dataloader._iterable_dataset import _skip_incomplete
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from rerun.experimental.dataloader.decoders._base import DecodedSample
+
+
+def _stream(
+    *samples: DecodedSample,
+) -> Generator[DecodedSample, None, None]:
+    yield from samples
+
+
+def _complete(value: float = 1.0) -> DecodedSample:
+    return {"image": torch.full((3, 2, 2), value), "action": torch.full((7,), value)}
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_drops_none_but_keeps_valid_empty_tensors() -> None:
+    incomplete: DecodedSample = {"image": None, "action": torch.ones(7)}
+    valid_empty: DecodedSample = {
+        "image": torch.empty(0, 3, 2, 2),
+        "action": torch.ones(7),
+    }
+
+    kept = list(_skip_incomplete(_stream(_complete(1.0), incomplete, _complete(2.0), valid_empty)))
+
+    assert len(kept) == 3
+    assert kept[-1] is valid_empty
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_records_one_skipped_sample_when_multiple_fields_are_missing() -> None:
+    metrics = DataloaderMetrics(max_workers=1)
+    try:
+        incomplete: DecodedSample = {"image": None, "action": None}
+        kept = list(
+            _skip_incomplete(
+                _stream(incomplete, _complete(), incomplete),
+                metrics=metrics._worker_publisher(),
+            )
+        )
+
+        assert len(kept) == 1
+        assert metrics.summary() == {"skipped_samples": 2.0}
+    finally:
+        metrics.close()
+
+
+def test_warns_once_per_missing_field() -> None:
+    incomplete: DecodedSample = {"image": None, "action": torch.ones(7)}
+    samples = _stream(*(incomplete for _ in range(5)))
+
+    with pytest.warns(RuntimeWarning, match="field 'image' has no value") as record:
+        assert list(_skip_incomplete(samples)) == []
+
+    assert len(record) == 1
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_default_consecutive_skip_limit_is_1000() -> None:
+    incomplete: DecodedSample = {"image": None, "action": torch.ones(7)}
+
+    with pytest.raises(RuntimeError, match="Exceeded max_consecutive_skipped_samples=1000"):
+        list(_skip_incomplete(_stream(*(incomplete for _ in range(1001)))))
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_allows_exactly_the_configured_number_of_consecutive_skipped_samples() -> None:
+    incomplete: DecodedSample = {"image": None, "action": torch.ones(7)}
+
+    kept = list(
+        _skip_incomplete(
+            _stream(incomplete, incomplete, _complete()),
+            max_consecutive_skipped_samples=2,
+        )
+    )
+
+    assert len(kept) == 1
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_valid_sample_resets_consecutive_skip_count() -> None:
+    incomplete: DecodedSample = {"image": None, "action": torch.ones(7)}
+
+    kept = list(
+        _skip_incomplete(
+            _stream(incomplete, _complete(1.0), incomplete, _complete(2.0)),
+            max_consecutive_skipped_samples=1,
+        )
+    )
+
+    assert len(kept) == 2
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_zero_skip_budget_raises_on_the_first_incomplete_sample() -> None:
+    samples = _skip_incomplete(
+        _stream(_complete(), {"image": None, "action": torch.ones(7)}),
+        max_consecutive_skipped_samples=0,
+    )
+
+    assert next(samples)["image"] is not None
+    with pytest.raises(RuntimeError, match="Exceeded max_consecutive_skipped_samples=0"):
+        next(samples)
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_none_skip_budget_allows_an_arbitrary_incomplete_run() -> None:
+    incomplete: DecodedSample = {"image": None, "action": torch.ones(7)}
+    valid = _complete()
+
+    kept = list(
+        _skip_incomplete(
+            _stream(*(incomplete for _ in range(1001)), valid),
+            max_consecutive_skipped_samples=None,
+        )
+    )
+
+    assert kept == [valid]
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_raises_after_consecutive_skip_limit_with_per_field_counts() -> None:
+    missing_image: DecodedSample = {"image": None, "action": torch.ones(7)}
+    missing_both: DecodedSample = {"image": None, "action": None}
+
+    with pytest.raises(RuntimeError, match="Exceeded max_consecutive_skipped_samples=1") as error:
+        list(
+            _skip_incomplete(
+                _stream(missing_image, missing_both),
+                max_consecutive_skipped_samples=1,
+            )
+        )
+
+    assert "2 total; missing fields: action=1, image=2" in str(error.value)
+
+
+def test_rejects_a_negative_skip_budget() -> None:
+    with pytest.raises(ValueError, match="max_consecutive_skipped_samples must be non-negative"):
+        list(_skip_incomplete(_stream(), max_consecutive_skipped_samples=-1))
+
+
+def test_closes_the_source_when_the_consumer_stops_early() -> None:
+    closed = False
+
+    def source() -> Generator[DecodedSample, None, None]:
+        nonlocal closed
+        try:
+            while True:
+                yield _complete()
+        finally:
+            closed = True
+
+    samples = _skip_incomplete(source())
+    next(samples)
+    samples.close()
+
+    assert closed

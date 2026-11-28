@@ -1,0 +1,516 @@
+// Allow unwrap() in benchmarks
+#![expect(clippy::unwrap_used)]
+
+#[cfg(not(all(feature = "decoder", feature = "encoder")))]
+compile_error!("msg_encode_benchmark requires 'decoder' and 'encoder' features.");
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use re_chunk::{Chunk, RowId};
+use re_log_encoding::rrd::{Compression, EncodingOptions};
+use re_log_encoding::{DummyApplicationIdInjector, ToApplication as _, ToTransport as _};
+use re_log_msg::LogMsg;
+use re_log_types::example_components::{MyColor, MyPoint, MyPoints};
+use re_log_types::{StoreId, StoreKind, TimeInt, TimeType, Timeline, entity_path};
+const PROTOBUF_COMPRESSED: EncodingOptions = EncodingOptions::PROTOBUF_COMPRESSED;
+const PROTOBUF_UNCOMPRESSED: EncodingOptions = EncodingOptions::PROTOBUF_UNCOMPRESSED;
+
+use criterion::{Criterion, criterion_group, criterion_main};
+use itertools::Itertools as _;
+
+cfg_select! {
+    debug_assertions => {
+        // `cargo test` also runs the benchmark setup code, so make sure they run quickly:
+        const NUM_POINTS: usize = 1;
+        const NUM_BLOBS: usize = 1;
+        const BLOB_SIZE_BYTES: usize = 4 * 1024;
+    }
+    _ => {
+        const NUM_POINTS: usize = 10_000;
+        const NUM_BLOBS: usize = 16;
+        const BLOB_SIZE_BYTES: usize = 1024 * 1024;
+    }
+}
+
+criterion_group!(
+    benches,
+    mono_points_arrow,
+    mono_points_arrow_batched,
+    batch_points_arrow,
+    video_like_blobs,
+    blob_arrow_msg,
+    ipc_payload_alignment,
+);
+criterion_main!(benches);
+
+fn encode_log_msgs(
+    messages: &[LogMsg],
+    encoding_options: re_log_encoding::rrd::EncodingOptions,
+) -> Vec<u8> {
+    let mut bytes = vec![];
+    re_log_encoding::Encoder::encode_into(
+        re_build_info::CrateVersion::LOCAL,
+        encoding_options,
+        messages.iter().map(Ok),
+        &mut bytes,
+    )
+    .unwrap();
+    assert!(bytes.len() > messages.len());
+    bytes
+}
+
+fn decode_log_msgs(mut bytes: &[u8]) -> Vec<LogMsg> {
+    let messages = re_log_encoding::DecoderApp::decode_lazy(&mut bytes)
+        .try_collect()
+        .unwrap();
+    assert!(bytes.is_empty());
+    messages
+}
+
+fn generate_messages(store_id: &StoreId, chunks: &[Chunk]) -> Vec<LogMsg> {
+    chunks
+        .iter()
+        .map(|chunk| LogMsg::ArrowMsg(store_id.clone(), chunk.to_arrow_msg().unwrap()))
+        .collect()
+}
+
+fn decode_chunks(messages: &[LogMsg]) -> Vec<Chunk> {
+    messages
+        .iter()
+        .map(|log_msg| {
+            if let LogMsg::ArrowMsg(_, arrow_msg) = log_msg {
+                Chunk::from_arrow_msg(arrow_msg).unwrap()
+            } else {
+                unreachable!()
+            }
+        })
+        .collect()
+}
+
+fn mono_points_arrow(c: &mut Criterion) {
+    fn generate_chunks() -> Vec<Chunk> {
+        (0..NUM_POINTS)
+            .map(|i| {
+                Chunk::builder(entity_path!("points", i.to_string()))
+                    .with_component_batches(
+                        RowId::ZERO,
+                        [build_frame_nr(TimeInt::ZERO)],
+                        [
+                            (
+                                MyPoints::descriptor_points(),
+                                &MyPoint::from_iter(0..1) as _,
+                            ),
+                            (
+                                MyPoints::descriptor_colors(),
+                                &MyColor::from_iter(0..1) as _,
+                            ),
+                        ],
+                    )
+                    .build()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    {
+        let store_id = StoreId::random(StoreKind::Recording, "test_app");
+        let mut group = c.benchmark_group("mono_points_arrow");
+        group.throughput(criterion::Throughput::Elements(NUM_POINTS as _));
+        group.bench_function("generate_message_bundles", |b| {
+            b.iter(generate_chunks);
+        });
+        let chunks = generate_chunks();
+        group.bench_function("generate_messages", |b| {
+            b.iter(|| generate_messages(&store_id, &chunks));
+        });
+        let messages = generate_messages(&store_id, &chunks);
+        group.bench_function("encode_log_msg(protobuf)", |b| {
+            b.iter(|| encode_log_msgs(&messages, PROTOBUF_COMPRESSED));
+        });
+        group.bench_function("encode_total(protobuf)", |b| {
+            b.iter(|| {
+                encode_log_msgs(
+                    &generate_messages(&store_id, &generate_chunks()),
+                    PROTOBUF_COMPRESSED,
+                )
+            });
+        });
+
+        {
+            let encoded = encode_log_msgs(&messages, PROTOBUF_COMPRESSED);
+            group.bench_function("decode_log_msg(protobuf)", |b| {
+                b.iter(|| {
+                    let decoded = decode_log_msgs(&encoded);
+                    assert_eq!(decoded.len(), messages.len());
+                    decoded
+                });
+            });
+            group.bench_function("decode_message_bundles(protobuf)", |b| {
+                b.iter(|| {
+                    let chunks = decode_chunks(&messages);
+                    assert_eq!(chunks.len(), messages.len());
+                    chunks
+                });
+            });
+            group.bench_function("decode_total(protobuf)", |b| {
+                b.iter(|| decode_chunks(&decode_log_msgs(&encoded)));
+            });
+        }
+    }
+}
+
+fn mono_points_arrow_batched(c: &mut Criterion) {
+    fn generate_chunk() -> Chunk {
+        let mut builder = Chunk::builder("points");
+        for _ in 0..NUM_POINTS {
+            builder = builder.with_component_batches(
+                RowId::ZERO,
+                [build_frame_nr(TimeInt::ZERO)],
+                [
+                    (
+                        MyPoints::descriptor_points(),
+                        &MyPoint::from_iter(0..1) as _,
+                    ),
+                    (
+                        MyPoints::descriptor_colors(),
+                        &MyColor::from_iter(0..1) as _,
+                    ),
+                ],
+            );
+        }
+        builder.build().unwrap()
+    }
+
+    {
+        let store_id = StoreId::random(StoreKind::Recording, "test_app");
+        let mut group = c.benchmark_group("mono_points_arrow_batched");
+        group.throughput(criterion::Throughput::Elements(NUM_POINTS as _));
+        group.bench_function("generate_message_bundles", |b| {
+            b.iter(generate_chunk);
+        });
+        let chunks = [generate_chunk()];
+        group.bench_function("generate_messages", |b| {
+            b.iter(|| generate_messages(&store_id, &chunks));
+        });
+        let messages = generate_messages(&store_id, &chunks);
+        group.bench_function("encode_log_msg(protobuf)", |b| {
+            b.iter(|| encode_log_msgs(&messages, PROTOBUF_COMPRESSED));
+        });
+        group.bench_function("encode_total(protobuf)", |b| {
+            b.iter(|| {
+                encode_log_msgs(
+                    &generate_messages(&store_id, &[generate_chunk()]),
+                    PROTOBUF_COMPRESSED,
+                )
+            });
+        });
+
+        {
+            let encoded = encode_log_msgs(&messages, PROTOBUF_COMPRESSED);
+            group.bench_function("decode_log_msg(protobuf)", |b| {
+                b.iter(|| {
+                    let decoded = decode_log_msgs(&encoded);
+                    assert_eq!(decoded.len(), messages.len());
+                    decoded
+                });
+            });
+            group.bench_function("decode_message_bundles(protobuf)", |b| {
+                b.iter(|| {
+                    let bundles = decode_chunks(&messages);
+                    assert_eq!(bundles.len(), messages.len());
+                    bundles
+                });
+            });
+            group.bench_function("decode_total(protobuf)", |b| {
+                b.iter(|| decode_chunks(&decode_log_msgs(&encoded)));
+            });
+        }
+    }
+}
+
+fn batch_points_arrow(c: &mut Criterion) {
+    fn generate_chunks() -> Vec<Chunk> {
+        vec![
+            Chunk::builder(entity_path!("points"))
+                .with_component_batches(
+                    RowId::ZERO,
+                    [build_frame_nr(TimeInt::ZERO)],
+                    [
+                        (
+                            MyPoints::descriptor_points(),
+                            &MyPoint::from_iter(0..NUM_POINTS as u32) as _,
+                        ),
+                        (
+                            MyPoints::descriptor_colors(),
+                            &MyColor::from_iter(0..NUM_POINTS as u32) as _,
+                        ),
+                    ],
+                )
+                .build()
+                .unwrap(),
+        ]
+    }
+
+    {
+        let store_id = StoreId::random(StoreKind::Recording, "test_app");
+        let mut group = c.benchmark_group("batch_points_arrow");
+        group.throughput(criterion::Throughput::Elements(NUM_POINTS as _));
+        group.bench_function("generate_message_bundles", |b| {
+            b.iter(generate_chunks);
+        });
+        let chunks = generate_chunks();
+        group.bench_function("generate_messages", |b| {
+            b.iter(|| generate_messages(&store_id, &chunks));
+        });
+        let messages = generate_messages(&store_id, &chunks);
+        group.bench_function("encode_log_msg(protobuf)", |b| {
+            b.iter(|| encode_log_msgs(&messages, PROTOBUF_COMPRESSED));
+        });
+        group.bench_function("encode_total(protobuf)", |b| {
+            b.iter(|| {
+                encode_log_msgs(
+                    &generate_messages(&store_id, &generate_chunks()),
+                    PROTOBUF_COMPRESSED,
+                )
+            });
+        });
+
+        {
+            let encoded = encode_log_msgs(&messages, PROTOBUF_COMPRESSED);
+            group.bench_function("decode_log_msg(protobuf)", |b| {
+                b.iter(|| {
+                    let decoded = decode_log_msgs(&encoded);
+                    assert_eq!(decoded.len(), messages.len());
+                    decoded
+                });
+            });
+            group.bench_function("decode_message_bundles(protobuf)", |b| {
+                b.iter(|| {
+                    let chunks = decode_chunks(&messages);
+                    assert_eq!(chunks.len(), messages.len());
+                    chunks
+                });
+            });
+            group.bench_function("decode_total(protobuf)", |b| {
+                b.iter(|| decode_chunks(&decode_log_msgs(&encoded)));
+            });
+        }
+    }
+}
+
+/// Chunks carrying incompressible blobs, like encoded video samples.
+///
+/// Encoding with the LZ4 request shows what an attempt that gets discarded costs over writing
+/// the bytes as-is, and decoding shows what skipping the decompression pass gains.
+fn video_like_blobs(c: &mut Criterion) {
+    fn incompressible_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 56) as u8
+            })
+            .collect()
+    }
+
+    fn generate_chunks() -> Vec<Chunk> {
+        (0..NUM_BLOBS)
+            .map(|i| {
+                let frame_nr = i64::try_from(i).unwrap();
+                Chunk::builder(entity_path!("video"))
+                    .with_archetype(
+                        RowId::ZERO,
+                        [build_frame_nr(TimeInt::new_temporal(frame_nr))],
+                        &re_sdk_types::archetypes::AssetVideo::from_file_contents(
+                            incompressible_bytes(BLOB_SIZE_BYTES, i as u64),
+                            Some(re_sdk_types::components::MediaType::mp4()),
+                        ),
+                    )
+                    .build()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    let store_id = StoreId::random(StoreKind::Recording, "test_app");
+    let mut group = c.benchmark_group("video_like_blobs");
+    group.throughput(criterion::Throughput::Bytes(
+        (NUM_BLOBS * BLOB_SIZE_BYTES) as u64,
+    ));
+    let messages = generate_messages(&store_id, &generate_chunks());
+
+    for (label, options) in [
+        ("lz4_requested", PROTOBUF_COMPRESSED),
+        ("uncompressed", PROTOBUF_UNCOMPRESSED),
+    ] {
+        group.bench_function(format!("encode_log_msg({label})"), |b| {
+            b.iter(|| encode_log_msgs(&messages, options));
+        });
+        let encoded = encode_log_msgs(&messages, options);
+        group.bench_function(format!("decode_log_msg({label})"), |b| {
+            b.iter(|| {
+                let decoded = decode_log_msgs(&encoded);
+                assert_eq!(decoded.len(), messages.len());
+                decoded
+            });
+        });
+    }
+}
+
+/// Decoding one transport-level `ArrowMsg` holding a video-sized blob, which is what the SDK
+/// does for every chunk it fetches: the cost of the IPC decode itself, uncompressed and LZ4.
+fn blob_arrow_msg(c: &mut Criterion) {
+    cfg_select! {
+        debug_assertions => {
+            const BLOB_BYTES: usize = 1024;
+        }
+        _ => {
+            const BLOB_BYTES: usize = 2 * 1024 * 1024;
+        }
+    }
+
+    // Incompressible, like encoded video: a xorshift stream.
+    let blob: Vec<u8> = {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        (0..BLOB_BYTES)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    };
+    let chunk = Chunk::builder(entity_path!("video"))
+        .with_archetype(
+            RowId::ZERO,
+            [build_frame_nr(TimeInt::ZERO)],
+            &re_sdk_types::archetypes::AssetVideo::new(blob),
+        )
+        .build()
+        .unwrap();
+    let store_id = StoreId::random(StoreKind::Recording, "test_app");
+    let message = LogMsg::ArrowMsg(store_id, chunk.to_arrow_msg().unwrap());
+
+    let mut group = c.benchmark_group("blob_arrow_msg");
+    group.throughput(criterion::Throughput::Bytes(BLOB_BYTES as _));
+    for compression in [Compression::Off, Compression::LZ4] {
+        let transport = message.to_transport(compression).unwrap();
+        group.bench_function(format!("to_application({compression:?})"), |b| {
+            let mut injector = DummyApplicationIdInjector::new("test_app");
+            b.iter(|| {
+                let decoded = transport.to_application((&mut injector, None)).unwrap();
+                std::hint::black_box(decoded)
+            });
+        });
+    }
+}
+
+/// Decoding an uncompressed IPC payload that starts on an 8-byte boundary against one that
+/// starts a byte past it, which is where most payloads sliced out of a gRPC message or a file
+/// land.
+///
+/// A blob aliases the payload either way, scalars are relocated by arrow when misaligned, and a
+/// misaligned payload holding a dense union is copied whole.
+fn ipc_payload_alignment(c: &mut Criterion) {
+    use std::sync::Arc;
+
+    use arrow::array::{
+        ArrayRef, BinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, UnionArray,
+    };
+    use arrow::datatypes::{DataType, Field, UnionFields};
+
+    cfg_select! {
+        debug_assertions => {
+            const BLOB_BYTES: usize = 1024;
+        }
+        _ => {
+            const BLOB_BYTES: usize = 2 * 1024 * 1024;
+        }
+    }
+    const NUM_SCALARS: i64 = 8;
+
+    fn ipc_stream(batch: &RecordBatch) -> Vec<u8> {
+        let mut stream = Vec::new();
+        let mut writer =
+            arrow::ipc::writer::StreamWriter::try_new(&mut stream, batch.schema_ref()).unwrap();
+        writer.write(batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        stream
+    }
+
+    /// `payload` at an address exactly `offset` bytes past an 8-byte boundary.
+    fn at_alignment_offset(payload: &[u8], offset: usize) -> bytes::Bytes {
+        let mut storage = vec![0_u8; payload.len() + 16];
+        let start = storage.as_ptr().align_offset(align_of::<u64>()) + offset;
+        storage[start..start + payload.len()].copy_from_slice(payload);
+        bytes::Bytes::from(storage).slice(start..start + payload.len())
+    }
+
+    let blob: ArrayRef = Arc::new(BinaryArray::from_vec(vec![&[0xAB_u8; BLOB_BYTES][..]]));
+    let dense_union: ArrayRef = Arc::new(
+        UnionArray::try_new(
+            UnionFields::try_new([0], [Field::new("i", DataType::Int32, false)]).unwrap(),
+            vec![0_i8].into(),
+            Some(vec![0_i32].into()),
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap(),
+    );
+    let batches = [
+        (
+            "blob",
+            RecordBatch::try_from_iter([("blob", Arc::clone(&blob))]).unwrap(),
+        ),
+        (
+            "scalars",
+            RecordBatch::try_from_iter([
+                (
+                    "time",
+                    Arc::new(Int64Array::from_iter_values(0..NUM_SCALARS)) as ArrayRef,
+                ),
+                (
+                    "x",
+                    Arc::new(Float64Array::from(vec![1.0; NUM_SCALARS as usize])) as ArrayRef,
+                ),
+                (
+                    "y",
+                    Arc::new(Float64Array::from(vec![2.0; NUM_SCALARS as usize])) as ArrayRef,
+                ),
+            ])
+            .unwrap(),
+        ),
+        (
+            "blob_and_dense_union",
+            RecordBatch::try_from_iter([("blob", blob), ("union", dense_union)]).unwrap(),
+        ),
+    ];
+
+    let mut group = c.benchmark_group("ipc_payload_alignment");
+    for (name, batch) in &batches {
+        let stream = ipc_stream(batch);
+        for (placement, offset) in [("aligned", 0), ("misaligned", 1)] {
+            let payload = at_alignment_offset(&stream, offset);
+            group.bench_function(format!("{name}({placement})"), |b| {
+                b.iter(|| {
+                    let decoded = re_protos::common::v1alpha1::ext::record_batch_from_ipc_bytes(
+                        &payload,
+                        Compression::Off,
+                        payload.len() as u64,
+                    )
+                    .unwrap();
+                    std::hint::black_box(decoded)
+                });
+            });
+        }
+    }
+}
+
+/// Build a ([`Timeline`], [`TimeInt`]) tuple from `frame_nr` suitable for inserting in a [`re_log_types::TimePoint`].
+fn build_frame_nr(frame_nr: TimeInt) -> (Timeline, TimeInt) {
+    (Timeline::new("frame_nr", TimeType::Sequence), frame_nr)
+}

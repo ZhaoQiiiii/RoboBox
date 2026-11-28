@@ -1,0 +1,29 @@
+{
+  "licenses": [
+    {
+      "type": "MIT"
+    },
+    {
+      "type": "Apache-2.0"
+    }
+  ],
+  "private": true,
+  "scripts": {
+    "postinstall": "npm run build:proto --workspace web-viewer",
+    "docs": "node scripts/docs.mjs",
+    "docs:serve": "node scripts/serve-docs.mjs"
+  },
+  "workspaces": [
+    "web-viewer",
+    "web-viewer-react"
+  ],
+  "devDependencies": {
+    "oxlint": "1.94.0",
+    "oxlint-tsgolint": "7.0.2007"
+  },
+  "overrides": {
+    "brace-expansion": "^5.0.12",
+    "markdown-it": "^14.3.3",
+    "yaml": "^2.8.3"
+  }
+}

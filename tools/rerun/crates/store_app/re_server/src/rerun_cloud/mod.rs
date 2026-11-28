@@ -1,0 +1,2459 @@
+use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use arrow::array::BooleanArray;
+use arrow::record_batch::RecordBatch;
+use datafusion::prelude::SessionContext;
+use futures::StreamExt as _;
+use futures::stream::BoxStream;
+use re_protos::common::v1alpha1::TaskId;
+use tonic::{Code, Request, Response, Status};
+
+use re_arrow_util::RecordBatchExt as _;
+use re_log_encoding::ToTransport as _;
+use re_log_types::{EntryId, StoreKind, TimelineName};
+use re_protos::cloud::v1alpha1::ext::{
+    AssetMode, ChunkCandidatesDataframe, ChunkIndexingPolicy, QueryTasksDataframe,
+    RegisterWithDatasetDataframe, ScanDatasetManifestDataframe, ScanSegmentTableDataframe,
+    asset_applies_to_segment, read_asset_mode, read_asset_segments,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use re_protos::cloud::v1alpha1::ext::{CreateTableEntryResponse, ProviderDetails};
+use re_protos::cloud::v1alpha1::rerun_cloud_service_server::RerunCloudService;
+use re_protos::cloud::v1alpha1::{
+    CancelTasksRequest, CancelTasksResponse, DeleteEntryResponse, DoBandwidthTestResponse,
+    EntryCreatedEvent, EntryDeletedEvent, EntryDetails, EntryKind, EventKind, FetchChunksRequest,
+    GetDatasetManifestSchemaRequest, GetDatasetManifestSchemaResponse, GetDatasetSchemaResponse,
+    GetRrdManifestResponse, GetSchemasRequest, GetSchemasResponse, GetSegmentTableSchemaResponse,
+    LayerNameFilter, QueryDatasetResponse, QueryTasksOnCompletionRequest,
+    QueryTasksOnCompletionResponse, QueryTasksRequest, QueryTasksResponse, RegisterTableRequest,
+    RegisterTableResponse, ScanDatasetManifestRequest, ScanDatasetManifestResponse,
+    ScanSegmentTableResponse, ScanTableResponse, SegmentIdFilter, WatchEventsResponse,
+    layer_name_filter, segment_id_filter, watch_events_response,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use re_protos::common::v1alpha1::ext::IfDuplicateBehavior;
+use re_protos::common::v1alpha1::ext::{DatasetKind, SegmentId};
+use re_protos::headers::{RerunHeadersExtractorExt as _, resolve_entry_id};
+use re_protos::missing_field;
+use re_protos::protocol_level::{ClientLevelCheck, ProtocolLevel};
+use re_protos::{
+    EntryName,
+    cloud::v1alpha1::ext::{
+        self, ApplyDatasetPolicyRequest, ApplyDatasetPolicyResponse, CreateDatasetEntryRequest,
+        CreateDatasetEntryResponse, CreateTableEntryRequest, DataSource, EntryDetailsUpdate,
+        QueryDatasetRequest, ReadDatasetEntryResponse, ReadTableEntryResponse, TableInsertMode,
+        UpdateDatasetEntryRequest, UpdateDatasetEntryResponse, UpdateEntryRequest,
+        UpdateEntryResponse, UpdateTableEntryRequest, UpdateTableEntryResponse,
+    },
+};
+#[cfg(not(target_arch = "wasm32"))]
+use re_tuid::Tuid;
+use re_types_core::LayerName;
+
+mod chunk_selection;
+use self::chunk_selection::{EntityScope, LayerStore, encode_candidates, select_chunks};
+mod register_with_dataset;
+use self::register_with_dataset::{RegisterWithDatasetResult, do_register_with_dataset};
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::NamedPath;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::OnError;
+use crate::store::TASK_ID_SUCCESS;
+use crate::store::{ChunkKey, Dataset, InMemoryStore, SegmentProperties, Table, TaskResult};
+
+#[derive(Debug)]
+#[cfg_attr(target_arch = "wasm32", derive(Clone, Copy, Default))]
+pub struct RerunCloudHandlerSettings {
+    #[cfg(not(target_arch = "wasm32"))]
+    storage_dir: tempfile::TempDir,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RerunCloudHandlerSettings {
+    fn new() -> Result<Self, crate::store::Error> {
+        Ok(Self {
+            storage_dir: create_data_dir()?,
+        })
+    }
+}
+
+/// Create the directory for the handler's on-disk state.
+///
+/// The name includes the process id: `tempfile` seeds its random suffix from the current time
+/// and thread id, so processes started in the same instant can pick the same suffix, and a
+/// collision with a directory another process is still removing fails on Windows with
+/// `PermissionDenied`, which `tempfile` does not retry.
+#[cfg(not(target_arch = "wasm32"))]
+fn create_data_dir() -> Result<tempfile::TempDir, crate::store::Error> {
+    let prefix = format!("rerun-data-{}-", std::process::id());
+    Ok(tempfile::Builder::new().prefix(&prefix).tempdir()?)
+}
+
+fn apply_segment_id_filter(
+    batch: RecordBatch,
+    filter: Option<&SegmentIdFilter>,
+) -> tonic::Result<RecordBatch> {
+    let Some(filter) = filter else {
+        return Ok(batch);
+    };
+    let Some(strategy) = filter.strategy.as_ref() else {
+        return Ok(batch);
+    };
+    let (ids, scan_only) = match strategy {
+        segment_id_filter::Strategy::ScanOnly(ids) => (&ids.segment_ids, true),
+        segment_id_filter::Strategy::Skip(ids) => (&ids.segment_ids, false),
+    };
+
+    let segment_ids = ScanSegmentTableDataframe::COLUMN_RERUN_SEGMENT_ID
+        .extract(&batch)
+        .map_err(|err| Status::internal(err.to_string()))?;
+    let mask = membership_mask(segment_ids.iter(), ids, scan_only);
+
+    arrow::compute::filter_record_batch(&batch, &mask)
+        .map_err(|err| Status::internal(format!("Unable to apply segment ID filter: {err:#}")))
+}
+
+fn apply_layer_name_filter(
+    batch: RecordBatch,
+    filter: Option<&LayerNameFilter>,
+) -> tonic::Result<RecordBatch> {
+    let Some(filter) = filter else {
+        return Ok(batch);
+    };
+    let Some(strategy) = filter.strategy.as_ref() else {
+        return Ok(batch);
+    };
+    let (names, scan_only) = match strategy {
+        layer_name_filter::Strategy::ScanOnly(names) => (&names.layer_names, true),
+        layer_name_filter::Strategy::Skip(names) => (&names.layer_names, false),
+    };
+
+    let layer_names = ScanDatasetManifestDataframe::COLUMN_RERUN_LAYER_NAME
+        .extract(&batch)
+        .map_err(|err| Status::internal(err.to_string()))?;
+    let mask = membership_mask(layer_names.iter(), names, scan_only);
+
+    arrow::compute::filter_record_batch(&batch, &mask)
+        .map_err(|err| Status::internal(format!("Unable to apply layer name filter: {err:#}")))
+}
+
+/// Keeps a row when whether `values` lists it matches `scan_only`.
+fn membership_mask<'a>(
+    column: impl Iterator<Item = &'a str>,
+    values: &[String],
+    scan_only: bool,
+) -> BooleanArray {
+    let values = values
+        .iter()
+        .map(String::as_str)
+        .collect::<ahash::HashSet<_>>();
+    column
+        .map(|value| values.contains(value) == scan_only)
+        .collect()
+}
+
+/// Builds a [`RerunCloudHandler`].
+///
+/// Touches the filesystem only in [`Self::build`] and [`Self::build_with_write_access`], which
+/// create the handler's storage directory.
+pub struct RerunCloudHandlerBuilder {
+    build_info: re_build_info::BuildInfo,
+    store: InMemoryStore,
+}
+
+impl RerunCloudHandlerBuilder {
+    /// `build_info` describes the binary hosting the handler, and is what the handler reports
+    /// from its version endpoint.
+    pub fn new(build_info: re_build_info::BuildInfo) -> Self {
+        Self {
+            build_info,
+            store: InMemoryStore::default(),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn with_directory_as_dataset(
+        mut self,
+        directory: &NamedPath,
+        on_duplicate: IfDuplicateBehavior,
+        on_error: crate::OnError,
+    ) -> Result<Self, crate::store::Error> {
+        self.store
+            .load_directory_as_dataset(directory, on_duplicate, on_error)
+            .await?;
+
+        Ok(self)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn with_rrds_as_dataset(
+        mut self,
+        dataset_name: EntryName,
+        rrd_paths: Vec<PathBuf>,
+        on_duplicate: IfDuplicateBehavior,
+        on_error: crate::OnError,
+    ) -> Result<Self, crate::store::Error> {
+        let dataset_id = self
+            .store
+            .create_dataset(dataset_name, None, Default::default())?;
+
+        for rrd_path in rrd_paths {
+            let load_result = self
+                .store
+                .register_rrd_to_dataset(
+                    dataset_id,
+                    &rrd_path,
+                    None,
+                    on_duplicate,
+                    StoreKind::Recording,
+                )
+                .await;
+            match load_result {
+                Ok(_segment_ids) => {}
+                Err(err) => match on_error {
+                    OnError::Continue => {
+                        re_log::warn!("Failed loading file {}: {err}", rrd_path.display());
+                    }
+                    OnError::Abort => {
+                        return Err(err);
+                    }
+                },
+            }
+        }
+
+        Ok(self)
+    }
+
+    #[cfg(all(feature = "lance", not(target_arch = "wasm32")))]
+    pub async fn with_directory_as_table(
+        mut self,
+        path: &NamedPath,
+        on_duplicate: IfDuplicateBehavior,
+    ) -> Result<Self, crate::store::Error> {
+        self.store
+            .load_directory_as_table(path, on_duplicate)
+            .await?;
+
+        Ok(self)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn build(self) -> Result<RerunCloudHandler, crate::store::Error> {
+        let Self { build_info, store } = self;
+        let settings = RerunCloudHandlerSettings::new()?;
+        Ok(RerunCloudHandler::new(settings, build_info, store, None))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn build(self) -> RerunCloudHandler {
+        let Self { build_info, store } = self;
+        RerunCloudHandler::new(RerunCloudHandlerSettings::default(), build_info, store)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn build_with_write_access(
+        self,
+    ) -> anyhow::Result<(RerunCloudHandler, axum::routing::MethodRouter)> {
+        let Self { build_info, store } = self;
+        let settings = RerunCloudHandlerSettings::new()?;
+        let write_access_grants =
+            crate::routes::WriteAccessGrants::new(settings.storage_dir.path().to_owned())?;
+        let write_upload_route = crate::routes::write_upload_route(write_access_grants.clone());
+        let handler =
+            RerunCloudHandler::new(settings, build_info, store, Some(write_access_grants));
+        Ok((handler, write_upload_route))
+    }
+}
+
+// ---
+
+pub struct RerunCloudHandler {
+    #[cfg(not(target_arch = "wasm32"))]
+    settings: RerunCloudHandlerSettings,
+
+    #[cfg(not(target_arch = "wasm32"))]
+    write_access_grants: Option<crate::routes::WriteAccessGrants>,
+    build_info: re_build_info::BuildInfo,
+    store: tokio::sync::RwLock<InMemoryStore>,
+    events_tx: tokio::sync::broadcast::Sender<WatchEventsResponse>,
+}
+
+impl RerunCloudHandler {
+    fn new(
+        settings: RerunCloudHandlerSettings,
+        build_info: re_build_info::BuildInfo,
+        store: InMemoryStore,
+        #[cfg(not(target_arch = "wasm32"))] write_access_grants: Option<
+            crate::routes::WriteAccessGrants,
+        >,
+    ) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let _ = settings;
+        let (events_tx, _) = tokio::sync::broadcast::channel(1024);
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            settings,
+            #[cfg(not(target_arch = "wasm32"))]
+            write_access_grants,
+            build_info,
+            store: tokio::sync::RwLock::new(store),
+            events_tx,
+        }
+    }
+
+    /// The directory holding this handler's on-disk state, such as staged uploads.
+    ///
+    /// Removed together with the handler.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn storage_dir(&self) -> &std::path::Path {
+        self.settings.storage_dir.path()
+    }
+
+    /// Broadcast a catalog event to all `WatchEvents` subscribers.
+    fn notify(&self, kind: watch_events_response::Kind) {
+        // A send error just means there are no subscribers, which is fine.
+        let _ = self
+            .events_tx
+            .send(WatchEventsResponse { kind: Some(kind) })
+            .ok();
+    }
+
+    /// Returns the store of every layer of the given segments of a dataset, or of all its
+    /// segments if `segment_ids` is `None`.
+    async fn get_chunk_stores(
+        &self,
+        dataset_id: EntryId,
+        segment_ids: Option<&[SegmentId]>,
+    ) -> tonic::Result<Vec<LayerStore>> {
+        let store = self.store.read().await;
+        let dataset = store.dataset(dataset_id)?;
+
+        Ok(dataset
+            .segments_from_ids(segment_ids)
+            .flat_map(|(segment_id, segment)| {
+                segment
+                    .iter_sources()
+                    .map(|(layer_name, source)| LayerStore {
+                        segment_id: segment_id.clone(),
+                        layer: layer_name.clone(),
+                        store_slot_id: source.store_slot_id(),
+                        resolved: source.resolved_store().clone(),
+                    })
+            })
+            .collect())
+    }
+
+    /// Selects `FindChunks` candidates across every store of a dataset, in fixed-schema batches.
+    ///
+    /// Checks the timeline against every store of the dataset, not only the selected ones, so an
+    /// unknown timeline fails whatever the segment scope. A dataset with no stores skips the
+    /// check and answers one empty batch.
+    async fn find_candidates(
+        &self,
+        entry_id: EntryId,
+        request: ext::FindChunksRequest,
+    ) -> tonic::Result<BoxStream<'static, tonic::Result<RecordBatch>>> {
+        request.ensure_supported()?;
+
+        let chunk_stores = self.get_chunk_stores(entry_id, None).await?;
+
+        if let Some(timeline) = request.timeline()
+            && !chunk_stores.is_empty()
+            && !chunk_stores
+                .iter()
+                .any(|store| store.resolved.schema().timelines().contains_key(&timeline))
+        {
+            return Err(tonic::Status::invalid_argument(format!(
+                "unknown timeline `{timeline}`"
+            )));
+        }
+
+        let request_is_empty = request.is_empty();
+        let timeline = request.timeline();
+        let entities = EntityScope::new(&request.contents);
+
+        // A dataset with no stores, an empty request, or a segment scope that matches none of
+        // the dataset's stores must all answer with one empty batch rather than zero batches:
+        // clients concatenate a scan's responses, and a response with no batch carries no
+        // schema to concatenate against.
+        let selected_chunk_stores: Vec<_> = if request_is_empty {
+            Vec::new()
+        } else {
+            chunk_stores
+                .into_iter()
+                .filter(|store| request.mode.selects_segment(&store.segment_id))
+                .collect()
+        };
+
+        if selected_chunk_stores.is_empty() {
+            let batch = ChunkCandidatesDataframe::empty_record_batch();
+            return Ok(Box::pin(futures::stream::iter([Ok(batch)])));
+        }
+
+        let stream = futures::stream::iter(selected_chunk_stores.into_iter().map(move |store| {
+            let selected_chunks = select_chunks(&store, &entities, Some(&request.mode))?;
+            encode_candidates(&selected_chunks, timeline.as_ref())
+        }));
+
+        Ok(Box::pin(stream))
+    }
+
+    /// Answers a [`ext::LegacyPlan::FullScan`]: every chunk of the given segments and contents.
+    /// The optional timeline supplies response starts without filtering the selection.
+    ///
+    /// TODO(RR-5817): remove with the rest of the `QueryDataset` compatibility code.
+    async fn full_scan_candidates(
+        &self,
+        entry_id: EntryId,
+        segments: ext::SegmentSelection,
+        contents: ext::ContentSelection,
+        timeline: Option<TimelineName>,
+    ) -> tonic::Result<BoxStream<'static, tonic::Result<RecordBatch>>> {
+        let segment_ids = match &segments {
+            ext::SegmentSelection::All => None,
+            ext::SegmentSelection::Explicit(ids) => Some(ids.iter().cloned().collect::<Vec<_>>()),
+        };
+
+        let chunk_stores = self
+            .get_chunk_stores(entry_id, segment_ids.as_deref())
+            .await?;
+
+        if chunk_stores.is_empty() {
+            let batch = ChunkCandidatesDataframe::empty_record_batch();
+            return Ok(Box::pin(futures::stream::iter([Ok(batch)])));
+        }
+
+        let entities = EntityScope::new(&contents);
+
+        let stream = futures::stream::iter(chunk_stores.into_iter().map(move |store| {
+            let selected_chunks = select_chunks(&store, &entities, None)?;
+            encode_candidates(&selected_chunks, timeline.as_ref())
+        }));
+
+        Ok(Box::pin(stream))
+    }
+
+    #[cfg_attr(target_arch = "wasm32", expect(clippy::unused_async))]
+    async fn resolve_data_sources(data_sources: &[DataSource]) -> tonic::Result<Vec<DataSource>> {
+        let mut resolved = Vec::<DataSource>::with_capacity(data_sources.len());
+        for source in data_sources {
+            if !source.is_prefix {
+                resolved.push(source.clone());
+                continue;
+            }
+
+            cfg_select! {
+                target_arch = "wasm32" => {
+                    // TODO(RR-5155): Support enumerating OPFS directories for prefix registration.
+                    return Err(tonic::Status::invalid_argument(
+                        "prefix data sources are not supported on wasm",
+                    ));
+                }
+                _ => {
+                    if source.storage_url.scheme() == "memory" {
+                        return Err(tonic::Status::invalid_argument(
+                            "memory:// URLs cannot be used as prefix data sources",
+                        ));
+                    }
+                    let path = source.storage_url.to_file_path().map_err(|()| {
+                        tonic::Status::invalid_argument(format!(
+                            "getting file path from {:?}",
+                            source.storage_url
+                        ))
+                    })?;
+                    let meta =
+                        tokio::fs::metadata(&path)
+                            .await
+                            .map_err(|err| match err.kind() {
+                                std::io::ErrorKind::NotFound => tonic::Status::invalid_argument(
+                                    format!("Directory not found: {path:?}"),
+                                ),
+                                _ => tonic::Status::invalid_argument(format!(
+                                    "Failed to read directory metadata {path:?}: {err:#}"
+                                )),
+                            })?;
+                    if !meta.is_dir() {
+                        return Err(tonic::Status::invalid_argument(format!(
+                            "expected prefix / directory but got an object ({path:?})"
+                        )));
+                    }
+
+                    // Recursively walk the directory and grab all '.rrd' files
+                    let mut dirs_to_visit = vec![path];
+                    let mut files = Vec::new();
+
+                    while let Some(current_dir) = dirs_to_visit.pop() {
+                        let mut entries =
+                            tokio::fs::read_dir(&current_dir).await.map_err(|err| {
+                                tonic::Status::internal(format!(
+                                    "Failed to read directory {current_dir:?}: {err:#}"
+                                ))
+                            })?;
+
+                        while let Some(entry) = entries.next_entry().await.map_err(|err| {
+                            tonic::Status::internal(format!(
+                                "Failed to read directory entry: {err:#}"
+                            ))
+                        })? {
+                            let entry_path = entry.path();
+                            let file_type = entry.file_type().await.map_err(|err| {
+                                tonic::Status::internal(format!(
+                                    "Failed to read directory entry metadata: {err:#}"
+                                ))
+                            })?;
+
+                            if file_type.is_dir() {
+                                dirs_to_visit.push(entry_path);
+                            } else if let Some(extension) = entry_path.extension()
+                                && extension == "rrd"
+                            {
+                                files.push(entry_path);
+                            }
+                        }
+                    }
+
+                    if files.is_empty() {
+                        return Err(tonic::Status::invalid_argument(format!(
+                            "no rrd files found in {:?}",
+                            source.storage_url
+                        )));
+                    }
+
+                    for file_path in files {
+                        let mut file_url = source.storage_url.clone();
+                        file_url.set_path(&file_path.to_string_lossy());
+                        resolved.push(DataSource {
+                            storage_url: file_url,
+                            is_prefix: false,
+                            ..source.clone()
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(resolved)
+    }
+}
+
+impl std::fmt::Debug for RerunCloudHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerunCloudHandler").finish()
+    }
+}
+
+macro_rules! decl_stream {
+    ($stream:ident<manifest:$resp:ident>) => {
+        pub type $stream = std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = tonic::Result<re_protos::cloud::v1alpha1::$resp>> + Send,
+            >,
+        >;
+    };
+
+    ($stream:ident<rerun_cloud:$resp:ident>) => {
+        pub type $stream = std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = tonic::Result<re_protos::cloud::v1alpha1::$resp>> + Send,
+            >,
+        >;
+    };
+
+    ($stream:ident<tasks:$resp:ident>) => {
+        pub type $stream = std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = tonic::Result<re_protos::cloud::v1alpha1::$resp>> + Send,
+            >,
+        >;
+    };
+}
+
+decl_stream!(DoBandwidthTestResponseStream<rerun_cloud:DoBandwidthTestResponse>);
+decl_stream!(WatchEventsResponseStream<rerun_cloud:WatchEventsResponse>);
+decl_stream!(FetchChunksResponseStream<manifest:FetchChunksResponse>);
+decl_stream!(FindChunksResponseStream<rerun_cloud:FindChunksResponse>);
+decl_stream!(GetAssetsForSegmentResponseStream<rerun_cloud:GetAssetsForSegmentResponse>);
+decl_stream!(GetSegmentPropertiesResponseStream<rerun_cloud:GetSegmentPropertiesResponse>);
+decl_stream!(GetRrdManifestResponseStream<manifest:GetRrdManifestResponse>);
+decl_stream!(GetSchemasResponseStream<manifest:GetSchemasResponse>);
+decl_stream!(QueryDatasetResponseStream<manifest:QueryDatasetResponse>);
+decl_stream!(QueryTasksOnCompletionResponseStream<tasks:QueryTasksOnCompletionResponse>);
+decl_stream!(ScanDatasetManifestResponseStream<manifest:ScanDatasetManifestResponse>);
+decl_stream!(ScanSegmentTableResponseStream<manifest:ScanSegmentTableResponse>);
+decl_stream!(ScanTableResponseStream<rerun_cloud:ScanTableResponse>);
+decl_stream!(UnregisterFromDatasetResponseStream<manifest:UnregisterFromDatasetResponse>);
+
+impl RerunCloudHandler {
+    async fn find_datasets(
+        &self,
+        entry_id: Option<EntryId>,
+        name: Option<EntryName>,
+        store_kind: Option<StoreKind>,
+    ) -> tonic::Result<Vec<EntryDetails>> {
+        let store = self.store.read().await;
+
+        let dataset = match (entry_id, name) {
+            (None, None) => None,
+
+            (Some(entry_id), None) => Some(store.dataset(entry_id)?),
+
+            (None, Some(name)) => Some(store.dataset_by_name(&name)?),
+
+            (Some(entry_id), Some(name)) => {
+                let dataset = store.dataset_by_name(&name)?;
+                if dataset.id() != entry_id {
+                    return Err(tonic::Status::not_found(format!(
+                        "Dataset with ID {entry_id} not found"
+                    )));
+                }
+                Some(dataset)
+            }
+        };
+
+        let dataset_iter = if let Some(dataset) = dataset {
+            itertools::Either::Left(std::iter::once(dataset))
+        } else {
+            itertools::Either::Right(store.iter_datasets())
+        };
+
+        Ok(dataset_iter
+            .filter(|dataset| {
+                store_kind.is_none_or(|store_kind| dataset.store_kind() == store_kind)
+            })
+            .map(Dataset::as_entry_details)
+            .map(Into::into)
+            .collect())
+    }
+
+    async fn find_tables(
+        &self,
+        entry_id: Option<EntryId>,
+        name: Option<EntryName>,
+    ) -> tonic::Result<Vec<EntryDetails>> {
+        let store = self.store.read().await;
+
+        let table = match (entry_id, name) {
+            (None, None) => None,
+
+            (Some(entry_id), None) => {
+                let Some(table) = store.table(entry_id) else {
+                    return Err(tonic::Status::not_found(format!(
+                        "Table with ID {entry_id} not found"
+                    )));
+                };
+                Some(table)
+            }
+
+            (None, Some(name)) => {
+                let Some(table) = store.table_by_name(&name) else {
+                    return Err(tonic::Status::not_found(format!(
+                        "Table with name {name} not found"
+                    )));
+                };
+                Some(table)
+            }
+
+            (Some(entry_id), Some(name)) => {
+                let Some(table) = store.table_by_name(&name) else {
+                    return Err(tonic::Status::not_found(format!(
+                        "Table with name {name} not found"
+                    )));
+                };
+                if table.id() != entry_id {
+                    return Err(tonic::Status::not_found(format!(
+                        "Table with ID {entry_id} not found"
+                    )));
+                }
+                Some(table)
+            }
+        };
+
+        let table_iter = if let Some(table) = table {
+            itertools::Either::Left(std::iter::once(table))
+        } else {
+            itertools::Either::Right(store.iter_tables())
+        };
+
+        Ok(table_iter
+            .map(Table::as_entry_details)
+            .map(Into::into)
+            .collect())
+    }
+}
+
+/// Verifies that the referenced blueprint dataset (if any) exists and is itself a blueprint dataset.
+///
+/// Internal consistency of the `DatasetDetails`/`TableDetails` is checked separately via their
+/// `validate_consistency` methods.
+fn validate_blueprint_dataset(
+    store: &InMemoryStore,
+    blueprint_dataset: Option<EntryId>,
+    entry_kind: &str,
+) -> tonic::Result<()> {
+    let Some(blueprint_dataset) = blueprint_dataset else {
+        return Ok(());
+    };
+
+    let blueprint_dataset = store.dataset(blueprint_dataset).map_err(|err| {
+        tonic::Status::invalid_argument(format!(
+            "{entry_kind} blueprint dataset does not exist: {err}"
+        ))
+    })?;
+
+    if blueprint_dataset.store_kind() != StoreKind::Blueprint {
+        return Err(tonic::Status::invalid_argument(format!(
+            "{entry_kind} blueprint dataset must be a blueprint dataset"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Same as [`validate_blueprint_dataset`], for the asset dataset.
+fn validate_asset_dataset(
+    store: &InMemoryStore,
+    asset_dataset: Option<EntryId>,
+) -> tonic::Result<()> {
+    let Some(asset_dataset) = asset_dataset else {
+        return Ok(());
+    };
+
+    let asset_dataset = store.dataset(asset_dataset).map_err(|err| {
+        tonic::Status::invalid_argument(format!("asset dataset does not exist: {err}"))
+    })?;
+
+    let kind = asset_dataset.dataset_kind();
+    if kind != DatasetKind::Asset {
+        return Err(tonic::Status::invalid_argument(format!(
+            "asset dataset reference must point to an asset dataset, this is a {kind:?} dataset"
+        )));
+    }
+
+    Ok(())
+}
+
+#[tonic::async_trait]
+impl RerunCloudService for RerunCloudHandler {
+    async fn version(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::VersionRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::VersionResponse>> {
+        let re_protos::cloud::v1alpha1::VersionRequest {} = request.into_inner();
+
+        // NOTE: Reminder that this is only fully filled iff CI=1.
+        let build_info = self.build_info.clone();
+
+        Ok(tonic::Response::new(
+            re_protos::cloud::v1alpha1::VersionResponse {
+                build_info: Some(build_info.into()),
+                version: re_build_info::exposed_version().to_owned(),
+                cloud_provider: None,
+                cloud_region: None,
+                features: re_protos::cloud::v1alpha1::features::all_supported_features(),
+            },
+        ))
+    }
+
+    async fn who_am_i(
+        &self,
+        _request: tonic::Request<re_protos::cloud::v1alpha1::WhoAmIRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::WhoAmIResponse>> {
+        // The local server has no authentication, so grant full access.
+        Ok(tonic::Response::new(
+            re_protos::cloud::v1alpha1::WhoAmIResponse {
+                user_id: None,
+                can_read: true,
+                can_write: true,
+                capabilities: Some(re_protos::cloud::v1alpha1::ServerCapabilities {
+                    capabilities: crate::capability_names(),
+                }),
+                client_deprecation: None,
+                protocol_level: crate::PROTOCOL_LEVEL.as_u32(),
+            },
+        ))
+    }
+
+    type DoBandwidthTestStream = DoBandwidthTestResponseStream;
+
+    async fn do_bandwidth_test(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::DoBandwidthTestRequest>,
+    ) -> tonic::Result<tonic::Response<Self::DoBandwidthTestStream>> {
+        let re_protos::cloud::v1alpha1::DoBandwidthTestRequest { num_bytes } = request.into_inner();
+        let max = ext::MAX_BANDWIDTH_TEST_BYTES;
+        if num_bytes > max {
+            return Err(Status::invalid_argument(format!(
+                "num_bytes ({num_bytes}) exceeds the maximum of {max}"
+            )));
+        }
+        Ok(tonic::Response::new(
+            Box::pin(bandwidth_test_stream(num_bytes)) as Self::DoBandwidthTestStream,
+        ))
+    }
+
+    type WatchEventsStream = WatchEventsResponseStream;
+
+    async fn watch_events(
+        &self,
+        request: Request<re_protos::cloud::v1alpha1::WatchEventsRequest>,
+    ) -> tonic::Result<tonic::Response<Self::WatchEventsStream>> {
+        let rx = self.events_tx.subscribe();
+
+        let kinds = request.into_inner().kinds;
+
+        let stream = futures::stream::unfold((rx, kinds), |(mut rx, kinds)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if kinds.is_empty() {
+                            return Some((Ok(event), (rx, kinds)));
+                        }
+
+                        let subscribed = event.kind.is_some_and(|kind| kind.is_entry_kind())
+                            && kinds.contains(&EventKind::entry());
+
+                        if subscribed {
+                            return Some((Ok(event), (rx, kinds)));
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+
+        Ok(tonic::Response::new(
+            Box::pin(stream) as Self::WatchEventsStream
+        ))
+    }
+
+    // --- Catalog ---
+
+    async fn get_storage_locations(
+        &self,
+        _request: tonic::Request<re_protos::cloud::v1alpha1::GetStorageLocationsRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::GetStorageLocationsResponse>>
+    {
+        Err(tonic::Status::unimplemented(
+            "storage locations are not supported",
+        ))
+    }
+
+    async fn find_entries(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::FindEntriesRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::FindEntriesResponse>> {
+        let filter = request.into_inner().filter.unwrap_or_default();
+
+        let entry_id = filter.id.map(TryInto::try_into).transpose()?;
+        let name = filter
+            .name
+            .map(EntryName::new)
+            .transpose()
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+
+        // `entry_kinds` (new, repeated) always wins over the legacy singular `entry_kind` when
+        // both are set. `ENTRY_KIND_UNSPECIFIED` is rejected outright; unknown *positive* values
+        // (kinds newer than this server knows about) are intentionally allowed through and
+        // simply match no entry, so a client requesting them degrades gracefully instead of
+        // erroring out (forward compat, mirrors Rerun Hub).
+        if filter
+            .entry_kinds
+            .contains(&(EntryKind::Unspecified as i32))
+        {
+            return Err(Status::invalid_argument(
+                "find_entries: entry_kinds must not contain ENTRY_KIND_UNSPECIFIED",
+            ));
+        }
+
+        // The effective set of raw `EntryKind` values to match against. `None` for the
+        // kind-less default.
+        let effective_kinds: Option<Vec<i32>> = if !filter.entry_kinds.is_empty() {
+            Some(filter.entry_kinds)
+        } else if let Some(kind) = filter.entry_kind {
+            // Legacy singular field (pre hub 0.15)
+            let kind = EntryKind::try_from(kind).map_err(|err| {
+                Status::invalid_argument(format!("find_entries: invalid entry kind {err}"))
+            })?;
+            if kind == EntryKind::Unspecified {
+                return Err(Status::invalid_argument(
+                    "find_entries: entry kind unspecified",
+                ));
+            }
+            Some(vec![kind as i32])
+        } else {
+            None
+        };
+
+        let matches_kind = |raw_kind: i32| match &effective_kinds {
+            Some(kinds) => kinds.contains(&raw_kind),
+            // When neither the new `entry_kinds` nor legacy `entry_kind` (singular)
+            // are specified we fall back to the legacy default.
+            //
+            // See RR-5186.
+            None => EntryKind::try_from(raw_kind).is_ok_and(EntryKind::is_legacy_default_kind),
+        };
+
+        let soften_not_found = |result: tonic::Result<Vec<EntryDetails>>| match result {
+            Ok(entries) => Ok(entries),
+            // this is a find. Degrade a NotFound to an empty result set.
+            Err(err) if err.code() == Code::NotFound => Ok(vec![]),
+            Err(err) => Err(err),
+        };
+
+        let mut entries = if effective_kinds.is_some() {
+            // `Dataset` and `AssetDataset` are both backed by `StoreKind::Recording`, so a
+            // request for just one of them still has to fetch the whole recording family and
+            // filter by actual kind below (an asset dataset otherwise leaks into
+            // `entry_kind=Dataset` results).
+            let mut entries = Vec::new();
+            if matches_kind(EntryKind::Dataset as i32)
+                || matches_kind(EntryKind::AssetDataset as i32)
+            {
+                let result = self
+                    .find_datasets(entry_id, name.clone(), Some(StoreKind::Recording))
+                    .await;
+                entries.extend(soften_not_found(result)?);
+            }
+            if matches_kind(EntryKind::BlueprintDataset as i32) {
+                let result = self
+                    .find_datasets(entry_id, name.clone(), Some(StoreKind::Blueprint))
+                    .await;
+                entries.extend(soften_not_found(result)?);
+            }
+            if matches_kind(EntryKind::Table as i32) {
+                let result = self.find_tables(entry_id, name.clone()).await;
+                entries.extend(soften_not_found(result)?);
+            }
+            entries
+        } else {
+            let datasets = self.find_datasets(entry_id, name.clone(), None).await;
+            let mut datasets = soften_not_found(datasets)?;
+            let tables = self.find_tables(entry_id, name.clone()).await;
+            datasets.extend(soften_not_found(tables)?);
+            datasets
+        };
+
+        entries.retain(|entry| matches_kind(entry.entry_kind));
+
+        let response = re_protos::cloud::v1alpha1::FindEntriesResponse { entries };
+
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn create_dataset_entry(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::CreateDatasetEntryRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::CreateDatasetEntryResponse>>
+    {
+        let CreateDatasetEntryRequest {
+            name: dataset_name,
+            id: dataset_id,
+            policy,
+        } = request.into_inner().try_into()?;
+
+        let mut store = self.store.write().await;
+        let dataset_id = store.create_dataset(dataset_name, dataset_id, policy)?;
+        let dataset = store.dataset(dataset_id)?;
+
+        self.notify(watch_events_response::Kind::EntryCreated(
+            EntryCreatedEvent {
+                id: Some(dataset_id.into()),
+            },
+        ));
+
+        Ok(tonic::Response::new(
+            CreateDatasetEntryResponse {
+                dataset: dataset.as_dataset_entry(),
+            }
+            .into(),
+        ))
+    }
+
+    async fn read_dataset_entry(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::ReadDatasetEntryRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::ReadDatasetEntryResponse>> {
+        let store = self.store.read().await;
+        let entry_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        let dataset = store.dataset(entry_id)?;
+
+        Ok(tonic::Response::new(
+            ReadDatasetEntryResponse {
+                dataset_entry: dataset.as_dataset_entry(),
+            }
+            .into(),
+        ))
+    }
+
+    async fn update_dataset_entry(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::UpdateDatasetEntryRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::UpdateDatasetEntryResponse>>
+    {
+        #[expect(
+            deprecated,
+            reason = "body id fallback for clients that send no header"
+        )]
+        let entry_id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
+        let request = UpdateDatasetEntryRequest::from_resolved(entry_id, request.into_inner())?;
+
+        request
+            .dataset_details
+            .validate_consistency()
+            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+
+        let mut store = self.store.write().await;
+        validate_blueprint_dataset(&store, request.dataset_details.blueprint_dataset, "dataset")?;
+
+        let mut dataset_details = request.dataset_details;
+
+        // The asset dataset reference is server-managed: unless the client explicitly points it
+        // at a new asset dataset, keep the stored one. Recording datasets created before asset
+        // datasets were introduced have none, so create the missing one on demand, and replace a
+        // reference left dangling by a deleted asset dataset the same way.
+        let dataset = store.dataset(request.id)?;
+        // Only `ApplyDatasetPolicy` changes the policy.
+        dataset_details.policy = dataset.dataset_details().policy.clone();
+        let stored_asset_dataset = dataset.dataset_details().asset_dataset;
+        let dataset_kind = dataset.dataset_kind();
+        let client_chosen_asset_dataset = dataset_details.asset_dataset.is_some()
+            && dataset_details.asset_dataset != stored_asset_dataset;
+        if client_chosen_asset_dataset {
+            validate_asset_dataset(&store, dataset_details.asset_dataset)?;
+        } else if dataset_kind == DatasetKind::Recording {
+            let existing = stored_asset_dataset.filter(|id| store.dataset(*id).is_ok());
+            dataset_details.asset_dataset = Some(match existing {
+                Some(existing) => existing,
+                None => store.create_asset_dataset_for_entry(request.id)?,
+            });
+        }
+
+        let dataset = store.dataset_mut(request.id)?;
+
+        dataset.set_dataset_details(dataset_details);
+
+        Ok(tonic::Response::new(
+            UpdateDatasetEntryResponse {
+                dataset_entry: dataset.as_dataset_entry(),
+            }
+            .into(),
+        ))
+    }
+
+    async fn apply_dataset_policy(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::ApplyDatasetPolicyRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::ApplyDatasetPolicyResponse>>
+    {
+        let mut store = self.store.write().await;
+        let entry_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        let ApplyDatasetPolicyRequest { mut policy } = request.into_inner().try_into()?;
+        policy.resolve_chunk_indexing_policy(ChunkIndexingPolicy::ALL);
+
+        let dataset = store.dataset_mut(entry_id)?;
+        let mut dataset_details = dataset.dataset_details().clone();
+        dataset_details.policy = Some(policy);
+        dataset.set_dataset_details(dataset_details);
+
+        Ok(tonic::Response::new(
+            ApplyDatasetPolicyResponse {
+                dataset_entry: dataset.as_dataset_entry(),
+                task_ids: Vec::new(),
+            }
+            .into(),
+        ))
+    }
+
+    async fn read_table_entry(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::ReadTableEntryRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::ReadTableEntryResponse>> {
+        let store = self.store.read().await;
+
+        #[expect(
+            deprecated,
+            reason = "body id fallback for clients that send no header"
+        )]
+        let id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
+
+        let table = store.table(id).ok_or_else(|| {
+            tonic::Status::not_found(format!("table with entry ID '{id}' not found"))
+        })?;
+
+        Ok(tonic::Response::new(
+            ReadTableEntryResponse {
+                table_entry: table.as_table_entry(),
+            }
+            .try_into()?,
+        ))
+    }
+
+    async fn update_table_entry(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::UpdateTableEntryRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::UpdateTableEntryResponse>> {
+        #[expect(
+            deprecated,
+            reason = "body id fallback for clients that send no header"
+        )]
+        let entry_id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
+        let request = UpdateTableEntryRequest::from_resolved(entry_id, request.into_inner())?;
+
+        let mut store = self.store.write().await;
+        store.table(request.id).ok_or_else(|| {
+            tonic::Status::not_found(format!("table with entry ID '{}' not found", request.id))
+        })?;
+
+        let mut table_details = request.table_details;
+        // Backwards compatibility: tables created before table blueprints had no associated
+        // blueprint dataset. If a client updates such a table without providing one, create the
+        // missing dataset on demand.
+        if table_details.blueprint_dataset.is_none()
+            && table_details.default_blueprint_segment.is_some()
+        {
+            table_details.blueprint_dataset = Some(
+                match store
+                    .table(request.id)
+                    .and_then(|table| table.table_details().blueprint_dataset)
+                {
+                    Some(blueprint_dataset) => blueprint_dataset,
+                    None => store.create_blueprint_dataset_for_entry(request.id)?,
+                },
+            );
+        }
+
+        table_details
+            .validate_consistency()
+            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+        validate_blueprint_dataset(&store, table_details.blueprint_dataset, "table")?;
+
+        let table = store.table_mut(request.id).ok_or_else(|| {
+            tonic::Status::not_found(format!("table with entry ID '{}' not found", request.id))
+        })?;
+        table.set_table_details(table_details);
+
+        Ok(tonic::Response::new(
+            UpdateTableEntryResponse {
+                table_entry: table.as_table_entry(),
+            }
+            .try_into()?,
+        ))
+    }
+
+    async fn delete_entry(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::DeleteEntryRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::DeleteEntryResponse>> {
+        #[expect(
+            deprecated,
+            reason = "body id fallback for clients that send no header"
+        )]
+        let entry_id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
+
+        self.store.write().await.delete_entry(entry_id)?;
+
+        self.notify(watch_events_response::Kind::EntryDeleted(
+            EntryDeletedEvent {
+                id: Some(entry_id.into()),
+            },
+        ));
+
+        Ok(tonic::Response::new(DeleteEntryResponse {}))
+    }
+
+    async fn update_entry(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::UpdateEntryRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::UpdateEntryResponse>> {
+        #[expect(
+            deprecated,
+            reason = "body id fallback for clients that send no header"
+        )]
+        let resolved_id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
+        let UpdateEntryRequest {
+            id: entry_id,
+            entry_details_update: EntryDetailsUpdate { name },
+        } = UpdateEntryRequest::from_resolved(resolved_id, request.into_inner())?;
+
+        let mut store = self.store.write().await;
+
+        if let Some(name) = name {
+            store.rename_entry(entry_id, name)?;
+        }
+
+        Ok(tonic::Response::new(
+            UpdateEntryResponse {
+                entry_details: store.entry_details(entry_id)?,
+            }
+            .into(),
+        ))
+    }
+
+    // --- Grants ---
+
+    #[cfg(target_arch = "wasm32")]
+    async fn get_write_access_grant(
+        &self,
+        _: tonic::Request<re_protos::cloud::v1alpha1::GetWriteAccessGrantRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::GetWriteAccessGrantResponse>>
+    {
+        Err(tonic::Status::unimplemented(
+            "write access grants are not implemented on wasm",
+        ))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tracing::instrument(skip_all)]
+    async fn get_write_access_grant(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::GetWriteAccessGrantRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::GetWriteAccessGrantResponse>>
+    {
+        let request: ext::GetWriteAccessGrantRequest = request.into_inner().try_into()?;
+        if request.storage_location.is_some() {
+            return Err(tonic::Status::invalid_argument(
+                "explicit storage locations are not supported",
+            ));
+        }
+        if request.signing == ext::UrlSigning::Unsigned {
+            return Err(tonic::Status::unimplemented(
+                "unsigned upload requests are not implemented",
+            ));
+        }
+        if !request.accepts(re_protos::cloud::v1alpha1::UploadMethod::SingleRequest) {
+            return Err(tonic::Status::failed_precondition(
+                "this server only issues single-request grants",
+            ));
+        }
+        let write_access_grants = self.write_access_grants.as_ref().ok_or_else(|| {
+            tonic::Status::unimplemented("write access grants are not configured")
+        })?;
+        let response = write_access_grants.issue(&request.key).await?;
+        Ok(tonic::Response::new(response.try_into()?))
+    }
+
+    async fn get_multipart_upload_part_grants(
+        &self,
+        _: tonic::Request<re_protos::cloud::v1alpha1::GetMultipartUploadPartGrantsRequest>,
+    ) -> tonic::Result<
+        tonic::Response<re_protos::cloud::v1alpha1::GetMultipartUploadPartGrantsResponse>,
+    > {
+        Err(tonic::Status::unimplemented(
+            "multipart uploads are not implemented",
+        ))
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        _: tonic::Request<re_protos::cloud::v1alpha1::CompleteMultipartUploadRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::CompleteMultipartUploadResponse>>
+    {
+        Err(tonic::Status::unimplemented(
+            "multipart uploads are not implemented",
+        ))
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        _: tonic::Request<re_protos::cloud::v1alpha1::AbortMultipartUploadRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::AbortMultipartUploadResponse>>
+    {
+        Err(tonic::Status::unimplemented(
+            "multipart uploads are not implemented",
+        ))
+    }
+
+    // --- Manifest Registry ---
+
+    async fn register_with_dataset(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::RegisterWithDatasetRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::RegisterWithDatasetResponse>>
+    {
+        let mut store = self.store.write().await;
+
+        let dataset_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+
+        let ext::RegisterWithDatasetRequest {
+            data_sources,
+            on_duplicate,
+        } = request.into_inner().try_into()?;
+
+        let data_sources = Self::resolve_data_sources(&data_sources).await?;
+        if data_sources.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "no data sources to register",
+            ));
+        }
+
+        // A segment id that differs from its store's recording id is misread by clients that
+        // attribute chunks to recording ids. Raised before registering, since a failed batch can
+        // still have added some of its sources.
+        if data_sources
+            .iter()
+            .any(|data_source| data_source.segment_id_override.is_some())
+        {
+            store
+                .dataset_mut(dataset_id)?
+                .raise_required_client_protocol_level(ProtocolLevel::CHUNK_SEGMENT_FROM_REQUEST);
+        }
+
+        let RegisterWithDatasetResult {
+            segment_ids,
+            segment_layers,
+            segment_types,
+            storage_urls,
+            task_ids,
+        } = do_register_with_dataset(&mut store, dataset_id, data_sources, on_duplicate).await?;
+
+        let record_batch = RegisterWithDatasetDataframe::new(
+            segment_ids,
+            segment_layers,
+            segment_types,
+            storage_urls,
+            task_ids,
+        )
+        .into_record_batch()
+        .map_err(|err| tonic::Status::internal(format!("Failed to create dataframe: {err:#}")))?;
+        Ok(tonic::Response::new(
+            re_protos::cloud::v1alpha1::RegisterWithDatasetResponse {
+                data: Some(record_batch.into()),
+            },
+        ))
+    }
+
+    type UnregisterFromDatasetStream = UnregisterFromDatasetResponseStream;
+
+    async fn unregister_from_dataset(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::UnregisterFromDatasetRequest>,
+    ) -> tonic::Result<Response<Self::UnregisterFromDatasetStream>> {
+        let mut store = self.store.write().await;
+
+        let entry_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        request.get_ref().sanity_check()?;
+
+        let dataset = store.dataset_mut(entry_id)?;
+
+        let ext::UnregisterFromDatasetRequest {
+            segments_to_drop,
+            layers_to_drop,
+            force: _, // OSS doesn't even have statuses
+        } = request.into_inner().try_into()?;
+
+        // As per our proto conventions, an empty list means "all":
+        let segments_to_drop: Option<HashSet<&SegmentId>> =
+            (!segments_to_drop.is_empty()).then(|| segments_to_drop.iter().collect());
+        let layers_to_drop: Option<HashSet<&LayerName>> =
+            (!layers_to_drop.is_empty()).then(|| layers_to_drop.iter().collect());
+
+        _ = dataset
+            .remove_layers(segments_to_drop.as_ref(), layers_to_drop.as_ref())
+            .await?;
+
+        store.cleanup_store_pool();
+
+        let stream = futures::stream::once(async move {
+            Ok(re_protos::cloud::v1alpha1::UnregisterFromDatasetResponse {
+                data: Some(ScanDatasetManifestDataframe::empty_record_batch().into()),
+                task_id: Some(TaskId {
+                    id: TASK_ID_SUCCESS.to_owned(),
+                }),
+            })
+        });
+
+        Ok(tonic::Response::new(
+            Box::pin(stream) as Self::UnregisterFromDatasetStream
+        ))
+    }
+
+    async fn write_table(
+        &self,
+        request: tonic::Request<tonic::Streaming<re_protos::cloud::v1alpha1::WriteTableRequest>>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::WriteTableResponse>> {
+        // Limit the scope of the lock here to prevent deadlocks
+        // when reading and writing to the same table
+        let entry_id = {
+            let store = self.store.read().await;
+            get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?
+        };
+
+        let mut request = request.into_inner();
+
+        while let Some(write_msg) = request.next().await {
+            let write_msg = write_msg?;
+
+            let rb = write_msg
+                .dataframe_part
+                .ok_or_else(|| {
+                    tonic::Status::invalid_argument("no data frame in WriteTableRequest")
+                })?
+                .try_into()
+                .map_err(|err: re_protos::TypeConversionError| {
+                    tonic::Status::new(err.grpc_code(), format!("Could not decode chunk: {err:#}"))
+                })?;
+
+            let insert_op = TableInsertMode::try_from(write_msg.insert_mode)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+
+            cfg_select! {
+                feature = "lance" => {
+                    let mut store = self.store.write().await;
+                    let Some(table) = store.table_mut(entry_id) else {
+                        return Err(tonic::Status::not_found("table not found"));
+                    };
+                    check_merge_keys(&table.schema(), &rb, insert_op)?;
+                    table
+                        .write_table(rb, insert_op)
+                        .await
+                        .map_err(|err| table_write_error_to_status(&err))?;
+                }
+                _ => {
+                    let mut table = {
+                        let store = self.store.read().await;
+                        store
+                            .table(entry_id)
+                            .cloned()
+                            .ok_or_else(|| tonic::Status::not_found("table not found"))?
+                    };
+                    check_merge_keys(&table.schema(), &rb, insert_op)?;
+                    table
+                        .write_table(rb, insert_op)
+                        .await
+                        .map_err(|err| table_write_error_to_status(&err))?;
+                }
+            }
+        }
+
+        Ok(tonic::Response::new(
+            re_protos::cloud::v1alpha1::WriteTableResponse {},
+        ))
+    }
+
+    /* Query schemas */
+
+    async fn get_segment_table_schema(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::GetSegmentTableSchemaRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::GetSegmentTableSchemaResponse>>
+    {
+        let store = self.store.read().await;
+
+        let entry_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        let dataset = store.dataset(entry_id)?;
+        let record_batch = dataset.segment_table().await.map_err(|err| {
+            tonic::Status::internal(format!("Unable to read segment table: {err:#}"))
+        })?;
+
+        Ok(tonic::Response::new(GetSegmentTableSchemaResponse {
+            schema: Some(
+                record_batch
+                    .schema_ref()
+                    .as_ref()
+                    .try_into()
+                    .map_err(|err| {
+                        tonic::Status::internal(format!(
+                            "unable to serialize Arrow schema: {err:#}"
+                        ))
+                    })?,
+            ),
+            meta: None,
+        }))
+    }
+
+    type ScanSegmentTableStream = ScanSegmentTableResponseStream;
+
+    async fn scan_segment_table(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::ScanSegmentTableRequest>,
+    ) -> tonic::Result<tonic::Response<Self::ScanSegmentTableStream>> {
+        let (mut record_batch, request) = {
+            let store = self.store.read().await;
+            let entry_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+            let dataset = store.dataset(entry_id)?;
+            let record_batch = dataset.segment_table().await.map_err(|err| {
+                tonic::Status::internal(format!("Unable to read segment table: {err:#}"))
+            })?;
+            (record_batch, request.into_inner())
+        };
+
+        record_batch = apply_segment_id_filter(record_batch, request.segment_id_filter.as_ref())?;
+
+        // project columns
+        if !request.columns.is_empty() {
+            record_batch = record_batch
+                .project_columns(request.columns.iter().map(|s| s.as_str()))
+                .map_err(|err| {
+                    tonic::Status::invalid_argument(format!("Unable to project columns: {err:#}"))
+                })?;
+        }
+
+        let stream = futures::stream::once(async move {
+            Ok(ScanSegmentTableResponse {
+                data: Some(record_batch.into()),
+                meta: None,
+            })
+        });
+
+        Ok(tonic::Response::new(
+            Box::pin(stream) as Self::ScanSegmentTableStream
+        ))
+    }
+
+    async fn get_dataset_manifest_schema(
+        &self,
+        request: Request<GetDatasetManifestSchemaRequest>,
+    ) -> tonic::Result<Response<GetDatasetManifestSchemaResponse>> {
+        let store = self.store.read().await;
+
+        let entry_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        let dataset = store.dataset(entry_id)?;
+        let record_batch = dataset.dataset_manifest().await?;
+
+        Ok(tonic::Response::new(GetDatasetManifestSchemaResponse {
+            schema: Some(
+                record_batch
+                    .schema_ref()
+                    .as_ref()
+                    .try_into()
+                    .map_err(|err| {
+                        tonic::Status::internal(format!(
+                            "unable to serialize Arrow schema: {err:#}"
+                        ))
+                    })?,
+            ),
+            meta: None,
+        }))
+    }
+
+    type ScanDatasetManifestStream = ScanDatasetManifestResponseStream;
+
+    async fn scan_dataset_manifest(
+        &self,
+        request: Request<ScanDatasetManifestRequest>,
+    ) -> tonic::Result<Response<Self::ScanDatasetManifestStream>> {
+        let (mut record_batch, request) = {
+            let store = self.store.read().await;
+            let entry_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+            let dataset = store.dataset(entry_id)?;
+            let record_batch = dataset.dataset_manifest().await?;
+            (record_batch, request.into_inner())
+        };
+
+        record_batch = apply_segment_id_filter(record_batch, request.segment_id_filter.as_ref())?;
+        record_batch = apply_layer_name_filter(record_batch, request.layer_name_filter.as_ref())?;
+
+        // project columns
+        if !request.columns.is_empty() {
+            record_batch = record_batch
+                .project_columns(request.columns.iter().map(|s| s.as_str()))
+                .map_err(|err| {
+                    tonic::Status::invalid_argument(format!("Unable to project columns: {err:#}"))
+                })?;
+        }
+
+        let stream = futures::stream::once(async move {
+            Ok(ScanDatasetManifestResponse {
+                data: Some(record_batch.into()),
+                meta: None,
+            })
+        });
+
+        Ok(tonic::Response::new(
+            Box::pin(stream) as Self::ScanDatasetManifestStream
+        ))
+    }
+
+    async fn get_dataset_schema(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::GetDatasetSchemaRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::GetDatasetSchemaResponse>> {
+        let store = self.store.read().await;
+        let entry_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+
+        let dataset = store.dataset(entry_id)?;
+        let schema = dataset.schema().map_err(|err| {
+            tonic::Status::internal(format!("Unable to read dataset schema: {err:#}"))
+        })?;
+
+        Ok(tonic::Response::new(GetDatasetSchemaResponse {
+            schema: Some((&schema).try_into().map_err(|err| {
+                tonic::Status::internal(format!("Unable to serialize Arrow schema: {err:#}"))
+            })?),
+            meta: None,
+        }))
+    }
+
+    type GetSchemasStream = GetSchemasResponseStream;
+
+    async fn get_schemas(
+        &self,
+        request: tonic::Request<GetSchemasRequest>,
+    ) -> tonic::Result<tonic::Response<Self::GetSchemasStream>> {
+        let store = self.store.read().await;
+        let entry_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        let dataset = store.dataset(entry_id)?;
+
+        let ext::GetSchemasRequest {
+            schema_ids: mut remaining,
+        } = request.into_inner().try_into()?;
+        let mut responses = Vec::with_capacity(remaining.len());
+        for source in dataset.iter_sources() {
+            if remaining.is_empty() {
+                break;
+            }
+
+            let schema_id = source.schema_sha256();
+            if remaining.remove(&schema_id) {
+                let response = ext::GetSchemasResponse {
+                    schema_id,
+                    schema: source.schema(),
+                };
+                responses.push(Ok(GetSchemasResponse::try_from(response).map_err(
+                    |err| tonic::Status::internal(format!("Unable to serialize schema: {err:#}")),
+                )?));
+            }
+        }
+
+        Ok(tonic::Response::new(
+            Box::pin(futures::stream::iter(responses)) as Self::GetSchemasStream,
+        ))
+    }
+
+    type GetRrdManifestStream = GetRrdManifestResponseStream;
+
+    async fn get_rrd_manifest(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::GetRrdManifestRequest>,
+    ) -> tonic::Result<tonic::Response<Self::GetRrdManifestStream>> {
+        let store = self.store.read().await;
+        let entry_id = get_entry_id_from_headers(
+            &store,
+            &request,
+            ClientLevelCheck::Enforce(request.get_ref().client_meta),
+        )?;
+
+        let request = request.into_inner();
+        let segment_id = request
+            .segment_id
+            .ok_or_else(|| {
+                missing_field!(
+                    re_protos::cloud::v1alpha1::GetRrdManifestRequest,
+                    "segment_id"
+                )
+            })?
+            .try_into()?;
+
+        let dataset = store.dataset(entry_id)?;
+        let rrd_manifest = dataset.rrd_manifest(&segment_id)?;
+
+        let rrd_manifest_stream =
+            futures::stream::once(futures::future::ok(GetRrdManifestResponse {
+                rrd_manifest: Some(rrd_manifest.to_transport(()).map_err(|err| {
+                    tonic::Status::internal(format!("Unable to compute RRD manifest: {err:#}"))
+                })?),
+                manifest_key: None,
+                meta: None,
+            }));
+
+        Ok(tonic::Response::new(
+            Box::pin(rrd_manifest_stream) as Self::GetRrdManifestStream
+        ))
+    }
+
+    type GetAssetsForSegmentStream = GetAssetsForSegmentResponseStream;
+
+    async fn get_assets_for_segment(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::GetAssetsForSegmentRequest>,
+    ) -> tonic::Result<tonic::Response<Self::GetAssetsForSegmentStream>> {
+        let store = self.store.read().await;
+
+        let dataset_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        let request = request.into_inner();
+
+        let dataset = store.dataset(dataset_id)?;
+
+        let dataset_kind = dataset.dataset_kind();
+        if dataset_kind != DatasetKind::Recording {
+            return Err(tonic::Status::invalid_argument(format!(
+                "assets can only be queried on recording datasets, this is a {dataset_kind:?} dataset"
+            )));
+        }
+
+        // Datasets created before asset datasets were introduced don't have one, which simply
+        // means no assets were ever registered. One is created on demand when the dataset entry
+        // is next updated.
+        let Some(asset_dataset) = dataset.dataset_details().asset_dataset else {
+            return Ok(tonic::Response::new(
+                Box::pin(futures::stream::empty()) as Self::GetAssetsForSegmentStream
+            ));
+        };
+
+        // Each asset carries its own mode and segment list, so resolving a segment's assets is a
+        // filter over the asset dataset alone. Recordings hold no asset properties.
+        let requested_segment_id = request
+            .segment_id
+            .map(SegmentId::try_from)
+            .transpose()?
+            .map(|segment_id| segment_id.into_inner());
+
+        // Which asset segments exist comes from the dataset, and how each one applies comes from its
+        // mutable properties. An asset with no properties resolves to the opt-out default, so it
+        // applies to every segment.
+        let assets = store.dataset(asset_dataset)?;
+        let mut asset_segment_ids = Vec::new();
+        for segment_id in assets.segments().keys() {
+            let (mode, segments) = match assets.segment_properties(segment_id) {
+                Some(stored) => (
+                    read_asset_mode(&stored.properties, 0),
+                    read_asset_segments(&stored.properties, 0),
+                ),
+                None => (AssetMode::default(), HashSet::new()),
+            };
+            if asset_applies_to_segment(mode, requested_segment_id.as_deref(), &segments) {
+                asset_segment_ids.push(segment_id.clone().into());
+            }
+        }
+
+        let response = futures::stream::once(futures::future::ok(
+            re_protos::cloud::v1alpha1::GetAssetsForSegmentResponse {
+                assets_entry: Some(asset_dataset.into()),
+                asset_segment_ids,
+            },
+        ));
+
+        Ok(tonic::Response::new(
+            Box::pin(response) as Self::GetAssetsForSegmentStream
+        ))
+    }
+
+    /* Segment properties */
+
+    type GetSegmentPropertiesStream = GetSegmentPropertiesResponseStream;
+
+    async fn get_segment_properties(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::GetSegmentPropertiesRequest>,
+    ) -> tonic::Result<tonic::Response<Self::GetSegmentPropertiesStream>> {
+        let store = self.store.read().await;
+
+        let dataset_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        let request = request.into_inner();
+
+        let dataset = store.dataset(dataset_id)?;
+
+        let requested: Vec<SegmentId> = request
+            .segment_ids
+            .into_iter()
+            .map(SegmentId::try_from)
+            .collect::<Result<_, _>>()?;
+
+        if requested.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "segment_ids must name at least one segment",
+            ));
+        }
+
+        // Named segments that have no properties are absent from the response.
+        let responses: Vec<_> = requested
+            .chunks(SEGMENTS_PER_PROPERTIES_RESPONSE)
+            .map(|chunk| {
+                let segments = chunk
+                    .iter()
+                    .filter_map(|segment_id| {
+                        let stored = dataset.segment_properties(segment_id)?;
+                        Some(segment_properties_response(segment_id, stored))
+                    })
+                    .collect();
+                Ok(re_protos::cloud::v1alpha1::GetSegmentPropertiesResponse { segments })
+            })
+            .collect();
+
+        let response = futures::stream::iter(responses);
+
+        Ok(tonic::Response::new(
+            Box::pin(response) as Self::GetSegmentPropertiesStream
+        ))
+    }
+
+    async fn set_segment_properties(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::SetSegmentPropertiesRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::SetSegmentPropertiesResponse>>
+    {
+        let mut store = self.store.write().await;
+
+        let dataset_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        let request = request.into_inner();
+
+        let segment_id: SegmentId = request
+            .segment_id
+            .ok_or_else(|| tonic::Status::invalid_argument("segment_id is required"))?
+            .try_into()?;
+
+        let properties: RecordBatch = request
+            .properties
+            .ok_or_else(|| tonic::Status::invalid_argument("properties are required"))?
+            .try_into()
+            .map_err(|err| {
+                tonic::Status::invalid_argument(format!("Failed to decode properties: {err:#}"))
+            })?;
+        if properties.num_rows() != 1 {
+            return Err(tonic::Status::invalid_argument(format!(
+                "segment properties must be a single row, got {} rows",
+                properties.num_rows()
+            )));
+        }
+
+        let revision = store.dataset_mut(dataset_id)?.set_segment_properties(
+            segment_id,
+            properties,
+            request.expected_revision,
+        )?;
+
+        Ok(tonic::Response::new(
+            re_protos::cloud::v1alpha1::SetSegmentPropertiesResponse { revision },
+        ))
+    }
+
+    async fn delete_segment_properties(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::DeleteSegmentPropertiesRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::DeleteSegmentPropertiesResponse>>
+    {
+        let mut store = self.store.write().await;
+
+        let dataset_id = get_entry_id_from_headers(&store, &request, ClientLevelCheck::Exempt)?;
+        let request = request.into_inner();
+
+        let dataset = store.dataset_mut(dataset_id)?;
+        for segment in request.segments {
+            let segment_id: SegmentId = segment
+                .segment_id
+                .ok_or_else(|| tonic::Status::invalid_argument("segment_id is required"))?
+                .try_into()?;
+            dataset.remove_segment_properties(&segment_id, segment.expected_revision);
+        }
+
+        Ok(tonic::Response::new(
+            re_protos::cloud::v1alpha1::DeleteSegmentPropertiesResponse {},
+        ))
+    }
+
+    /* Queries */
+
+    type QueryDatasetStream = QueryDatasetResponseStream;
+
+    async fn query_dataset(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::QueryDatasetRequest>,
+    ) -> tonic::Result<tonic::Response<Self::QueryDatasetStream>> {
+        let entry_id = get_entry_id_from_headers(
+            &*self.store.read().await,
+            &request,
+            ClientLevelCheck::Enforce(request.get_ref().client_meta),
+        )?;
+
+        let mut request: QueryDatasetRequest = request.into_inner().try_into()?;
+
+        // TODO(RR-5817): this serves released SDKs, answering `QueryDataset` through `FindChunks`.
+        let columns = request
+            .scan_parameters
+            .as_mut()
+            .map(|parameters| std::mem::take(&mut parameters.columns))
+            .unwrap_or_default();
+        let mut dataset_schema = None;
+        let request = if ext::selects_components_on_every_entity(&request) {
+            let schema = self
+                .store
+                .read()
+                .await
+                .dataset(entry_id)?
+                .schema()
+                .map_err(|err| {
+                    tonic::Status::internal(format!("Unable to read dataset schema: {err:#}"))
+                })?;
+            let request = ext::list_entities_for_component_selection(request, &schema);
+            dataset_schema = Some(schema);
+            request
+        } else {
+            request
+        };
+        let plan = ext::adapt_legacy(request)?;
+        let response_timeline = if let Some(name) = ext::projected_start_name(&plan, &columns) {
+            let schema = match dataset_schema {
+                Some(schema) => schema,
+                None => self
+                    .store
+                    .read()
+                    .await
+                    .dataset(entry_id)?
+                    .schema()
+                    .map_err(|err| {
+                        tonic::Status::internal(format!("Unable to read dataset schema: {err:#}"))
+                    })?,
+            };
+            ext::resolve_projected_start_timeline(name, &schema)?
+        } else {
+            None
+        };
+
+        let stream: BoxStream<'static, tonic::Result<RecordBatch>> = match plan {
+            ext::LegacyPlan::Find(request) => {
+                let timeline = request.timeline();
+                let candidates = self.find_candidates(entry_id, request).await?;
+                candidates
+                    .map(move |batch| ext::encode_legacy_candidates(batch?, timeline.as_ref()))
+                    .boxed()
+            }
+
+            ext::LegacyPlan::FullScan {
+                segments, contents, ..
+            } => {
+                let candidates = self
+                    .full_scan_candidates(entry_id, segments, contents, response_timeline)
+                    .await?;
+                candidates
+                    .map(move |batch| {
+                        ext::encode_legacy_candidates(batch?, response_timeline.as_ref())
+                    })
+                    .boxed()
+            }
+        };
+
+        let stream = stream.map(|batch| {
+            batch.map(|batch| QueryDatasetResponse {
+                data: Some(batch.into()),
+                meta: None,
+            })
+        });
+
+        Ok(tonic::Response::new(
+            Box::pin(stream) as Self::QueryDatasetStream
+        ))
+    }
+
+    type FetchChunksStream = FetchChunksResponseStream;
+
+    // NOTE: OSS server does not detect source drift (a registered rrd file
+    // being mutated after registration) which Rerun Hub implements.
+    // Consider if worth having parity (RR-4577).
+    async fn fetch_chunks(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::FetchChunksRequest>,
+    ) -> tonic::Result<tonic::Response<Self::FetchChunksStream>> {
+        // worth noting that FetchChunks is not per-dataset request, it simply contains chunk infos
+        let request = request.into_inner();
+
+        let mut chunk_keys = vec![];
+        for chunk_info_data in request.chunk_infos {
+            let chunk_info_batch: RecordBatch = chunk_info_data.try_into().map_err(|err| {
+                tonic::Status::internal(format!("Failed to decode chunk_info: {err:#}"))
+            })?;
+
+            // Checks that the column is present, is `Binary`, and has no nulls:
+            let chunk_key_col = FetchChunksRequest::COLUMN_CHUNK_KEY
+                .extract(&chunk_info_batch)
+                .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+
+            for chunk_key in &chunk_key_col {
+                chunk_keys.push(ChunkKey::decode(chunk_key)?);
+            }
+        }
+
+        let chunks = self
+            .store
+            .read()
+            .await
+            .chunks_from_chunk_keys(&chunk_keys)
+            .await?;
+
+        let stream = futures::stream::iter(chunks).map(|(store_id, chunk)| {
+            let arrow_msg = re_log_msg::ArrowMsg {
+                batch: std::sync::Arc::new(chunk.to_chunk_batch().map_err(|err| {
+                    tonic::Status::internal(format!(
+                        "failed to convert chunk to chunk batch: {err:#}"
+                    ))
+                })?),
+                on_release: None,
+            };
+
+            let compression = re_log_encoding::Compression::Off;
+
+            let encoded_chunk = arrow_msg
+                .to_transport((store_id, compression))
+                .map_err(|err| tonic::Status::internal(format!("encoding failed: {err:#}")))?;
+
+            Ok(re_protos::cloud::v1alpha1::FetchChunksResponse {
+                chunks: vec![encoded_chunk],
+            })
+        });
+
+        Ok(tonic::Response::new(
+            Box::pin(stream) as Self::FetchChunksStream
+        ))
+    }
+
+    type FindChunksStream = FindChunksResponseStream;
+
+    async fn find_chunks(
+        &self,
+        mut request: tonic::Request<re_protos::cloud::v1alpha1::FindChunksRequest>,
+    ) -> tonic::Result<tonic::Response<Self::FindChunksStream>> {
+        // Validate the body before looking up the entry, keeping the headers for that lookup.
+        let client_meta = request.get_ref().client_meta;
+        let find_request: ext::FindChunksRequest = std::mem::take(request.get_mut()).try_into()?;
+        find_request.ensure_supported()?;
+
+        let entry_id = get_entry_id_from_headers(
+            &*self.store.read().await,
+            &request,
+            ClientLevelCheck::Enforce(client_meta),
+        )?;
+
+        let stream = self.find_candidates(entry_id, find_request).await?;
+
+        let stream = stream.map(|result| {
+            result.map(|batch| re_protos::cloud::v1alpha1::FindChunksResponse {
+                data: Some(batch.into()),
+                meta: None,
+            })
+        });
+
+        Ok(tonic::Response::new(
+            Box::pin(stream) as Self::FindChunksStream
+        ))
+    }
+
+    // --- Table APIs ---
+
+    async fn register_table(
+        &self,
+        request: tonic::Request<RegisterTableRequest>,
+    ) -> tonic::Result<tonic::Response<RegisterTableResponse>> {
+        cfg_select! {
+            target_arch = "wasm32" => {
+                let _ = request;
+                return Err(tonic::Status::unimplemented(
+                    "register_table is not supported on wasm",
+                ));
+            }
+            _ => {
+                #[cfg_attr(not(feature = "lance"), expect(unused_mut))]
+                let mut store = self.store.write().await;
+                let request = request.into_inner();
+                let Some(provider_details) = request.provider_details else {
+                    return Err(tonic::Status::invalid_argument("Missing provider details"));
+                };
+                #[cfg_attr(not(feature = "lance"), expect(unused_variables))]
+                let lance_table = match ProviderDetails::try_from(&provider_details) {
+                    Ok(ProviderDetails::LanceTable(lance_table)) => lance_table.table_url,
+                    Ok(ProviderDetails::SystemTable(_)) => Err(Status::invalid_argument(
+                        "System tables cannot be registered",
+                    ))?,
+                    Err(err) => return Err(err.into()),
+                }
+                .to_file_path()
+                .map_err(|()| tonic::Status::invalid_argument("Invalid lance table path"))?;
+
+                cfg_select! {
+                    feature = "lance" => {
+                        let named_path = NamedPath {
+                            name: Some(request.name.clone()),
+                            path: lance_table,
+                        };
+
+                        let entry_id = store
+                            .load_directory_as_table(&named_path, IfDuplicateBehavior::Error)
+                            .await?;
+                    }
+                    _ => {
+                        let entry_id = EntryId::new();
+                    }
+                }
+
+                let table_entry = store
+                    .table(entry_id)
+                    .ok_or_else(|| Status::internal("table missing that was just registered"))?
+                    .as_table_entry();
+
+                let response = RegisterTableResponse {
+                    table_entry: Some(table_entry.try_into()?),
+                };
+
+                self.notify(watch_events_response::Kind::EntryCreated(
+                    EntryCreatedEvent {
+                        id: Some(entry_id.into()),
+                    },
+                ));
+
+                Ok(response.into())
+            }
+        }
+    }
+
+    async fn get_table_schema(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::GetTableSchemaRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::GetTableSchemaResponse>> {
+        let store = self.store.read().await;
+        #[expect(
+            deprecated,
+            reason = "body id fallback for clients that send no header"
+        )]
+        let entry_id = resolve_entry_id(&request, request.get_ref().table_id.as_ref())?;
+
+        let table = store
+            .table(entry_id)
+            .ok_or_else(|| Status::not_found(format!("Entry with ID {entry_id} not found")))?;
+
+        let schema = table.schema();
+
+        Ok(tonic::Response::new(
+            re_protos::cloud::v1alpha1::GetTableSchemaResponse {
+                schema: Some(schema.as_ref().try_into().map_err(|err| {
+                    Status::internal(format!("Unable to serialize Arrow schema: {err:#}"))
+                })?),
+            },
+        ))
+    }
+
+    type ScanTableStream = ScanTableResponseStream;
+
+    async fn scan_table(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::ScanTableRequest>,
+    ) -> tonic::Result<tonic::Response<Self::ScanTableStream>> {
+        #[expect(
+            deprecated,
+            reason = "body id fallback for clients that send no header"
+        )]
+        let entry_id = resolve_entry_id(&request, request.get_ref().table_id.as_ref())?;
+
+        let provider = {
+            let store = self.store.read().await;
+            let table = store
+                .table(entry_id)
+                .ok_or_else(|| Status::not_found(format!("Entry with ID {entry_id} not found")))?;
+            table.provider()
+        };
+
+        let ctx = SessionContext::default();
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .map_err(|err| Status::internal(format!("failed to scan table: {err:#}")))?;
+
+        let stream = plan
+            .execute(0, ctx.task_ctx())
+            .map_err(|err| tonic::Status::from_error(Box::new(err)))?;
+
+        let resp_stream = stream.map(|batch| {
+            let batch = batch.map_err(|err| tonic::Status::from_error(Box::new(err)))?;
+            Ok(ScanTableResponse {
+                dataframe_part: Some(batch.into()),
+            })
+        });
+
+        Ok(tonic::Response::new(
+            Box::pin(resp_stream) as Self::ScanTableStream
+        ))
+    }
+
+    // --- Tasks service ---
+
+    async fn query_tasks(
+        &self,
+        request: tonic::Request<QueryTasksRequest>,
+    ) -> tonic::Result<tonic::Response<QueryTasksResponse>> {
+        let task_ids = request.into_inner().ids;
+        let store = self.store.read().await;
+
+        let mut ids = Vec::with_capacity(task_ids.len());
+        let mut exec_statuses = Vec::with_capacity(task_ids.len());
+        let mut msgs = Vec::with_capacity(task_ids.len());
+
+        for task_id in task_ids {
+            // Look up the task in the registry, falling back to success for unknown IDs
+            // (including legacy dummy IDs and stale task IDs)
+            let result = store
+                .task_registry()
+                .get(&task_id)
+                .unwrap_or_else(TaskResult::success);
+
+            ids.push(task_id);
+            exec_statuses.push(result.exec_status);
+            msgs.push(if result.msgs.is_empty() {
+                None
+            } else {
+                Some(result.msgs)
+            });
+        }
+
+        let num_tasks = ids.len();
+        type Df = QueryTasksDataframe;
+        // The OSS server runs every task to completion synchronously, so it has nothing to say
+        // about kind, payload, leases, or timing: those columns are all-null.
+        let rb = Df {
+            task_id: Df::COLUMN_TASK_ID.new_from_values(ids),
+            kind: Df::COLUMN_KIND.new_null(num_tasks),
+            data: Df::COLUMN_DATA.new_null(num_tasks),
+            exec_status: Df::COLUMN_EXEC_STATUS.new_from_values(exec_statuses),
+            msgs: Df::COLUMN_MSGS.new_from_values(msgs),
+            blob: Df::COLUMN_BLOB.new_null(num_tasks),
+            lease_owner: Df::COLUMN_LEASE_OWNER.new_null(num_tasks),
+            lease_expiration: Df::COLUMN_LEASE_EXPIRATION.new_null(num_tasks),
+            attempts: Df::COLUMN_ATTEMPTS.new_from_values(std::iter::repeat_n(1_u8, num_tasks)),
+            creation_time: Df::COLUMN_CREATION_TIME.new_null(num_tasks),
+            last_update_time: Df::COLUMN_LAST_UPDATE_TIME.new_null(num_tasks),
+        }
+        .into_record_batch()
+        .map_err(|err| tonic::Status::internal(format!("Failed to create dataframe: {err:#}")))?;
+
+        // All tasks finish immediately in the OSS server
+        Ok(tonic::Response::new(QueryTasksResponse {
+            data: Some(rb.into()),
+        }))
+    }
+
+    type QueryTasksOnCompletionStream = QueryTasksOnCompletionResponseStream;
+
+    async fn query_tasks_on_completion(
+        &self,
+        request: tonic::Request<QueryTasksOnCompletionRequest>,
+    ) -> tonic::Result<tonic::Response<Self::QueryTasksOnCompletionStream>> {
+        let task_ids = request.into_inner().ids;
+
+        // All tasks finish immediately in the OSS server, so we can delegate to `query_tasks
+        let response_data = self
+            .query_tasks(tonic::Request::new(QueryTasksRequest { ids: task_ids }))
+            .await?
+            .into_inner()
+            .data;
+
+        Ok(tonic::Response::new(
+            Box::pin(futures::stream::once(async move {
+                Ok(QueryTasksOnCompletionResponse {
+                    data: response_data,
+                })
+            })) as Self::QueryTasksOnCompletionStream,
+        ))
+    }
+
+    async fn cancel_tasks(
+        &self,
+        _request: tonic::Request<CancelTasksRequest>,
+    ) -> tonic::Result<tonic::Response<CancelTasksResponse>> {
+        // Cancelling tasks is a noop in the OSS server
+        Ok(tonic::Response::new(CancelTasksResponse {}))
+    }
+
+    async fn do_maintenance(
+        &self,
+        _request: tonic::Request<re_protos::cloud::v1alpha1::DoMaintenanceRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::DoMaintenanceResponse>> {
+        Err(tonic::Status::unimplemented(
+            "do_maintenance not implemented",
+        ))
+    }
+
+    async fn do_global_maintenance(
+        &self,
+        _request: tonic::Request<re_protos::cloud::v1alpha1::DoGlobalMaintenanceRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::DoGlobalMaintenanceResponse>>
+    {
+        Err(tonic::Status::unimplemented(
+            "do_global_maintenance not implemented",
+        ))
+    }
+
+    async fn create_table_entry(
+        &self,
+        request: Request<re_protos::cloud::v1alpha1::CreateTableEntryRequest>,
+    ) -> tonic::Result<Response<re_protos::cloud::v1alpha1::CreateTableEntryResponse>> {
+        let request: CreateTableEntryRequest = request.into_inner().try_into()?;
+        let table_name = request.name;
+
+        let schema = Arc::new(request.schema);
+
+        cfg_select! {
+            target_arch = "wasm32" => {
+                let Some(details) = request.provider_details else {
+                    return Err(tonic::Status::unimplemented(
+                        "filesystem-backed table creation is not supported on wasm",
+                    ));
+                };
+            }
+            _ => {
+                let details = if let Some(details) = request.provider_details {
+                    details
+                } else {
+                    // Create a directory in the storage directory. We use a tuid to avoid collisions
+                    // and avoid any sanitization issue with the provided table name.
+                    let table_path = self
+                        .settings
+                        .storage_dir
+                        .path()
+                        .join(format!("lance-{}", Tuid::new()));
+                    ProviderDetails::LanceTable(ext::LanceTable {
+                        table_url: url::Url::from_directory_path(table_path).map_err(|_err| {
+                            Status::internal(format!(
+                                "Failed to create table directory in {:?}",
+                                self.settings.storage_dir.path()
+                            ))
+                        })?,
+                    })
+                };
+            }
+        }
+
+        cfg_select! {
+            target_arch = "wasm32" => {
+                let _ = (table_name, schema, details);
+                return Err(tonic::Status::unimplemented(
+                    "filesystem-backed table creation is not supported on wasm",
+                ));
+            }
+            _ => {
+                let table = match details {
+                    ProviderDetails::LanceTable(table) => {
+                        self.store
+                            .write()
+                            .await
+                            .create_table_entry(table_name, &table.table_url, schema)
+                            .await?
+                    }
+                    ProviderDetails::SystemTable(_) => {
+                        return Err(tonic::Status::invalid_argument(
+                            "Creating system tables is not supported",
+                        ));
+                    }
+                };
+
+                self.notify(watch_events_response::Kind::EntryCreated(
+                    EntryCreatedEvent {
+                        id: Some(table.details.id.into()),
+                    },
+                ));
+
+                Ok(Response::new(
+                    CreateTableEntryResponse { table }.try_into()?,
+                ))
+            }
+        }
+    }
+}
+
+/// How many segments one `GetSegmentProperties` response carries.
+const SEGMENTS_PER_PROPERTIES_RESPONSE: usize = 100;
+
+/// One segment's stored properties, in wire form.
+fn segment_properties_response(
+    segment_id: &SegmentId,
+    stored: &SegmentProperties,
+) -> re_protos::cloud::v1alpha1::SegmentProperties {
+    re_protos::cloud::v1alpha1::SegmentProperties {
+        segment_id: Some(segment_id.clone().into()),
+        properties: Some((&stored.properties).into()),
+        revision: stored.revision,
+    }
+}
+
+/// Write failures caused by the caller's batch are invalid arguments, everything else is internal.
+fn table_write_error_to_status(err: &datafusion::error::DataFusionError) -> tonic::Status {
+    let message = format!("error writing to table: {err:#}");
+    if ext::is_bad_write_table_input(err) {
+        tonic::Status::invalid_argument(message)
+    } else {
+        tonic::Status::internal(message)
+    }
+}
+
+/// `Replace` and `Update` match rows on the table index columns, so the batch must contain them.
+fn check_merge_keys(
+    table_schema: &arrow::datatypes::Schema,
+    batch: &RecordBatch,
+    insert_op: TableInsertMode,
+) -> tonic::Result<()> {
+    if !matches!(
+        insert_op,
+        TableInsertMode::Replace | TableInsertMode::Update
+    ) {
+        return Ok(());
+    }
+
+    let batch_schema = batch.schema();
+    let missing = table_schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            field
+                .metadata()
+                .get(re_sorbet::metadata::SORBET_IS_TABLE_INDEX)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        })
+        .filter(|field| batch_schema.field_with_name(field.name()).is_err())
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(tonic::Status::invalid_argument(format!(
+            "batch is missing table index column(s): {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+/// Retrieves the entry ID based on HTTP headers.
+/// Resolves the entry that the headers of a request name.
+///
+/// With [`ClientLevelCheck::Enforce`], the entry must be a dataset, and the request fails with
+/// `FailedPrecondition` when the client is below the protocol level that dataset requires.
+fn get_entry_id_from_headers<T>(
+    store: &InMemoryStore,
+    req: &tonic::Request<T>,
+    check: ClientLevelCheck,
+) -> tonic::Result<EntryId> {
+    let entry_id = if let Some(entry_id) = req.entry_id()? {
+        entry_id
+    } else if let Some(dataset_name) = req.entry_name()? {
+        store.dataset_by_name(&dataset_name)?.id()
+    } else {
+        const HEADERS: &[&str] = &[
+            re_protos::headers::RERUN_HTTP_HEADER_ENTRY_ID,
+            re_protos::headers::RERUN_HTTP_HEADER_ENTRY_NAME,
+        ];
+        return Err(tonic::Status::invalid_argument(format!(
+            "missing mandatory {HEADERS:?} HTTP headers"
+        )));
+    };
+
+    match check {
+        ClientLevelCheck::Exempt => {}
+        ClientLevelCheck::Enforce(_) => store
+            .dataset(entry_id)?
+            .required_client_protocol_level()
+            .ensure_met_by(check, "this dataset")?,
+    }
+
+    Ok(entry_id)
+}
+
+/// Streams `num_bytes` of pseudo-random (incompressible) bytes back to the client,
+/// split into ~1 MiB chunks.
+fn bandwidth_test_stream(
+    num_bytes: u64,
+) -> impl futures::Stream<Item = tonic::Result<DoBandwidthTestResponse>> + Send {
+    futures::stream::iter(ext::BandwidthTestPayloadIter::new(num_bytes).map(Ok))
+}
+
+#[cfg(test)]
+mod tests;

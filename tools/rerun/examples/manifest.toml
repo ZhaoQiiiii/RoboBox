@@ -1,0 +1,146 @@
+#:schema ./schema.json
+
+# Examples listed in this manifest will appear on our website.
+# This has no effect whatsoever on whether they appear in the app itself.
+#
+# To add examples to the app itself, use the `channel` attribute in the example's readme's frontmatter.
+# See <https://github.com/rerun-io/rerun/tree/main/examples#adding-a-new-example> for more information.
+
+[categories.experiment-loop]
+order = 1
+title = "The experiment loop"
+prelude = """
+Collect, prepare, train, and evaluate: follow robot data through each step of the loop.
+"""
+# Each example names the steps it covers with `steps` in its README frontmatter.
+# The website orders the examples by their first step, then by the order of `examples`.
+steps = ["collect", "prepare", "train", "evaluate"]
+examples = [
+  "rrd_conversion",
+  "teleop_livekit",
+  "droid_semantic_search",
+  "annotation_gradio",
+  "rerun_export",
+  "lerobot",
+]
+
+# These are examples that we explicitly exclude from our website. You can check that all examples are either included
+# or explicitly excluded by running `python scripts/check_example_manifest_coverage.py`.
+[ignored]
+examples = [
+  "_empty_rerun_sdk",
+  "all_examples",
+  "blueprint", # Not very pretty
+  "custom_callback",
+  "custom_collection_adapter",
+  "custom_importer",
+  "custom_store_subscriber",
+  "custom_view",
+  "custom_visualizer",
+  "dataframe_query",
+  "query_gcs_auth", # Needs a Rerun Hub dataset backed by GCS and Google credentials
+  "dataloader", # Isolated uv project (conflicts with workspace deps via LeRobot), not built by rerun.io
+  "dataloader_pooled_batches", # Console-only example with no Viewer output
+  "drone_lidar",
+  "extend_viewer_ui",
+  "external_importer",
+  "graph_lattice",
+  "table_grid_with_flags",
+  "incremental_logging",
+  "lenses",
+  "minimal_serve",
+  "ply_stl_tetrahedrons",
+  "server_tables",
+  "shared_recording",
+  "spawn_viewer",
+  "stdio",
+  "table_blueprints",
+  "table_zoo",
+  "template",
+  "viewer_callbacks",
+  "using_index_values",
+
+  # TODO(jleibs): We want to bring them back once opentelemtry is fixed
+  "human_pose_tracking",
+  "gesture_detection",
+
+  # Not part of the experiment loop.
+  "air_traffic_data",
+  "animated_urdf",
+  "any_scalar",
+  "arflow",
+  "arkit_scenes",
+  "blueprint_stocks",
+  "camera_video_stream",
+  "chess_robby_fischer",
+  "clock",
+  "controlnet",
+  "depth_compare",
+  "detect_and_track_objects",
+  "dicom_mri",
+  "differentiable_blocks_world",
+  "dna",
+  "droid_dataset",
+  "egoexo_forge",
+  "eigen_opencv",
+  "eye_control",
+  "face_tracking",
+  "glomap",
+  "graphs",
+  "hloc_glomap",
+  "imu_signals",
+  "instant_splat",
+  "kiss-icp",
+  "lerobot_loader",
+  "lidar",
+  "limap",
+  "live_camera_edge_detection",
+  "live_depth_sensor",
+  "live_scrolling_plot",
+  "llm_embedding_ner",
+  "log_file",
+  "mast3r_slam",
+  "mcc",
+  "mini_nvs_solver",
+  "minimal",
+  "ml_depth_pro",
+  "multiprocess_logging",
+  "multithreading",
+  "notebook",
+  "notebook_callbacks",
+  "notebook_neural_field_2d",
+  "notebook_viewer",
+  "nuscenes_dataset",
+  "nv12",
+  "objectron",
+  "ocr",
+  "open_photogrammetry_format",
+  "openstreetmap_data",
+  "plots",
+  "prompt_depth_anything",
+  "raw_mesh",
+  "revy",
+  "rgbd",
+  "robot_data_preprocessing",
+  "ros2_bridge",
+  "ros_bridge",
+  "ros_node",
+  "ros_tf",
+  "rrt_star",
+  "sam2_depthanything",
+  "sam3d_body",
+  "segment_anything_model",
+  "shape_pointe",
+  "simplerecon",
+  "slahmr",
+  "state_timeline",
+  "stereo_vision_slam",
+  "structure_from_motion",
+  "tapir",
+  "tfrecord_loader",
+  "vista",
+  "vistadream",
+  "vrs",
+  "webpage",
+  "widebaseline",
+]

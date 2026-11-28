@@ -1,0 +1,674 @@
+//! Everything needed to convert back and forth between transport-level and application-level types.
+//!
+//! ⚠️Make sure to familiarize yourself with the [crate-level docs] first. ⚠️
+//!
+//! This is where all the complex application-level logic that precedes encoding / follows decoding
+//! happens: Chunk/Sorbet migrations, data patching (app ID injection, version propagation, BW-compat hacks,
+//! etc).
+//!
+//! To go from a freshly decoded transport-level type to its application-level equivalent, use [`ToApplication`].
+//! To prepare an application-level type for encoding, use [`ToTransport`].
+
+use itertools::Itertools as _;
+use re_build_info::CrateVersion;
+use re_chunk_index::RawRrdManifest;
+use re_log_msg::{BlueprintActivationCommand, SetStoreInfo};
+
+use crate::ApplicationIdInjector;
+use crate::rrd::CodecError;
+
+/// Migrates the Sorbet schema of an RRD manifest, decoded without migration, to the latest Sorbet version.
+///
+/// Returns the migrated schema and its hash.
+///
+/// The hash of the input is reused as an optimization when no migration was needed.
+///
+/// The manifest data must be migrated with [`re_sorbet::migrate_rrd_manifest_data`] and the
+/// same `raw` schema, or the index columns won't match the migrated schema.
+pub fn migrate_rrd_manifest_sorbet_schema(
+    raw: &arrow::datatypes::SchemaRef,
+    raw_sha256: re_sorbet::SchemaId,
+) -> Result<(arrow::datatypes::Schema, re_sorbet::SchemaId), arrow::error::ArrowError> {
+    let migrated = std::sync::Arc::unwrap_or_clone(re_sorbet::migrate_schema_ref(raw.clone()));
+    let sha256 = if migrated.fields() == raw.fields() {
+        raw_sha256
+    } else {
+        RawRrdManifest::compute_sorbet_schema_sha256(&migrated)?
+    };
+    Ok((migrated, sha256))
+}
+
+// TODO(cmc): I'd really like a nice centralized way of communicating this.
+//
+// pub type LogMsgTransport = re_protos::log_msg::v1alpha1::log_msg::Msg;
+// pub type LogMsgApp = re_log_msg::LogMsg;
+
+// ---
+
+/// Converts an application-level type to a transport-level type, ready for encoding.
+pub trait ToTransport {
+    type Output;
+    type Context<'a>;
+
+    fn to_transport(&self, context: Self::Context<'_>) -> Result<Self::Output, CodecError>;
+}
+
+impl ToTransport for re_log_msg::LogMsg {
+    type Output = re_protos::log_msg::v1alpha1::log_msg::Msg;
+    type Context<'a> = crate::rrd::Compression;
+
+    fn to_transport(&self, compression: Self::Context<'_>) -> Result<Self::Output, CodecError> {
+        log_msg_app_to_transport(self, compression)
+    }
+}
+
+impl ToTransport for re_log_msg::ArrowMsg {
+    type Output = re_protos::log_msg::v1alpha1::ArrowMsg;
+    type Context<'a> = (re_log_types::StoreId, crate::rrd::Compression);
+
+    fn to_transport(
+        &self,
+        (store_id, compression): Self::Context<'_>,
+    ) -> Result<Self::Output, CodecError> {
+        arrow_msg_app_to_transport(self, store_id, compression)
+    }
+}
+
+impl ToTransport for crate::RrdFooter {
+    type Output = re_protos::log_msg::v1alpha1::RrdFooter;
+    type Context<'a> = ();
+
+    fn to_transport(&self, (): Self::Context<'_>) -> Result<Self::Output, CodecError> {
+        let manifests: Vec<_> = self
+            .manifests
+            .values()
+            .map(|manifest| manifest.to_transport(()))
+            .try_collect()?;
+
+        Ok(Self::Output { manifests })
+    }
+}
+
+impl ToTransport for RawRrdManifest {
+    type Output = re_protos::log_msg::v1alpha1::RrdManifest;
+    type Context<'a> = ();
+
+    fn to_transport(&self, (): Self::Context<'_>) -> Result<Self::Output, CodecError> {
+        {
+            self.sanity_check_cheap()?;
+
+            // that will only work for tests local to this crate, but that's better than nothing.
+            #[cfg(test)]
+            self.sanity_check_heavy()?;
+        }
+
+        let sorbet_schema = re_protos::common::v1alpha1::Schema::try_from(&self.sorbet_schema)
+            .map_err(CodecError::ArrowSerialization)?;
+
+        let data: re_protos::common::v1alpha1::DataframePart = self.data.clone().into();
+
+        // Refuse to write a manifest that `DataframePart` decoding would refuse to read.
+        let max = re_protos::common::v1alpha1::ext::MAX_PAYLOAD_SIZE_BYTES;
+        if data.uncompressed_size > max {
+            return Err(CodecError::InvalidUncompressedSize {
+                declared: data.uncompressed_size,
+                max,
+            });
+        }
+
+        Ok(Self::Output {
+            store_id: Some(self.store_id.clone().into()),
+            sorbet_schema_sha256: Some(self.sorbet_schema_sha256.sha256().to_vec().into()),
+            sorbet_schema: Some(sorbet_schema),
+            data: Some(data),
+        })
+    }
+}
+
+/// Converts a transport-level type to an application-level type, ready for use in the viewer.
+pub trait ToApplication {
+    type Output;
+    type Context<'a>;
+
+    fn to_application(&self, context: Self::Context<'_>) -> Result<Self::Output, CodecError>;
+}
+
+impl ToApplication for re_protos::log_msg::v1alpha1::log_msg::Msg {
+    type Output = re_log_msg::LogMsg;
+    type Context<'a> = (
+        &'a mut dyn ApplicationIdInjector,
+        Option<CrateVersion<'static>>,
+    );
+
+    fn to_application(
+        &self,
+        (app_id_injector, patched_version): Self::Context<'_>,
+    ) -> Result<Self::Output, CodecError> {
+        let mut log_msg = log_msg_transport_to_app(app_id_injector, self)?;
+
+        if let Some(patched_version) = patched_version
+            && let re_log_msg::LogMsg::SetStoreInfo(msg) = &mut log_msg
+        {
+            // In the context of a native RRD stream (files, stdio, etc), this is used to patch the
+            // version advertised by the application-level object so that it matches the one advertised
+            // in the stream header.
+            // This in turn is what makes it possible to display the version of the RRD file in the viewer.
+            msg.info.store_version = Some(patched_version);
+        }
+
+        Ok(log_msg)
+    }
+}
+
+impl ToApplication for re_protos::log_msg::v1alpha1::LogMsg {
+    type Output = re_log_msg::LogMsg;
+    type Context<'a> = (
+        &'a mut dyn ApplicationIdInjector,
+        Option<CrateVersion<'static>>,
+    );
+
+    fn to_application(
+        &self,
+        app_id_injector: Self::Context<'_>,
+    ) -> Result<Self::Output, CodecError> {
+        let Some(msg) = self.msg.as_ref() else {
+            return Err(re_protos::missing_field!(Self, "msg").into());
+        };
+
+        msg.to_application(app_id_injector)
+    }
+}
+
+impl ToApplication for re_protos::log_msg::v1alpha1::ArrowMsg {
+    type Output = re_log_msg::ArrowMsg;
+    type Context<'a> = ();
+
+    fn to_application(&self, _context: Self::Context<'_>) -> Result<Self::Output, CodecError> {
+        arrow_msg_transport_to_app(self)
+    }
+}
+
+impl ToApplication for re_protos::log_msg::v1alpha1::RrdFooter {
+    type Output = crate::RrdFooter;
+    type Context<'a> = ();
+
+    fn to_application(&self, _context: Self::Context<'_>) -> Result<Self::Output, CodecError> {
+        let manifests: Result<std::collections::HashMap<_, _>, _> = self
+            .manifests
+            .iter()
+            .map(|manifest| {
+                let manifest = manifest.to_application(())?;
+                Ok::<_, CodecError>((manifest.store_id.clone(), manifest))
+            })
+            .collect();
+
+        Ok(Self::Output {
+            manifests: manifests?,
+        })
+    }
+}
+
+impl ToApplication for re_protos::log_msg::v1alpha1::RrdManifest {
+    type Output = RawRrdManifest;
+    type Context<'a> = ();
+
+    fn to_application(&self, _context: Self::Context<'_>) -> Result<Self::Output, CodecError> {
+        let store_id = self
+            .store_id
+            .as_ref()
+            .ok_or_else(|| re_protos::missing_field!(Self, "store_id"))?;
+
+        let sorbet_schema = self
+            .sorbet_schema
+            .as_ref()
+            .ok_or_else(|| re_protos::missing_field!(Self, "sorbet_schema"))?;
+
+        let sorbet_schema_sha256 = self
+            .sorbet_schema_sha256
+            .as_ref()
+            .ok_or_else(|| re_protos::missing_field!(Self, "sorbet_schema_sha256"))?;
+        let sorbet_schema_sha256 = (**sorbet_schema_sha256)
+            .try_into()
+            .map(re_sorbet::SchemaId::from_sha256)
+            .map_err(|err| re_protos::invalid_field!(Self, "sorbet_schema_sha256", err))?;
+
+        let data = self
+            .data
+            .as_ref()
+            .ok_or_else(|| re_protos::missing_field!(Self, "data"))?;
+
+        let raw_sorbet_schema = re_sorbet::raw_schema_from_ipc(
+            sorbet_schema
+                .arrow_schema
+                .as_ref()
+                .ok_or_else(|| re_protos::missing_field!(Self, "sorbet_schema.arrow_schema"))?,
+        )
+        .map_err(CodecError::ArrowDeserialization)?;
+        let (sorbet_schema, sorbet_schema_sha256) =
+            migrate_rrd_manifest_sorbet_schema(&raw_sorbet_schema, sorbet_schema_sha256)
+                .map_err(CodecError::ArrowDeserialization)?;
+
+        let rrd_manifest = Self::Output {
+            store_id: store_id.clone().try_into()?,
+            sorbet_schema,
+            sorbet_schema_sha256,
+            data: re_sorbet::migrate_rrd_manifest_data(&raw_sorbet_schema, data.try_into()?),
+        };
+
+        {
+            rrd_manifest.sanity_check_cheap()?;
+
+            // that will only work for tests local to this crate, but that's better than nothing
+            #[cfg(test)]
+            rrd_manifest.sanity_check_heavy()?;
+        }
+
+        Ok(rrd_manifest)
+    }
+}
+
+// ---
+
+/// Converts a transport-level `LogMsg` to its application-level counterpart.
+///
+/// This function attempts to migrate legacy `StoreId` with missing application id. It will return
+/// [`CodecError::StoreIdMissingApplicationId`] if a message arrives before the matching
+/// `SetStoreInfo` message.
+///
+/// The provided [`ApplicationIdInjector`] must be shared across all calls for the same stream.
+#[tracing::instrument(level = "debug", skip_all)]
+fn log_msg_transport_to_app<I: ApplicationIdInjector + ?Sized>(
+    app_id_injector: &mut I,
+    message: &re_protos::log_msg::v1alpha1::log_msg::Msg,
+) -> Result<re_log_msg::LogMsg, CodecError> {
+    re_tracing::profile_function!();
+
+    use re_protos::common::v1alpha1::ext::StoreIdFromProtoError;
+    use re_protos::log_msg::v1alpha1::log_msg::Msg;
+    use re_protos::missing_field;
+
+    match message {
+        Msg::SetStoreInfo(set_store_info) => {
+            let set_store_info: SetStoreInfo = set_store_info.clone().try_into()?;
+            app_id_injector.store_info_received(&set_store_info.info);
+            Ok(re_log_msg::LogMsg::SetStoreInfo(set_store_info))
+        }
+
+        Msg::ArrowMsg(arrow_msg) => {
+            let encoded = arrow_msg_transport_to_app(arrow_msg)?;
+
+            //TODO(#10730): clean that up when removing 0.24 back compat
+            let store_id: re_log_types::StoreId = match arrow_msg
+                .store_id
+                .as_ref()
+                .ok_or_else(|| missing_field!(re_protos::log_msg::v1alpha1::ArrowMsg, "store_id"))?
+                .clone()
+                .try_into()
+            {
+                Ok(store_id) => store_id,
+                // A *missing* app id can be recovered from an earlier `SetStoreInfo`; a *present
+                // but invalid* one is a hard error.
+                Err(StoreIdFromProtoError::MissingApplicationId(err)) => {
+                    let Some(store_id) = app_id_injector.recover_store_id(err.clone()) else {
+                        return Err(err.into());
+                    };
+
+                    store_id
+                }
+                Err(err @ StoreIdFromProtoError::InvalidApplicationId(_)) => return Err(err.into()),
+            };
+
+            Ok(re_log_msg::LogMsg::ArrowMsg(store_id, encoded))
+        }
+
+        Msg::BlueprintActivationCommand(blueprint_activation_command) => {
+            //TODO(#10730): clean that up when removing 0.24 back compat
+            let blueprint_id: re_log_types::StoreId = match blueprint_activation_command
+                .blueprint_id
+                .as_ref()
+                .ok_or_else(|| {
+                    missing_field!(
+                        re_protos::log_msg::v1alpha1::BlueprintActivationCommand,
+                        "blueprint_id"
+                    )
+                })?
+                .clone()
+                .try_into()
+            {
+                Ok(store_id) => store_id,
+                // A *missing* app id can be recovered from an earlier `SetStoreInfo`; a *present
+                // but invalid* one is a hard error.
+                Err(StoreIdFromProtoError::MissingApplicationId(err)) => {
+                    let Some(store_id) = app_id_injector.recover_store_id(err.clone()) else {
+                        return Err(err.into());
+                    };
+
+                    store_id
+                }
+                Err(err @ StoreIdFromProtoError::InvalidApplicationId(_)) => return Err(err.into()),
+            };
+
+            Ok(re_log_msg::LogMsg::BlueprintActivationCommand(
+                BlueprintActivationCommand {
+                    blueprint_id,
+                    make_active: blueprint_activation_command.make_active,
+                    make_default: blueprint_activation_command.make_default,
+                },
+            ))
+        }
+    }
+}
+
+/// Converts a transport-level `ArrowMsg` to its application-level counterpart.
+#[tracing::instrument(level = "debug", skip_all)]
+fn arrow_msg_transport_to_app(
+    arrow_msg: &re_protos::log_msg::v1alpha1::ArrowMsg,
+) -> Result<re_log_msg::ArrowMsg, CodecError> {
+    re_tracing::profile_function!();
+
+    use re_protos::log_msg::v1alpha1::Encoding;
+
+    if arrow_msg.encoding() != Encoding::ArrowIpc {
+        return Err(CodecError::UnsupportedEncoding);
+    }
+
+    // NOTE: Don't use the prost accessor `arrow_msg.compression()` here: it silently maps
+    // unknown enum values (e.g. a new codec from a future writer) to the default, which would
+    // then fail with a confusing Arrow-IPC parse error further down the line.
+    let compression = re_protos::common::v1alpha1::Compression::try_from(arrow_msg.compression)
+        .map_err(re_protos::TypeConversionError::from)?;
+
+    let batch = decode_arrow(
+        &arrow_msg.payload,
+        arrow_msg.uncompressed_size,
+        compression.into(),
+    )?;
+
+    let batch = re_sorbet::ChunkBatch::try_from(&batch)?;
+
+    Ok(re_log_msg::ArrowMsg {
+        batch: std::sync::Arc::new(batch),
+        on_release: None,
+    })
+}
+
+/// Converts an application-level `LogMsg` to its transport-level counterpart.
+#[tracing::instrument(level = "trace", skip_all)]
+fn log_msg_app_to_transport(
+    message: &re_log_msg::LogMsg,
+    compression: crate::rrd::Compression,
+) -> Result<re_protos::log_msg::v1alpha1::log_msg::Msg, CodecError> {
+    re_tracing::profile_function!();
+
+    let proto_msg = match message {
+        re_log_msg::LogMsg::SetStoreInfo(set_store_info) => {
+            re_protos::log_msg::v1alpha1::log_msg::Msg::SetStoreInfo(set_store_info.clone().into())
+        }
+
+        re_log_msg::LogMsg::ArrowMsg(store_id, arrow_msg) => {
+            let arrow_msg = arrow_msg_app_to_transport(arrow_msg, store_id.clone(), compression)?;
+            re_protos::log_msg::v1alpha1::log_msg::Msg::ArrowMsg(arrow_msg)
+        }
+
+        re_log_msg::LogMsg::BlueprintActivationCommand(blueprint_activation_command) => {
+            re_protos::log_msg::v1alpha1::log_msg::Msg::BlueprintActivationCommand(
+                blueprint_activation_command.clone().into(),
+            )
+        }
+    };
+
+    Ok(proto_msg)
+}
+
+/// Converts an application-level `ArrowMsg` to its transport-level counterpart.
+#[tracing::instrument(level = "trace", skip_all)]
+fn arrow_msg_app_to_transport(
+    arrow_msg: &re_log_msg::ArrowMsg,
+    store_id: re_log_types::StoreId,
+    compression: crate::rrd::Compression,
+) -> Result<re_protos::log_msg::v1alpha1::ArrowMsg, CodecError> {
+    re_tracing::profile_function!();
+
+    let re_log_msg::ArrowMsg {
+        batch,
+        on_release: _,
+    } = arrow_msg;
+
+    let payload = encode_arrow(batch, compression)?;
+
+    Ok(re_protos::log_msg::v1alpha1::ArrowMsg {
+        store_id: Some(store_id.into()),
+        chunk_id: Some(batch.chunk_id().as_tuid().into()),
+        compression: re_protos::common::v1alpha1::Compression::from(payload.compression) as i32,
+        uncompressed_size: payload.uncompressed_size,
+        encoding: re_protos::log_msg::v1alpha1::Encoding::ArrowIpc as i32,
+        payload: payload.data.into(),
+        is_static: Some(batch.is_static()),
+    })
+}
+
+// ---
+
+struct EncodedArrowRecordBatch {
+    /// Size of the IPC bytes before compression, which is `data.len()` if `compression` is off.
+    uncompressed_size: u64,
+
+    /// The compression actually applied to `data`.
+    ///
+    /// This may be [`Compression::Off`] even though LZ4 was requested, see
+    /// [`re_protos::common::v1alpha1::ext::compress_lz4_if_worthwhile`].
+    ///
+    /// [`Compression::Off`]: crate::rrd::Compression::Off
+    compression: crate::rrd::Compression,
+
+    data: Vec<u8>,
+}
+
+/// Encodes a native `RecordBatch` to an IPC payload, compressed if requested and worthwhile.
+#[tracing::instrument(level = "debug", skip_all)]
+fn encode_arrow(
+    batch: &arrow::array::RecordBatch,
+    compression: crate::rrd::Compression,
+) -> Result<EncodedArrowRecordBatch, CodecError> {
+    re_tracing::profile_function!();
+
+    let mut uncompressed = Vec::new();
+    {
+        let schema = batch.schema_ref().as_ref();
+
+        let mut sw = {
+            let _span = tracing::trace_span!("schema").entered();
+            ::arrow::ipc::writer::StreamWriter::try_new(&mut uncompressed, schema)
+                .map_err(CodecError::ArrowSerialization)?
+        };
+
+        {
+            let _span = tracing::trace_span!("data").entered();
+            sw.write(batch).map_err(CodecError::ArrowSerialization)?;
+        }
+
+        sw.finish().map_err(CodecError::ArrowSerialization)?;
+    }
+
+    // This will never fail until we have 128bit-native CPUs, but `as` is too dangerous and very
+    // sensitive to refactorings.
+    let uncompressed_size = uncompressed.len().try_into()?;
+
+    // Refuse to write what `decode_arrow` would refuse to read.
+    let max = crate::rrd::MessageHeader::MAX_PAYLOAD_SIZE_BYTES;
+    if uncompressed_size > max {
+        return Err(CodecError::InvalidUncompressedSize {
+            declared: uncompressed_size,
+            max,
+        });
+    }
+
+    let (data, compression) = match compression {
+        crate::rrd::Compression::Off => (uncompressed, crate::rrd::Compression::Off),
+        crate::rrd::Compression::LZ4 => {
+            re_protos::common::v1alpha1::ext::compress_lz4_if_worthwhile(uncompressed)
+        }
+    };
+
+    Ok(EncodedArrowRecordBatch {
+        uncompressed_size,
+        compression,
+        data,
+    })
+}
+
+/// Decodes a potentially compressed IPC payload into a native `RecordBatch`,
+/// see [`re_protos::common::v1alpha1::ext::record_batch_from_ipc_bytes`] for what the batch keeps alive.
+#[tracing::instrument(level = "debug", skip_all)]
+fn decode_arrow(
+    data: &re_protos::external::prost::bytes::Bytes,
+    uncompressed_size: u64,
+    compression: crate::rrd::Compression,
+) -> Result<arrow::array::RecordBatch, CodecError> {
+    re_protos::common::v1alpha1::ext::record_batch_from_ipc_bytes(
+        data,
+        compression,
+        uncompressed_size,
+    )?
+    .ok_or(CodecError::MissingRecordBatch)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use re_protos::common::v1alpha1::Compression as ProtoCompression;
+
+    use super::CodecError;
+    use crate::rrd::Compression;
+    use crate::rrd::test_util::{make_compressible_chunk, make_incompressible_chunk};
+
+    #[test]
+    fn tiny_compressed_payload_cannot_request_a_large_allocation() {
+        for declared in [
+            256,
+            crate::rrd::MessageHeader::MAX_PAYLOAD_SIZE_BYTES,
+            u64::MAX,
+        ] {
+            let mut arrow_msg = arrow_msg_with_compression(ProtoCompression::Lz4 as i32);
+            arrow_msg.payload = vec![0].into();
+            arrow_msg.uncompressed_size = declared;
+
+            assert_matches!(super::arrow_msg_transport_to_app(&arrow_msg),
+                Err(CodecError::InvalidUncompressedSize { declared: size, max: 255 }) if size == declared);
+        }
+    }
+
+    fn arrow_msg_with_compression(compression: i32) -> re_protos::log_msg::v1alpha1::ArrowMsg {
+        re_protos::log_msg::v1alpha1::ArrowMsg {
+            store_id: None,
+            chunk_id: None,
+            compression,
+            uncompressed_size: 0,
+            encoding: re_protos::log_msg::v1alpha1::Encoding::ArrowIpc as i32,
+            payload: Default::default(),
+            is_static: None,
+        }
+    }
+
+    fn to_transport_requesting_lz4(
+        chunk: &re_chunk::Chunk,
+    ) -> re_protos::log_msg::v1alpha1::ArrowMsg {
+        let store_id = re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "test");
+        super::arrow_msg_app_to_transport(
+            &chunk.to_arrow_msg().unwrap(),
+            store_id,
+            Compression::LZ4,
+        )
+        .unwrap()
+    }
+
+    /// Requesting LZ4 on a chunk that does not compress stores it uncompressed, and the message
+    /// records that, so readers never run LZ4 on it.
+    #[test]
+    fn lz4_request_falls_back_to_uncompressed_when_it_does_not_pay_off() {
+        let chunk = make_incompressible_chunk(64 * 1024);
+        let batch = chunk.to_arrow_msg().unwrap().batch.clone();
+
+        let msg = to_transport_requesting_lz4(&chunk);
+        assert_eq!(msg.compression, ProtoCompression::None as i32);
+        assert_eq!(msg.uncompressed_size, msg.payload.len() as u64);
+        let plain = super::encode_arrow(&batch, Compression::Off).unwrap();
+        assert_eq!(msg.payload, plain.data);
+
+        let decoded = super::arrow_msg_transport_to_app(&msg).unwrap();
+        assert_eq!(*decoded.batch, *batch);
+    }
+
+    /// A chunk that compresses well is still stored as LZ4.
+    #[test]
+    fn lz4_request_is_honored_when_it_pays_off() {
+        let chunk = make_compressible_chunk(64 * 1024);
+        let batch = chunk.to_arrow_msg().unwrap().batch.clone();
+
+        let msg = to_transport_requesting_lz4(&chunk);
+        assert_eq!(msg.compression, ProtoCompression::Lz4 as i32);
+        let max_percent = re_protos::common::v1alpha1::ext::MAX_LZ4_COMPRESSED_FRACTION_PERCENT;
+        assert!(
+            (msg.payload.len() as u64) * 100 <= msg.uncompressed_size * max_percent,
+            "a kept LZ4 payload must be at most {max_percent}% of the {} uncompressed bytes, got {}",
+            msg.uncompressed_size,
+            msg.payload.len()
+        );
+
+        let decoded = super::arrow_msg_transport_to_app(&msg).unwrap();
+        assert_eq!(*decoded.batch, *batch);
+    }
+
+    /// One stream encoded with a single LZ4 request ends up with both compressed and
+    /// uncompressed messages, and decodes back to the same messages.
+    #[test]
+    fn stream_mixing_compressed_and_uncompressed_messages_roundtrips() {
+        use re_log_msg::LogMsg;
+
+        let store_id = re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "test");
+        let messages: Vec<LogMsg> = [
+            make_incompressible_chunk(64 * 1024),
+            make_compressible_chunk(64 * 1024),
+            make_incompressible_chunk(64 * 1024),
+            make_compressible_chunk(64 * 1024),
+        ]
+        .iter()
+        .map(|chunk| LogMsg::ArrowMsg(store_id.clone(), chunk.to_arrow_msg().unwrap()))
+        .collect();
+
+        let encoded = crate::Encoder::encode(messages.iter().map(Ok)).unwrap();
+
+        let compressions: Vec<i32> = crate::DecoderTransport::decode_lazy(encoded.as_slice())
+            .map(|msg| match msg.unwrap() {
+                re_protos::log_msg::v1alpha1::log_msg::Msg::ArrowMsg(msg) => msg.compression,
+                _ => unreachable!(),
+            })
+            .collect();
+        let none = ProtoCompression::None as i32;
+        let lz4 = ProtoCompression::Lz4 as i32;
+        assert_eq!(compressions, vec![none, lz4, none, lz4]);
+
+        let decoded: Vec<LogMsg> = crate::DecoderApp::decode_lazy(encoded.as_slice())
+            .map(Result::unwrap)
+            .collect();
+        similar_asserts::assert_eq!(decoded, messages);
+    }
+
+    #[test]
+    fn arrow_msg_unknown_compression_errors() {
+        let arrow_msg = arrow_msg_with_compression(99);
+        let result = super::arrow_msg_transport_to_app(&arrow_msg);
+        assert_matches!(result, Err(CodecError::TypeConversion(_)));
+    }
+
+    #[test]
+    fn arrow_msg_unspecified_compression_is_accepted() {
+        // `COMPRESSION_UNSPECIFIED` is documented to mean no compression, so it must not be
+        // rejected as an unknown enum value (the empty payload fails later, during Arrow-IPC
+        // decoding).
+        let arrow_msg = arrow_msg_with_compression(0);
+        let result = super::arrow_msg_transport_to_app(&arrow_msg);
+        assert!(!matches!(result, Err(CodecError::TypeConversion(_))));
+    }
+}

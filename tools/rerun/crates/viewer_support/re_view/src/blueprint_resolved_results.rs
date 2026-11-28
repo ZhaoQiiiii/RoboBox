@@ -1,0 +1,873 @@
+use std::borrow::Cow;
+use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
+use std::sync::Arc;
+
+use itertools::Itertools as _;
+use nohash_hasher::IntMap;
+use re_chunk_store::external::re_chunk::external::arrow::array::ArrayRef;
+use re_chunk_store::{LatestAtQuery, RangeQuery, UnitChunkShared};
+use re_log_types::hash::{HASH_RANDOM_STATE, Hash64};
+use re_query::{LatestAtResults, RangeResults};
+use re_sdk_types::ComponentIdentifier;
+use re_sdk_types::blueprint::encodings::ComponentSourceKind;
+use re_viewer_context::{QueryContext, VisualizerComponentSource, typed_fallback_for};
+
+use crate::{
+    ComponentMappingError,
+    chunks_with_component::{ChunksWithComponent, MaybeChunksWithComponent},
+};
+
+/// A parsed source-component remapping ready to execute against query results.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct ActiveRemapping {
+    pub source: ComponentIdentifier,
+    pub selector: Option<re_lenses_core::Selector>,
+}
+
+impl ActiveRemapping {
+    pub fn is_identity(&self, target: ComponentIdentifier) -> bool {
+        self.selector.is_none() && target == self.source
+    }
+}
+
+/// The selected source for a visualizer component and any error encountered while checking it.
+#[derive(Debug)]
+#[must_use = "component source checking errors must be handled"]
+pub struct CheckedComponentSource<'a> {
+    /// The source selected explicitly or inferred by the query.
+    source: Cow<'a, VisualizerComponentSource>,
+
+    /// The error encountered while checking `source`, if any.
+    ///
+    /// It's boxed to reduce the size of the [`CheckedComponentSource`] struct:
+    /// we expect this to be rarely used and [`ComponentMappingError`] is quite large.
+    error: Option<Box<ComponentMappingError>>,
+
+    /// Parsed execution state for an explicit source-component mapping.
+    remapping: Option<ActiveRemapping>,
+
+    /// Recording dependencies captured before remapping changes chunk identities.
+    pub(crate) recording_result_hash: Hash64,
+}
+
+impl<'a> CheckedComponentSource<'a> {
+    pub fn new(source: Cow<'a, VisualizerComponentSource>) -> Self {
+        Self {
+            source,
+            error: None,
+            remapping: None,
+            recording_result_hash: Hash64::ZERO,
+        }
+    }
+
+    pub fn with_remapping(mut self, remapping: ActiveRemapping) -> Self {
+        self.remapping = Some(remapping);
+        self
+    }
+
+    pub fn with_error(mut self, error: ComponentMappingError) -> Self {
+        self.error = Some(Box::new(error));
+        self
+    }
+
+    pub fn set_error(&mut self, error: ComponentMappingError) {
+        self.error = Some(Box::new(error));
+    }
+
+    #[inline]
+    pub fn source(&self) -> &VisualizerComponentSource {
+        self.source.as_ref()
+    }
+
+    #[inline]
+    pub fn error(&self) -> Option<&ComponentMappingError> {
+        self.error.as_deref()
+    }
+
+    #[inline]
+    pub fn remapping(&self) -> Option<&ActiveRemapping> {
+        self.remapping.as_ref()
+    }
+}
+
+pub type ComponentSourcesMap<'a> = IntMap<ComponentIdentifier, CheckedComponentSource<'a>>;
+
+/// Wrapper that contains the results of a latest-at query with possible overrides.
+///
+/// Although overrides are never temporal, when accessed via the [`crate::BlueprintResolvedResultsExt`] trait
+/// they will be merged into the results appropriately.
+pub struct BlueprintResolvedLatestAtResults<'a> {
+    /// Resolved class/keypoint inputs used to synthesize annotation components.
+    pub(crate) annotation_input_hash: Hash64,
+
+    // Don't expose overrides/store results directly, since we may not query all overrides/store results
+    // indiscrimnently depending on the active mapping (as of writing that is not yet the case, but it's an optimization we want to do).
+    pub(crate) overrides: LatestAtResults,
+    pub(crate) store_results: LatestAtResults,
+    pub(crate) view_defaults: &'a LatestAtResults,
+
+    pub(crate) query_context: QueryContext<'a>,
+
+    pub(crate) component_sources: ComponentSourcesMap<'a>,
+
+    /// Components resolved from annotation context.
+    pub(crate) annotation_resolved: IntMap<ComponentIdentifier, UnitChunkShared>,
+
+    /// Row ID of the annotation context, needed to invalidate caches when annotation definitions change.
+    /// Synthesized chunks use class/keypoint row IDs, or zero for latest-at results.
+    pub(crate) annotation_context_row_id: Option<re_chunk::RowId>,
+}
+
+pub type ResolvedUnitChunkResult<'a> =
+    Result<Option<Cow<'a, UnitChunkShared>>, &'a ComponentMappingError>;
+
+impl<'a> BlueprintResolvedLatestAtResults<'a> {
+    /// Identifies resolved components, including intermediate inputs, without the cursor time.
+    ///
+    /// Cast rules are excluded; callers must keep them fixed or invalidate caches separately.
+    pub fn query_result_hash(&self) -> Hash64 {
+        let mut hasher = HASH_RANDOM_STATE.build_hasher();
+        self.entity_path().hash().hash(&mut hasher);
+        self.query().timeline().hash(&mut hasher);
+        self.component_sources.len().hash(&mut hasher);
+
+        // Iteration order matters here, but only that it's consistent while `component_sources` is unchanged.
+        #[expect(clippy::iter_over_hash_type)]
+        for (&component, checked) in &self.component_sources {
+            self.hash_component_result(component, checked, &mut hasher);
+        }
+
+        Hash64::from_u64(hasher.finish())
+    }
+
+    pub(crate) fn hash_component_result(
+        &self,
+        component: ComponentIdentifier,
+        checked: &CheckedComponentSource<'_>,
+        hasher: &mut impl std::hash::Hasher,
+    ) {
+        let source = checked.source();
+        let available = checked.error().is_none();
+        component.hash().hash(hasher);
+        source.hash(hasher);
+        available.hash(hasher);
+        if !available {
+            return;
+        }
+
+        match source {
+            VisualizerComponentSource::SourceComponent { .. } => {
+                checked.recording_result_hash.hash(hasher);
+            }
+            VisualizerComponentSource::Override => {
+                self.overrides
+                    .get_if_loaded(component)
+                    .and_then(|chunk| chunk.row_id())
+                    .hash(hasher);
+            }
+            VisualizerComponentSource::Default => {
+                self.view_defaults
+                    .get_if_loaded(component)
+                    .and_then(|chunk| chunk.row_id())
+                    .hash(hasher);
+            }
+            VisualizerComponentSource::AnnotationContext => {
+                (
+                    self.annotation_context_row_id,
+                    self.view_defaults
+                        .get_if_loaded(component)
+                        .and_then(|chunk| chunk.row_id()),
+                    self.annotation_input_hash,
+                )
+                    .hash(hasher);
+            }
+        }
+    }
+
+    /// Are there any chunks that need to be fetched from a remote store?
+    pub fn any_missing_chunks(&self) -> bool {
+        self.overrides.any_missing_chunks()
+            || self.store_results.any_missing_chunks()
+            || self.view_defaults.any_missing_chunks()
+    }
+
+    /// Returns the [`UnitChunkShared`] for the given component, respecting overrides, store results, annotation context, and defaults.
+    ///
+    /// `force_preserve_store_row_ids`: If true, preserves row IDs from store data.
+    /// If false, results are re-indexed to static with zeroed row IDs to allow range zipping.
+    /// Blueprint data (overrides/defaults) is **always** re-indexed regardless of this setting.
+    fn get_unit_chunk(
+        &'a self,
+        component: ComponentIdentifier,
+        force_preserve_store_row_ids: bool,
+    ) -> ResolvedUnitChunkResult<'a> {
+        self.get_unit_chunk_with_source(component, force_preserve_store_row_ids)
+            .map_or(Ok(None), |(_, unit_chunk)| unit_chunk)
+    }
+
+    /// Returns the selected source together with the [`UnitChunkShared`] for the given component.
+    ///
+    /// `force_preserve_store_row_ids`: If true, preserves row IDs from store data.
+    /// If false, results are re-indexed to static with zeroed row IDs to allow range zipping.
+    /// Blueprint data (overrides/defaults) is **always** re-indexed regardless of this setting.
+    ///
+    /// Returns `None` if the component isn't in use at all.
+    pub fn get_unit_chunk_with_source(
+        &'a self,
+        component: ComponentIdentifier,
+        force_preserve_store_row_ids: bool,
+    ) -> Option<(&'a VisualizerComponentSource, ResolvedUnitChunkResult<'a>)> {
+        let checked_source = self.component_sources.get(&component)?;
+        let source = checked_source.source();
+        if let Some(err) = checked_source.error() {
+            return Some((source, Err(err)));
+        }
+
+        let blueprint_unit_chunk = match source.source_kind() {
+            ComponentSourceKind::SourceComponent => {
+                if let Some(unit_chunk) = self.store_results.get_if_loaded(component) {
+                    let unit_chunk = if force_preserve_store_row_ids {
+                        Cow::Borrowed(unit_chunk)
+                    } else {
+                        let chunk: re_chunk::Chunk = (**unit_chunk).clone();
+                        let chunk = chunk.into_static().zeroed();
+                        Cow::Owned(chunk.into_unit().expect(
+                            "This was a unit chunk to begin with, so converting it back can't fail",
+                        ))
+                    };
+                    return Some((source, Ok(Some(unit_chunk))));
+                }
+                None
+            }
+            ComponentSourceKind::Override => self.overrides.get_if_loaded(component),
+            ComponentSourceKind::Default => self.view_defaults.get_if_loaded(component),
+            ComponentSourceKind::AnnotationContext => {
+                return Some((
+                    source,
+                    Ok(self.annotation_resolved.get(&component).map(Cow::Borrowed)),
+                ));
+            }
+        };
+
+        if let Some(unit_chunk) = blueprint_unit_chunk {
+            // Because this is an override or default from the blueprint we always re-index the data as static
+            let chunk: re_chunk::Chunk = (**unit_chunk).clone();
+            let chunk = chunk.into_static().zeroed();
+
+            let unit_chunk =
+                Cow::Owned(chunk.into_unit().expect(
+                    "This was a unit chunk to begin with, so converting it back can't fail",
+                ));
+
+            Some((source, Ok(Some(unit_chunk))))
+        } else {
+            Some((source, Ok(None)))
+        }
+    }
+}
+
+/// Wrapper that contains the results of a range query with possible overrides.
+///
+/// Although overrides are never temporal, when accessed via the [`crate::BlueprintResolvedResultsExt`] trait
+/// they will be merged into the results appropriately.
+pub struct BlueprintResolvedRangeResults<'a> {
+    /// Resolved class/keypoint inputs used to synthesize annotation components.
+    pub(crate) annotation_input_hash: Hash64,
+
+    pub(crate) overrides: LatestAtResults,
+    pub(crate) store_results: RangeResults,
+    pub(crate) view_defaults: &'a LatestAtResults,
+
+    pub(crate) query_context: QueryContext<'a>,
+
+    pub(crate) component_sources: ComponentSourcesMap<'a>,
+
+    /// Components resolved from annotation context.
+    pub(crate) annotation_resolved: IntMap<ComponentIdentifier, Vec<re_chunk::Chunk>>,
+
+    /// See [`BlueprintResolvedLatestAtResults::annotation_context_row_id`].
+    pub(crate) annotation_context_row_id: Option<re_chunk::RowId>,
+}
+
+impl BlueprintResolvedRangeResults<'_> {
+    /// Identifies resolved components, including intermediate inputs, and their dependencies.
+    ///
+    /// Cast rules are excluded; callers must keep them fixed or invalidate caches separately.
+    ///
+    /// The complete query distinguishes slices sharing source chunk IDs.
+    pub fn query_result_hash(&self) -> Hash64 {
+        let mut hasher = HASH_RANDOM_STATE.build_hasher();
+        self.entity_path().hash().hash(&mut hasher);
+        self.store_results.query.hash(&mut hasher);
+        self.component_sources.len().hash(&mut hasher);
+
+        // Iteration order matters here, but only that it's consistent while `component_sources` is unchanged.
+        #[expect(clippy::iter_over_hash_type)]
+        for (&component, checked) in &self.component_sources {
+            self.hash_component_result(component, checked, &mut hasher);
+        }
+
+        Hash64::from_u64(hasher.finish())
+    }
+
+    pub(crate) fn hash_component_result(
+        &self,
+        component: ComponentIdentifier,
+        checked: &CheckedComponentSource<'_>,
+        hasher: &mut impl std::hash::Hasher,
+    ) {
+        let source = checked.source();
+        let available = checked.error().is_none();
+        component.hash().hash(hasher);
+        source.hash(hasher);
+        available.hash(hasher);
+        if !available {
+            return;
+        }
+
+        match source {
+            VisualizerComponentSource::SourceComponent { .. } => {
+                (
+                    checked.recording_result_hash,
+                    // View defaults may be used on gaps in the data!
+                    self.view_defaults
+                        .get_if_loaded(component)
+                        .and_then(|chunk| chunk.row_id()),
+                )
+                    .hash(hasher);
+            }
+            VisualizerComponentSource::Override => {
+                self.overrides
+                    .get_if_loaded(component)
+                    .and_then(|chunk| chunk.row_id())
+                    .hash(hasher);
+            }
+            VisualizerComponentSource::Default => {
+                self.view_defaults
+                    .get_if_loaded(component)
+                    .and_then(|chunk| chunk.row_id())
+                    .hash(hasher);
+            }
+            VisualizerComponentSource::AnnotationContext => {
+                (
+                    self.annotation_context_row_id,
+                    self.view_defaults
+                        .get_if_loaded(component)
+                        .and_then(|chunk| chunk.row_id()),
+                    self.annotation_input_hash,
+                )
+                    .hash(hasher);
+            }
+        }
+    }
+
+    /// Are there any chunks that need to be fetched from a remote store?
+    pub fn any_missing_chunks(&self) -> bool {
+        self.overrides.any_missing_chunks()
+            || self.store_results.any_missing_chunks()
+            || self.view_defaults.any_missing_chunks()
+    }
+
+    /// Returns the [`QueryContext`] for this result.
+    pub fn query_context(&self) -> &QueryContext<'_> {
+        &self.query_context
+    }
+
+    /// Returns the target entity path for this result.
+    pub fn entity_path(&self) -> &re_log_types::EntityPath {
+        self.query_context.target_entity_path
+    }
+}
+
+impl BlueprintResolvedLatestAtResults<'_> {
+    /// Utility for retrieving the first instance of a component.
+    ///
+    /// This operates on a single component at a time and does not handle
+    /// required vs. optional component semantics needed when zipping multiple components together.
+    /// For multi-component zipping, see [`crate::VisualizerInstructionQueryResults`] which properly handles
+    /// required vs. optional distinction.
+    #[inline]
+    pub fn get_mono<C: re_types_core::Component>(
+        &self,
+        component: ComponentIdentifier,
+    ) -> Option<C> {
+        // We don't care about row ids here, but preserving means less overhead!
+        let force_preserve_store_row_ids = true;
+        let unit_chunk = self
+            .get_unit_chunk(component, force_preserve_store_row_ids)
+            .ok()??;
+
+        let deserialized_row = unit_chunk.iter_component::<C>(component).next()?;
+        deserialized_row.as_slice().first().cloned()
+    }
+
+    /// Utility for retrieving the first instance of a component, falling back to the registered fallback value.
+    ///
+    /// This operates on a single component at a time and does not handle
+    /// required vs. optional component semantics needed when zipping multiple components together.
+    /// For multi-component zipping, see [`crate::VisualizerInstructionQueryResults`] which properly handles
+    /// required vs. optional distinction.
+    #[inline]
+    pub fn get_mono_with_fallback<C: re_types_core::Component>(
+        &self,
+        component: ComponentIdentifier,
+    ) -> C {
+        self.get_mono::<C>(component)
+            .unwrap_or_else(|| typed_fallback_for(self.query_context(), component))
+    }
+
+    /// Returns the raw arrow array for the given component's single cell.
+    ///
+    /// This operates on a single component at a time and does not handle
+    /// required vs. optional component semantics needed when zipping multiple components together.
+    /// For multi-component zipping, see [`crate::VisualizerInstructionQueryResults`] which properly handles
+    /// required vs. optional distinction.
+    #[inline]
+    pub fn get_raw_cell(&self, component: ComponentIdentifier) -> Option<ArrayRef> {
+        // We don't care about row ids here, but preserving means less overhead!
+        let force_preserve_store_row_ids = true;
+        let unit_chunk = self
+            .get_unit_chunk(component, force_preserve_store_row_ids)
+            .ok()??;
+
+        unit_chunk.component_batch_raw(component)
+    }
+
+    /// Returns the [`QueryContext`] for this result.
+    pub fn query_context(&self) -> &QueryContext<'_> {
+        &self.query_context
+    }
+
+    /// Returns the target entity path for this result.
+    pub fn entity_path(&self) -> &re_log_types::EntityPath {
+        self.query_context.target_entity_path
+    }
+
+    /// Returns the query used to produce this result.
+    pub fn query(&self) -> &LatestAtQuery {
+        &self.query_context.query
+    }
+}
+
+/// An enum wrapping either latest-at or range blueprint resolved results.
+pub enum BlueprintResolvedResults<'a> {
+    /// Results of a latest-at query.
+    LatestAt {
+        /// The query that produced `results`.
+        query: LatestAtQuery,
+
+        /// The results, with blueprint overrides and defaults resolved.
+        results: BlueprintResolvedLatestAtResults<'a>,
+    },
+
+    /// Results of a range query.
+    Range {
+        /// The query that produced `results`.
+        query: RangeQuery,
+
+        /// The results, with blueprint overrides and defaults resolved.
+        results: BlueprintResolvedRangeResults<'a>,
+    },
+}
+
+impl BlueprintResolvedResults<'_> {
+    pub fn timeline(&self) -> re_log_types::TimelineName {
+        match self {
+            Self::LatestAt { query, .. } => query.timeline().unwrap_or_else(|| {
+                re_log::error_once!("Blueprint latest-at query unexpectedly missing a timeline");
+                re_log_types::TimelineName::log_time()
+            }),
+            Self::Range { query, .. } => *query.timeline(),
+        }
+    }
+
+    /// Are there any chunks that need to be fetched from a remote store?
+    pub fn any_missing_chunks(&self) -> bool {
+        match self {
+            Self::LatestAt { results, .. } => results.any_missing_chunks(),
+            Self::Range { results, .. } => results.any_missing_chunks(),
+        }
+    }
+
+    /// Identifies resolved components and their dependencies, including intermediate inputs.
+    ///
+    /// Range results use source chunk identities and query bounds, never per-row scans.
+    /// Latest-at results use selected row identities so cursor movement within unchanged data
+    /// does not invalidate caches.
+    ///
+    /// Cast rules are excluded; callers must keep them fixed or invalidate caches separately.
+    pub fn query_result_hash(&self) -> Hash64 {
+        re_tracing::profile_function!();
+
+        match self {
+            Self::LatestAt { results, .. } => results.query_result_hash(),
+            Self::Range { results, .. } => results.query_result_hash(),
+        }
+    }
+
+    /// Returns the [`QueryContext`] for this result.
+    #[inline]
+    pub fn query_context(&self) -> &QueryContext<'_> {
+        match self {
+            Self::LatestAt { results, .. } => &results.query_context,
+            Self::Range { results, .. } => &results.query_context,
+        }
+    }
+
+    /// Returns the target entity path for this result.
+    #[inline]
+    pub fn entity_path(&self) -> &re_log_types::EntityPath {
+        self.query_context().target_entity_path
+    }
+}
+
+// ---
+
+impl<'a> From<(LatestAtQuery, BlueprintResolvedLatestAtResults<'a>)>
+    for BlueprintResolvedResults<'a>
+{
+    #[inline]
+    fn from((query, results): (LatestAtQuery, BlueprintResolvedLatestAtResults<'a>)) -> Self {
+        Self::LatestAt { query, results }
+    }
+}
+
+impl<'a> From<(RangeQuery, BlueprintResolvedRangeResults<'a>)> for BlueprintResolvedResults<'a> {
+    #[inline]
+    fn from((query, results): (RangeQuery, BlueprintResolvedRangeResults<'a>)) -> Self {
+        Self::Range { query, results }
+    }
+}
+
+/// Extension traits to abstract query result handling for all spatial views.
+///
+/// Also turns all results into range results, so that views only have to worry about the ranged
+/// case.
+pub trait BlueprintResolvedResultsExt<'a> {
+    /// Returns component data for the given component or an empty array.
+    ///
+    /// For results that are aware of the blueprint, overrides, store results, and defaults will be
+    /// considered.
+    ///
+    /// `force_preserve_store_row_ids`: If true, preserves row IDs from store data in latest-at queries.
+    /// If false, all results are re-indexed to ([`TimeInt::STATIC`], [`RowId::ZERO`])
+    /// in order to allow the same range-zipping behavior as on range queries.
+    /// When false, you cannot rely on row IDs for any hashing/identification purposes!
+    ///
+    /// **WARNING:** Blueprint data (overrides/defaults) is **always** re-indexed to
+    /// ([`TimeInt::STATIC`], [`RowId::ZERO`]) regardless of this setting.
+    fn get_chunks(
+        &'a self,
+        component: ComponentIdentifier,
+        force_preserve_store_row_ids: bool,
+    ) -> MaybeChunksWithComponent<'a>;
+
+    /// Returns required component chunks with preserved store row IDs.
+    ///
+    /// Use this for required components where row IDs are needed for caching or identification.
+    ///
+    /// Blueprint row IDs are always discarded.
+    fn get_required_chunks(
+        &'a self,
+        component: ComponentIdentifier,
+    ) -> MaybeChunksWithComponent<'a>;
+
+    /// Returns optional component chunks with zeroed store row IDs.
+    ///
+    /// Use this for optional/recommended components where the original row IDs would otherwise
+    /// interfere with range zipping on latest-at queries.
+    ///
+    /// Blueprint row IDs are always discarded.
+    #[inline]
+    fn get_optional_chunks(
+        &'a self,
+        component: ComponentIdentifier,
+    ) -> MaybeChunksWithComponent<'a> {
+        self.get_chunks(component, false)
+    }
+
+    /// Returns a zero-copy iterator over all the results for the given `(timeline, component)` pair.
+    ///
+    /// Reports an error if there's no chunks for the given component and returns an empty iterator.
+    /// Use this for required components where row IDs are needed for caching or identification.
+    ///
+    /// Blueprint row IDs are always discarded.
+    ///
+    /// Call one of the following methods on the returned [`HybridResultsChunkIter`]:
+    /// * [`HybridResultsChunkIter::slice`]
+    /// * [`HybridResultsChunkIter::slice_from_struct_field`]
+    fn iter_required(
+        &'a self,
+        mut reporter: impl FnMut(&ComponentMappingError),
+        timeline: TimelineName,
+        component: ComponentIdentifier,
+    ) -> HybridResultsChunkIter<'a> {
+        let chunks_with_component = match self.get_required_chunks(component).try_into() {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                reporter(err);
+                ChunksWithComponent::empty(component)
+            }
+        };
+
+        HybridResultsChunkIter {
+            chunks_with_component,
+            timeline,
+        }
+    }
+
+    /// Returns a zero-copy iterator over all the results for the given `(timeline, component)` pair.
+    ///
+    /// Does *not* report an error if there's no chunks for the given component and returns an empty iterator.
+    /// Use this for optional/recommended components where the original row IDs would otherwise
+    /// interfere with range zipping on latest-at queries.
+    ///
+    /// **WARNING**: For latest-at queries, the row IDs are always zeroed out to allow for range zipping.
+    /// Blueprint row IDs are always discarded.
+    ///
+    /// Call one of the following methods on the returned [`HybridResultsChunkIter`]:
+    /// * [`HybridResultsChunkIter::slice`]
+    /// * [`HybridResultsChunkIter::slice_from_struct_field`]
+    fn iter_optional(
+        &'a self,
+        mut reporter: impl FnMut(&ComponentMappingError),
+        timeline: TimelineName,
+        component: ComponentIdentifier,
+    ) -> HybridResultsChunkIter<'a> {
+        let chunks_with_component = match self.get_optional_chunks(component).try_into() {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                reporter(err);
+                ChunksWithComponent::empty(component)
+            }
+        };
+
+        HybridResultsChunkIter {
+            chunks_with_component,
+            timeline,
+        }
+    }
+}
+
+impl BlueprintResolvedResultsExt<'_> for BlueprintResolvedRangeResults<'_> {
+    #[inline]
+    fn get_required_chunks(&self, component: ComponentIdentifier) -> MaybeChunksWithComponent<'_> {
+        self.get_chunks(component, true)
+    }
+
+    #[inline]
+    fn get_chunks(
+        &self,
+        component: ComponentIdentifier,
+        _force_preserve_store_row_ids: bool,
+    ) -> MaybeChunksWithComponent<'_> {
+        let Some(checked_source) = self.component_sources.get(&component) else {
+            return MaybeChunksWithComponent::empty(component);
+        };
+        if let Some(err) = checked_source.error() {
+            return MaybeChunksWithComponent::error(component, err);
+        }
+
+        let chunks = match checked_source.source() {
+            VisualizerComponentSource::SourceComponent { .. } => {
+                // NOTE: Because this is a range query, we always need the defaults to come first,
+                // since range queries don't have any state to bootstrap from.
+                let defaults = self.view_defaults.get_if_loaded(component).map(|unit| {
+                    // Because this is a default (blueprint data) we always re-index the data as static
+                    // and zero the row IDs
+                    Arc::unwrap_or_clone(unit.clone().into_chunk())
+                        .into_static()
+                        .zeroed()
+                });
+
+                let results_chunks = self.store_results.get(component).unwrap_or_default();
+
+                // TODO(cmc): this `collect_vec()` sucks, let's keep an eye on it and see if it ever
+                // becomes an issue.
+                Cow::Owned(std::iter::chain(defaults, results_chunks.iter().cloned()).collect_vec())
+            }
+            VisualizerComponentSource::Override => {
+                self.overrides
+                    .get_if_loaded(component)
+                    .map_or(Cow::Owned(Vec::new()), |unit| {
+                        // Because this is an override (blueprint data) we always re-index the data as static
+                        // and zero the row IDs
+                        let chunk = Arc::unwrap_or_clone(unit.clone().into_chunk())
+                            .into_static()
+                            .zeroed();
+                        Cow::Owned(vec![chunk])
+                    })
+            }
+            VisualizerComponentSource::Default => {
+                self.view_defaults
+                    .get_if_loaded(component)
+                    .map_or(Cow::Owned(Vec::new()), |unit| {
+                        // Because this is a default (blueprint data) we always re-index the data as static
+                        // and zero the row IDs
+                        Cow::Owned(vec![
+                            Arc::unwrap_or_clone(unit.clone().into_chunk())
+                                .into_static()
+                                .zeroed(),
+                        ])
+                    })
+            }
+            VisualizerComponentSource::AnnotationContext => self
+                .annotation_resolved
+                .get(&component)
+                .map_or(Cow::Owned(Vec::new()), |chunks| {
+                    Cow::Borrowed(chunks.as_slice())
+                }),
+        };
+
+        MaybeChunksWithComponent {
+            maybe_chunks: Ok(chunks),
+            component,
+        }
+    }
+}
+
+impl<'a> BlueprintResolvedResultsExt<'a> for BlueprintResolvedLatestAtResults<'_> {
+    #[inline]
+    fn get_required_chunks(
+        &'a self,
+        component: ComponentIdentifier,
+    ) -> MaybeChunksWithComponent<'a> {
+        self.get_chunks(component, true)
+    }
+
+    #[inline]
+    fn get_chunks(
+        &'a self,
+        component: ComponentIdentifier,
+        force_preserve_store_row_ids: bool,
+    ) -> MaybeChunksWithComponent<'a> {
+        match self.get_unit_chunk(component, force_preserve_store_row_ids) {
+            Ok(None) => MaybeChunksWithComponent::empty(component),
+
+            Ok(Some(unit_chunk)) => MaybeChunksWithComponent {
+                maybe_chunks: Ok(match unit_chunk {
+                    Cow::Borrowed(unit_chunk) => Cow::Borrowed(std::slice::from_ref(unit_chunk)),
+                    // TODO(andreas): Would be nice to get rid of the extra clone and vec allocation here.
+                    Cow::Owned(unit_chunk) => Cow::Owned(vec![(*unit_chunk.into_chunk()).clone()]),
+                }),
+                component,
+            },
+
+            Err(err) => MaybeChunksWithComponent::error(component, err),
+        }
+    }
+}
+
+impl<'a> BlueprintResolvedResultsExt<'a> for BlueprintResolvedResults<'_> {
+    #[inline]
+    fn get_required_chunks(
+        &'a self,
+        component: ComponentIdentifier,
+    ) -> MaybeChunksWithComponent<'a> {
+        self.get_chunks(component, true)
+    }
+
+    #[inline]
+    fn get_chunks(
+        &'a self,
+        component: ComponentIdentifier,
+        force_preserve_store_row_ids: bool,
+    ) -> MaybeChunksWithComponent<'a> {
+        match self {
+            Self::LatestAt { results, .. } => {
+                results.get_chunks(component, force_preserve_store_row_ids)
+            }
+            Self::Range { results, .. } => {
+                results.get_chunks(component, force_preserve_store_row_ids)
+            }
+        }
+    }
+}
+
+// ---
+
+use re_chunk::{ChunkComponentIterItem, RowId, TimeInt, TimelineName};
+
+/// The iterator type backing [`BlueprintResolvedResultsExt::iter_required`] and [`BlueprintResolvedResultsExt::iter_optional`].
+pub struct HybridResultsChunkIter<'a> {
+    chunks_with_component: ChunksWithComponent<'a>,
+    timeline: TimelineName,
+}
+
+impl<'a> HybridResultsChunkIter<'a> {
+    pub fn new(chunks_with_component: ChunksWithComponent<'a>, timeline: TimelineName) -> Self {
+        Self {
+            chunks_with_component,
+            timeline,
+        }
+    }
+
+    /// True if there's no chunks to iterate on.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.chunks_with_component.chunks.is_empty()
+    }
+
+    /// Iterate as indexed deserialized batches.
+    ///
+    /// TODO(#5305): Note that this uses the old codegen'd deserialization path, which does some
+    /// very unidiomatic Arrow things, and is therefore very slow at the moment. Avoid this on
+    /// performance critical paths.
+    ///
+    /// See [`re_chunk::Chunk::iter_component`] for more information.
+    pub fn component_slow<C: re_types_core::Component>(
+        &'a self,
+    ) -> impl Iterator<Item = ((TimeInt, RowId), ChunkComponentIterItem<C>)> + 'a {
+        self.chunks_with_component
+            .chunks
+            .iter()
+            .flat_map(move |chunk| {
+                itertools::izip!(
+                    chunk.iter_component_indices(
+                        self.timeline,
+                        self.chunks_with_component.component
+                    ),
+                    chunk.iter_component::<C>(self.chunks_with_component.component),
+                )
+            })
+    }
+
+    /// Iterate as indexed, sliced, deserialized component batches.
+    ///
+    /// See [`re_chunk::Chunk::iter_slices`] for more information.
+    pub fn slice<S: 'a + re_chunk::ChunkComponentSlicer>(
+        &'a self,
+    ) -> impl Iterator<Item = ((TimeInt, RowId), S::Item<'a>)> + 'a {
+        self.chunks_with_component.slice::<S>(self.timeline)
+    }
+
+    /// Iterate as indexed, sliced, deserialized component batches for a specific struct field.
+    ///
+    /// See [`re_chunk::Chunk::iter_slices_from_struct_field`] for more information.
+    pub fn slice_from_struct_field<S: 'a + re_chunk::ChunkComponentSlicer>(
+        &'a self,
+        field_name: &'a str,
+    ) -> impl Iterator<Item = ((TimeInt, RowId), S::Item<'a>)> + 'a {
+        self.chunks_with_component
+            .chunks
+            .iter()
+            .flat_map(move |chunk| {
+                itertools::izip!(
+                    chunk.iter_component_indices(
+                        self.timeline,
+                        self.chunks_with_component.component
+                    ),
+                    chunk.iter_slices_from_struct_field::<S>(
+                        self.chunks_with_component.component,
+                        field_name
+                    )
+                )
+            })
+    }
+
+    /// Access the underlying chunks.
+    #[inline]
+    pub fn chunks(&'a self) -> &'a ChunksWithComponent<'a> {
+        &self.chunks_with_component
+    }
+}

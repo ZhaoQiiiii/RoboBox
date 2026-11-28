@@ -1,0 +1,601 @@
+use std::collections::BTreeMap;
+
+use itertools::Itertools as _;
+use nohash_hasher::IntSet;
+use re_chunk_store::MissingChunkReporter;
+use re_log_types::EntityPath;
+use re_sdk_types::ViewClassIdentifier;
+use vec1::Vec1;
+
+use super::{ViewContext, ViewerDiagnostic};
+use crate::{
+    DragAndDropFeedback, DragAndDropPayload, IndicatedEntities, PerVisualizerType, QueryRange,
+    RecommendedMappings, SystemExecutionOutput, ViewClassRegistryError, ViewId, ViewQuery,
+    ViewSpawnContext, ViewSpawnHeuristics, ViewSystemExecutionError, ViewSystemIdentifier,
+    ViewSystemRegistrator, ViewerContext, VisualizableReason,
+};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd, Ord, Eq)]
+pub enum ViewClassLayoutPriority {
+    /// This view can share space with others
+    ///
+    /// Used for boring things like text and plots.
+    Low,
+
+    #[default]
+    Medium,
+
+    /// Give this view lots of space.
+    /// Used for spatial views (2D/3D).
+    High,
+}
+
+/// Recommended visualizers for an entity, split into all recommendations and the subset to auto-spawn.
+///
+/// `auto_spawned` is always a subset of `all_recommendations`.
+/// By default, all recommendations are also auto-spawned.
+pub struct RecommendedVisualizers {
+    /// All recommended visualizers (used for UI purposes like "add visualizer" menus).
+    all_recommendations: BTreeMap<ViewSystemIdentifier, Vec1<RecommendedMappings>>,
+
+    /// The subset of [`Self::all_recommendations`] that should be automatically spawned.
+    auto_spawned: BTreeMap<ViewSystemIdentifier, Vec1<RecommendedMappings>>,
+}
+
+impl RecommendedVisualizers {
+    /// Creates a new [`RecommendedVisualizers`] where all recommendations are auto-spawned.
+    pub fn new(
+        recommended_and_auto_spawned: BTreeMap<ViewSystemIdentifier, Vec1<RecommendedMappings>>,
+    ) -> Self {
+        Self {
+            auto_spawned: recommended_and_auto_spawned.clone(),
+            all_recommendations: recommended_and_auto_spawned,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(Default::default())
+    }
+
+    pub fn default(visualizer: ViewSystemIdentifier) -> Self {
+        Self::new(std::iter::once((visualizer, Default::default())).collect())
+    }
+
+    pub fn default_many(visualizers: impl IntoIterator<Item = ViewSystemIdentifier>) -> Self {
+        let recommended = visualizers
+            .into_iter()
+            .map(|v| (v, Default::default()))
+            .collect();
+        Self::new(recommended)
+    }
+
+    /// Inserts visualizer recommendations, merging with any existing mappings for the same visualizer.
+    ///
+    /// Duplicate mappings are removed.
+    /// If `auto_spawn` is true, this recommendation will also spawn a view.
+    pub fn insert(
+        &mut self,
+        visualizer: ViewSystemIdentifier,
+        mappings: Vec1<RecommendedMappings>,
+        auto_spawn: bool,
+    ) {
+        if auto_spawn {
+            Self::extend_mappings_unique(&mut self.auto_spawned, visualizer, mappings.clone());
+        }
+        Self::extend_mappings_unique(&mut self.all_recommendations, visualizer, mappings);
+    }
+
+    /// All recommended visualizers, including those not auto-spawned.
+    pub fn all_recommendations(
+        &self,
+    ) -> &BTreeMap<ViewSystemIdentifier, Vec1<RecommendedMappings>> {
+        &self.all_recommendations
+    }
+
+    /// Consumes self and returns the auto-spawned recommendations.
+    ///
+    /// Auto-spanned recommendations are always a subset of all recommendations.
+    pub fn into_auto_spawned(self) -> BTreeMap<ViewSystemIdentifier, Vec1<RecommendedMappings>> {
+        let Self {
+            all_recommendations: _,
+            auto_spawned,
+        } = self;
+        auto_spawned
+    }
+
+    fn extend_mappings_unique(
+        map: &mut BTreeMap<ViewSystemIdentifier, Vec1<RecommendedMappings>>,
+        visualizer: ViewSystemIdentifier,
+        mappings: Vec1<RecommendedMappings>,
+    ) {
+        match map.entry(visualizer) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                existing.extend(mappings);
+                *existing = Vec1::try_from_vec(existing.iter().cloned().unique().collect())
+                    .expect("There was already at least one mapping.");
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(mappings);
+            }
+        }
+    }
+}
+
+/// Callback that renders the active visualizers in the selection panel.
+pub type VisualizersSectionUi<'a> = Box<dyn Fn(&mut egui::Ui, &ViewContext<'_>) + 'a>;
+
+/// The visualizers section of [`ViewSelectionUi`].
+pub struct VisualizersSectionOutput<'a> {
+    /// Renders the active visualizers in the selection panel.
+    pub ui: VisualizersSectionUi<'a>,
+
+    /// Per-entity options for the "add visualizer" menu.
+    /// Recommended visualizers for an entity may or may not be identical to [`ViewClass::recommended_visualizers_for_entity`].
+    pub add_options: Vec<(EntityPath, RecommendedVisualizers)>,
+}
+
+/// Callback that renders the body of a [`SelectionSection`].
+pub type SelectionSectionUi<'a> = Box<dyn Fn(&mut egui::Ui, &ViewContext<'_>) + 'a>;
+
+/// Callback that renders a view's blueprint properties.
+pub type BlueprintPropertiesUi<'a> =
+    Box<dyn Fn(&mut egui::Ui, &ViewContext<'_>) -> Result<(), ViewSystemExecutionError> + 'a>;
+
+/// A section of the selection panel that a view class fills itself.
+pub struct SelectionSection<'a> {
+    /// Heading of the collapsing section.
+    pub title: String,
+
+    /// Renders the body of the section.
+    pub ui: SelectionSectionUi<'a>,
+}
+
+/// Configures the selection UI for a view.
+///
+/// ⚠ This API is unstable and may change in future versions.
+pub struct ViewSelectionUi<'a> {
+    /// Whether to show the standard entity path filter UI.
+    pub show_entity_filter: bool,
+
+    /// The structured visualizers section, including its add-visualizer menu.
+    pub visualizers: Option<VisualizersSectionOutput<'a>>,
+
+    /// Additional sections inserted between visualizers and blueprint properties.
+    pub extra_sections: Vec<SelectionSection<'a>>,
+
+    /// UI for the "View properties" section.
+    ///
+    /// `Some` replaces the generic property UI; `None` renders the properties declared by the
+    /// reflected view definition. The selection panel displays its empty state if nothing renders.
+    pub blueprint_properties: Option<BlueprintPropertiesUi<'a>>,
+}
+
+impl<'a> ViewSelectionUi<'a> {
+    /// Uses a custom properties UI while keeping the other selection-panel defaults.
+    pub fn properties_ui(
+        ui: impl Fn(&mut egui::Ui, &ViewContext<'_>) -> Result<(), ViewSystemExecutionError> + 'a,
+    ) -> Self {
+        Self {
+            blueprint_properties: Some(Box::new(ui)),
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for ViewSelectionUi<'_> {
+    fn default() -> Self {
+        Self {
+            show_entity_filter: true,
+            visualizers: None,
+            extra_sections: Vec::new(),
+            blueprint_properties: None,
+        }
+    }
+}
+
+/// Output produced by [`ViewClass::ui`].
+#[derive(Default)]
+pub struct ViewClassUiOutput {
+    /// Diagnostics about the view as a whole.
+    pub reports: Vec<ViewerDiagnostic>,
+}
+
+impl ViewClassUiOutput {
+    pub fn with_report(mut self, report: ViewerDiagnostic) -> Self {
+        self.reports.push(report);
+        self
+    }
+}
+
+/// Defines a class of view without any concrete types making it suitable for storage and interfacing.
+///
+/// Each View in the viewer's viewport has a single class assigned immutable at its creation time.
+/// The class defines all aspects of its behavior.
+/// It determines which entities are queried, how they are rendered, and how the user can interact with them.
+//
+// TODO(andreas): Consider formulating a view instance context object that is passed to all
+// methods that operate on concrete views as opposed to be about general information on the class.
+pub trait ViewClass: Send + Sync {
+    /// Identifier string of this view class.
+    ///
+    /// By convention we use `PascalCase`.
+    fn identifier() -> ViewClassIdentifier
+    where
+        Self: Sized;
+
+    /// Ordering hint for view class recommendations. Lower values are recommended *more*.
+    ///
+    /// If tied, the display name is used as a tiebreaker in lexicographical order.
+    fn recommendation_order(&self) -> i32 {
+        0
+    }
+
+    /// User-facing name of this view class.
+    ///
+    /// Used for UI display.
+    fn display_name(&self) -> &'static str;
+
+    /// Icon used to identify this view class.
+    fn icon(&self) -> &'static re_ui::Icon {
+        &re_ui::icons::VIEW_GENERIC
+    }
+
+    fn help(&self, os: egui::os::OperatingSystem) -> re_ui::Help;
+
+    /// Called once upon registration of the class
+    ///
+    /// This can be used to register all built-in [`crate::ViewContextSystem`] and [`crate::VisualizerSystem`].
+    fn on_register(
+        &self,
+        system_registry: &mut ViewSystemRegistrator<'_>,
+    ) -> Result<(), ViewClassRegistryError>;
+
+    /// Called once for every new view instance of this class.
+    ///
+    /// The state is *not* persisted across viewer sessions, only shared frame-to-frame.
+    fn new_state(&self) -> Box<dyn ViewState> {
+        Box::new(())
+    }
+
+    /// Preferred aspect ratio for the ui tiles of this view.
+    fn preferred_tile_aspect_ratio(&self, _state: &dyn ViewState) -> Option<f32> {
+        None
+    }
+
+    /// Controls how likely this view will get a large tile in the ui.
+    fn layout_priority(&self) -> ViewClassLayoutPriority {
+        ViewClassLayoutPriority::default()
+    }
+
+    /// Controls whether the visible time range UI should be displayed for this view.
+    fn supports_visible_time_range(&self) -> bool {
+        false
+    }
+
+    /// Default query range for this view.
+    //TODO(#6918): also provide ViewerContext and ViewId, to enable reading view properties.
+    fn default_query_range(&self, _state: &dyn ViewState) -> QueryRange {
+        QueryRange::LatestAt
+    }
+
+    /// Determines a suitable origin given the provided set of entities.
+    ///
+    /// This function only considers the transform topology, disregarding the actual visualizability
+    /// of the entities.
+    fn recommended_origin_for_entities(
+        &self,
+        entities: &IntSet<EntityPath>,
+        _entity_db: &re_entity_db::EntityDb,
+    ) -> Option<EntityPath> {
+        // For example: when creating a view from a single entity, we want that
+        // entity to be the origin of the view.
+        // If we select two sibling entities, we want their parent to be the origin.
+        Some(EntityPath::common_ancestor_of(entities.iter()))
+    }
+
+    /// Auto picked visualizers for an entity if there was not explicit selection.
+    ///
+    /// Helpful for customizing fallback behavior for types that are insufficient
+    /// to determine indicated on their own.
+    ///
+    /// Will only be called for entities where the selected visualizers have not
+    /// been overridden by the blueprint.
+    ///
+    /// `visualizers_with_reason` contains the visualizers that are visualizable for this entity,
+    /// along with the reason why they are visualizable.
+    ///
+    /// This interface provides a default implementation which will return all visualizers
+    /// which are both visualizable and indicated for the given entity.
+    fn recommended_visualizers_for_entity(
+        &self,
+        entity_path: &EntityPath,
+        visualizers_with_reason: &[(ViewSystemIdentifier, &VisualizableReason)],
+        indicated_entities_per_visualizer: &PerVisualizerType<&IndicatedEntities>,
+    ) -> RecommendedVisualizers {
+        let mut recommended = RecommendedVisualizers::empty();
+        for (visualizer, reason) in visualizers_with_reason {
+            if indicated_entities_per_visualizer
+                .get(visualizer)
+                .is_some_and(|matching_list| matching_list.contains(entity_path))
+            {
+                recommended.insert(*visualizer, reason.recommended_mappings(), true);
+            }
+        }
+        recommended
+    }
+
+    /// Recommends views for automatic spawning or explicit user creation.
+    ///
+    /// Automatic recommendations should not be triggered by property entities.
+    /// Explicit creation considers all entities and will use the first returned recommendation.
+    fn spawn_heuristics(
+        &self,
+        ctx: &ViewerContext<'_>,
+        spawn_context: ViewSpawnContext,
+    ) -> ViewSpawnHeuristics;
+
+    /// Configures the UI shown when the user selects a view of this class.
+    #[doc(alias = "settings_ui")]
+    fn selection_ui<'a>(&'a self, _ctx: &ViewContext<'_>) -> ViewSelectionUi<'a> {
+        ViewSelectionUi::default()
+    }
+
+    /// Additional UI displayed in the tab title bar, between the "maximize" and "help" buttons.
+    ///
+    /// Note: this is a right-to-left layout.
+    fn extra_title_bar_ui(
+        &self,
+        _ctx: &ViewerContext<'_>,
+        _ui: &mut egui::Ui,
+        _state: &mut dyn ViewState,
+        // TODO(RR-3076): Eventually we want to get rid of the _general_ concept of `space_origin`.
+        _space_origin: &EntityPath,
+        _view_id: ViewId,
+    ) -> Result<(), ViewSystemExecutionError> {
+        Ok(())
+    }
+
+    /// Handle a payload dragged over this view.
+    ///
+    /// The viewport calls this every frame while a payload hovers the view.
+    /// Only mutate the blueprint when `released` is true.
+    /// The viewport clears the drag payload and selects this view when a released drop returns
+    /// [`DragAndDropFeedback::Accept`].
+    ///
+    /// By default, entities are handled by [`crate::default_view_entity_drop`], which overrides can
+    /// call too, and all other payloads are ignored.
+    fn handle_drop(
+        &self,
+        ctx: &ViewContext<'_>,
+        payload: &DragAndDropPayload,
+        released: bool,
+    ) -> DragAndDropFeedback {
+        match payload {
+            DragAndDropPayload::Entities { entities } => {
+                crate::default_view_entity_drop(ctx, entities, released, |_| None)
+            }
+            DragAndDropPayload::Components { .. }
+            | DragAndDropPayload::Contents { .. }
+            | DragAndDropPayload::Invalid => DragAndDropFeedback::Ignore,
+        }
+    }
+
+    /// Draws the ui for this view class and handles ui events.
+    ///
+    /// The passed state is kept frame-to-frame.
+    ///
+    /// TODO(wumpf): Right now the ui methods control when and how to create [`re_renderer::ViewBuilder`]s.
+    ///              In the future, we likely want to move view builder handling to `re_viewport` with
+    ///              minimal configuration options exposed via [`crate::ViewClass`].
+    #[doc(alias = "paint")]
+    #[doc(alias = "render")]
+    fn ui(
+        &self,
+        ctx: &ViewerContext<'_>,
+        missing_chunk_reporter: &MissingChunkReporter,
+        ui: &mut egui::Ui,
+        state: &mut dyn ViewState,
+        query: &ViewQuery<'_>,
+        system_output: SystemExecutionOutput,
+    ) -> Result<ViewClassUiOutput, ViewSystemExecutionError>;
+}
+
+pub trait ViewClassExt<'a>: ViewClass + 'a {
+    fn view_context<'b>(
+        &self,
+        viewer_ctx: &'b ViewerContext<'b>,
+        view_id: ViewId,
+        view_state: &'b dyn ViewState,
+        space_origin: &'b EntityPath,
+    ) -> ViewContext<'b>;
+}
+
+impl<'a, T> ViewClassExt<'a> for T
+where
+    T: ViewClass + 'a,
+{
+    fn view_context<'b>(
+        &self,
+        viewer_ctx: &'b ViewerContext<'b>,
+        view_id: ViewId,
+        view_state: &'b dyn ViewState,
+        // TODO(RR-3076): Eventually we want to get rid of the _general_ concept of `space_origin`.
+        space_origin: &'b EntityPath,
+    ) -> ViewContext<'b> {
+        ViewContext {
+            viewer_ctx,
+            view_id,
+            view_class_identifier: T::identifier(),
+            space_origin,
+            view_state,
+            query_result: viewer_ctx.lookup_query_result(view_id),
+        }
+    }
+}
+
+/// Unserialized frame to frame state of a view.
+///
+/// For any state that should be persisted, use the Blueprint!
+/// This state is used for transient state, such as animation or uncommitted ui state like dragging a camera.
+/// (on mouse release, the camera would be committed to the blueprint).
+pub trait ViewState: std::any::Any + Sync + Send {
+    /// Converts itself to a reference of [`std::any::Any`], which enables downcasting to concrete types.
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Converts itself to a reference of [`std::any::Any`], which enables downcasting to concrete types.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// How many bytes this state uses on the heap.
+    fn heap_size_bytes(&self) -> u64;
+}
+
+/// Bridges `dyn ViewState` back to `SizeBytes`, so containers like `Box<dyn ViewState>` can be sized.
+impl re_byte_size::SizeBytes for dyn ViewState {
+    #[inline]
+    fn heap_size_bytes(&self) -> u64 {
+        ViewState::heap_size_bytes(self)
+    }
+}
+
+/// Implementation of an empty view state.
+impl ViewState for () {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn heap_size_bytes(&self) -> u64 {
+        0
+    }
+}
+
+pub trait ViewStateExt: ViewState {
+    /// Downcasts this state to a reference of a concrete type.
+    fn downcast_ref<T: ViewState>(&self) -> Result<&T, ViewSystemExecutionError> {
+        self.as_any()
+            .downcast_ref()
+            .ok_or(ViewSystemExecutionError::StateCastError(
+                std::any::type_name::<T>(),
+            ))
+    }
+
+    /// Downcasts this state to a mutable reference of a concrete type.
+    fn downcast_mut<T: ViewState>(&mut self) -> Result<&mut T, ViewSystemExecutionError> {
+        self.as_any_mut()
+            .downcast_mut()
+            .ok_or(ViewSystemExecutionError::StateCastError(
+                std::any::type_name::<T>(),
+            ))
+    }
+}
+
+impl ViewStateExt for dyn ViewState {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ComponentMatch, SingleRequiredComponentMatch, ViewClassPlaceholder,
+        VisualizerComponentSource,
+    };
+    use nohash_hasher::IntMap;
+
+    #[test]
+    fn native_mappings_take_precedence_over_ordered_heuristics() {
+        let entity = EntityPath::from("entity");
+        let visualizer: ViewSystemIdentifier = "TestVisualizer".into();
+        let target = "target".into();
+        let indicated = IndicatedEntities(std::iter::once(entity.clone()).collect());
+        let indicated_per_visualizer =
+            PerVisualizerType(std::iter::once((visualizer, &indicated)).collect());
+        let expected: Vec<_> = ["message_a", "message_b"]
+            .map(|source| {
+                RecommendedMappings::new(
+                    target,
+                    VisualizerComponentSource::SourceComponent {
+                        source_component: source.into(),
+                        selector: ".data".into(),
+                    },
+                )
+            })
+            .into();
+
+        // Without a native match, both heuristics are recommended in source order.
+        // A native match suppresses both: "other" requires remapping, "target" uses identity.
+        for native_source in [None, Some("other"), Some("target")] {
+            // Recommendation order must not depend on heuristic insertion order.
+            for sources in [["message_b", "message_a"], ["message_a", "message_b"]] {
+                let mut matches = IntMap::default();
+                for source in sources {
+                    matches.insert(
+                        source.into(),
+                        ComponentMatch::HeuristicMapping {
+                            component_type: None,
+                            mappings: RecommendedMappings::new(
+                                target,
+                                VisualizerComponentSource::SourceComponent {
+                                    source_component: source.into(),
+                                    selector: ".data".into(),
+                                },
+                            ),
+                        },
+                    );
+                }
+                if let Some(source) = native_source {
+                    matches.insert(
+                        source.into(),
+                        ComponentMatch::NativeSemantics {
+                            arrow_data_type: arrow::datatypes::DataType::Float64,
+                            component_type: None,
+                        },
+                    );
+                }
+                let reason = VisualizableReason::SingleRequiredComponentMatch(
+                    SingleRequiredComponentMatch {
+                        target_component: target,
+                        matches,
+                    },
+                );
+                let recommended = ViewClassPlaceholder.recommended_visualizers_for_entity(
+                    &entity,
+                    &[(visualizer, &reason)],
+                    &indicated_per_visualizer,
+                );
+
+                let native = native_source.map(|source| {
+                    if source == "target" {
+                        RecommendedMappings::default()
+                    } else {
+                        RecommendedMappings::new(
+                            target,
+                            VisualizerComponentSource::simple_map(source.into()),
+                        )
+                    }
+                });
+                let defaults = native.map_or_else(|| expected.clone(), |mapping| vec![mapping]);
+                assert_eq!(
+                    recommended.all_recommendations()[&visualizer].as_slice(),
+                    defaults,
+                    "{native_source:?}, {sources:?}"
+                );
+                // Auto-spawning must use the same precedence as the recommendation list.
+                assert_eq!(
+                    recommended.into_auto_spawned()[&visualizer].as_slice(),
+                    defaults
+                );
+
+                // Matching alone is insufficient: the visualizer must also be indicated.
+                let not_indicated = ViewClassPlaceholder.recommended_visualizers_for_entity(
+                    &entity,
+                    &[(visualizer, &reason)],
+                    &Default::default(),
+                );
+                assert!(not_indicated.all_recommendations().is_empty());
+            }
+        }
+    }
+}

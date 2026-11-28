@@ -1,0 +1,62 @@
+---
+title: Changeset entry (template)
+type: feature # highlight | misc | breaking | feature
+---
+
+<!--
+══════════════════════════════════════════════════════════════════════════════
+ PER-PR CHANGESET ENTRY TEMPLATE
+
+ If your PR is labeled `include in changelog`, copy this file to
+ `upcoming/<short-slug>.md` (e.g. `upcoming/log-tick-default-off.md`) and write
+ your entry below. One file per PR — this avoids the merge conflicts you'd get
+ from everyone editing a single shared changeset.
+
+ Frontmatter:
+   title  — your entry's heading (the docs build requires every page under
+            docs/content/ to have one).
+   type   — which section the entry belongs in. One of:
+              highlight  — a flagship change worth selling at the top of the notes
+              misc       — concise user-facing information, rendered as one list item
+              breaking   — a breaking change; the entry is its migration guide
+              feature    — a user-facing feature; SHOULD link docs and/or an example
+
+ At release time, an agent merges every file in this folder into the release's
+ `changeset-0-XX.md`, grouping by `type`, then empties the folder.
+ A `misc` entry becomes one list item under `## Other`, combining its heading and body;
+ the release changeset has no headings or prose outside those list items.
+
+ Keep it short: one to three sentences on what the user can now do.
+ Leave out implementation details and anything the user doesn't need to know.
+ Stick to facts, not sales copy, and reserve `highlight` for flagship changes.
+ Features that only work against Rerun Hub, and not against the OSS server, don't get an entry.
+ If the feature is partial (e.g. data types without viewer support yet), say what doesn't work yet.
+ If the feature is experimental and may change ensure your changelog entry says so.
+ A `breaking` entry is the migration guide for its change; never edit the migration guides of past releases.
+
+ For each entry, consider:
+   * Before/after      — required in any `breaking` entry.
+   * Visual media      — required for any visual feature. Use permanent website
+                         assets with normal Markdown or HTML markup. Do not use
+                         GitHub-hosted assets or paste a URL on its own line.
+   * Docs link         — required for any new user-facing feature.
+   * Example link      — required for new SDK functionality.
+
+ Write any relative doc links as if from `changelog/` (e.g.
+ `../reference/migration/...`), since that is where this entry ends up once
+ merged. This folder is excluded from link checking for that reason.
+
+ A placeholder like `TODO(name): add docs link` is fine while iterating, but it
+ must be resolved before the release ships — the release is BLOCKED on any
+ unresolved `TODO(name)`.
+
+ Delete this comment block in your copy.
+══════════════════════════════════════════════════════════════════════════════
+-->
+
+### My new feature
+
+Short description of what changed and why a user should care.
+
+TODO(name): add docs link
+TODO(name): add example link

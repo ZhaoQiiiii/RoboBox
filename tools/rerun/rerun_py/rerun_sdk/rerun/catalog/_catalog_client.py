@@ -1,0 +1,564 @@
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import TYPE_CHECKING, overload
+
+from rerun._tracing import with_tracing
+from rerun_bindings import (
+    CatalogClientInternal,
+    format_bytes,
+)
+
+from ..error_utils import RerunIncompatibleDependencyVersionError, RerunMissingDependencyError
+from . import EntryId
+from ._location import StorageLocation, StorageLocations
+
+if TYPE_CHECKING:
+    import datafusion
+    import pyarrow as pa
+
+    from ..experimental import ObjectStoreAuth
+    from . import ChunkIndexingPolicy, DatasetEntry, TableEntry
+
+# Known FFI compatible releases of Datafusion.
+DATAFUSION_MAJOR_VERSION_COMPATIBILITY_SETS = [
+    {52},
+]
+
+
+def _are_datafusion_versions_compatible(v1: int, v2: int) -> bool:
+    """
+    Determine compatibility between two DataFusion versions.
+
+    In some rare cases, we may need to have a mismatch, e.g. in some deployed Rerun Hub docker images. So we have a
+    carefully crafted compatibility allowlist for known-to-be-ffi-compatible DataFusion releases.
+    """
+
+    if v1 == v2:
+        return True
+
+    for compat_set in DATAFUSION_MAJOR_VERSION_COMPATIBILITY_SETS:
+        if v1 in compat_set and v2 in compat_set:
+            return True
+
+    return False
+
+
+def _compatible_datafusion_version(version: int) -> list[int]:
+    """Returns a list of compatible DataFusion versions for the given version."""
+
+    for compat_set in DATAFUSION_MAJOR_VERSION_COMPATIBILITY_SETS:
+        if version in compat_set:
+            return sorted(compat_set)
+    return [version]
+
+
+@dataclass(frozen=True)
+class VersionInfo:
+    """Version and deployment information from a Rerun server."""
+
+    version: str
+    """The version string of the server."""
+
+    cloud_provider: str | None
+    """The cloud provider name (e.g. "aws", "azure"). None if not deployed on cloud."""
+
+    cloud_region: str | None
+    """The cloud region (e.g. "us-west-2", "eastus"). None if not deployed on cloud."""
+
+    features: list[str]
+    """
+    Feature flags advertised by the server.
+
+    Servers too old to advertise features return an empty list, which means "no optional features supported".
+    """
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    """Result of [`CatalogClient.benchmark`][]."""
+
+    rtt: timedelta
+    """Round-trip time to the server."""
+
+    bandwidth: float | None
+    """
+    Estimated download bandwidth from the server, in bytes per second.
+
+    `None` if the bandwidth probe was too small to be measured (e.g. a tiny payload on a fast
+    loopback connection — the elapsed time is dominated by RTT).
+    """
+
+    def __repr__(self) -> str:
+        return f"BenchmarkResult(rtt={_format_duration(self.rtt)}, bandwidth={_format_bandwidth(self.bandwidth)})"
+
+
+def _format_duration(d: timedelta) -> str:
+    seconds = d.total_seconds()
+    if seconds < 1e-3:
+        return f"{seconds * 1e6:.1f} μs"
+    if seconds < 1.0:
+        return f"{seconds * 1e3:.1f} ms"
+    return f"{seconds:.2f} s"
+
+
+def _format_bandwidth(bps: float | None) -> str:
+    if bps is None:
+        return "(too fast to measure)"
+    return f"{format_bytes(bps)}/s"
+
+
+class CatalogClient:
+    """
+    Client for a remote Rerun catalog server.
+
+    Note: the `datafusion` package is required to use this client. Initialization will fail with an error if the package
+    is not installed.
+    """
+
+    __slots__ = ("_internal",)
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        token: str | None = None,
+        object_store_auth: ObjectStoreAuth | None = None,
+    ) -> None:
+        """
+        Connect to a remote Rerun catalog server.
+
+        Parameters
+        ----------
+        url:
+            The URL of the catalog server to connect to.
+        token:
+            An optional authentication token to use when connecting to the server.
+        object_store_auth:
+            Authentication for fetching chunks directly from object storage, see
+            [`ObjectStoreAuth`][rerun.experimental.ObjectStoreAuth].
+
+        """
+
+        from importlib.metadata import version
+        from importlib.util import find_spec
+
+        if find_spec("datafusion") is None:
+            raise RerunMissingDependencyError("datafusion", "catalog")
+
+        # Check that we have a compatible version of datafusion.
+        # We need a version match because the FFI is currently unstable, see:
+        # https://github.com/apache/datafusion/issues/17374
+
+        expected_df_version = CatalogClientInternal.datafusion_major_version()
+        datafusion_version = version("datafusion")
+        datafusion_major_version = int(datafusion_version.split(".")[0])
+
+        if not _are_datafusion_versions_compatible(datafusion_major_version, expected_df_version):
+            raise RerunIncompatibleDependencyVersionError(
+                "datafusion",
+                datafusion_version,
+                _compatible_datafusion_version(expected_df_version),
+                optional_dep="catalog",
+            )
+
+        if url.startswith(("http://", "https://")):
+            logging.warning(
+                f"Use `rerun+{url}` instead of `{url}`. The `rerun+` prefix marks a Rerun data protocol URL."
+            )
+            url = f"rerun+{url}"
+
+        self._internal = CatalogClientInternal(url, token, object_store_auth)
+
+    @classmethod
+    def _from_internal(cls, internal: CatalogClientInternal) -> CatalogClient:
+        """
+        Wrap an existing internal client object.
+
+        This is an internal API and should not be used directly.
+        """
+        instance = object.__new__(cls)
+        instance._internal = internal
+        return instance
+
+    def __repr__(self) -> str:
+        return self._internal.__repr__()
+
+    @property
+    def url(self) -> str:
+        """Returns the catalog URL."""
+        return self._internal.url
+
+    @with_tracing("CatalogClient.get_storage_locations")
+    def _get_storage_locations(self) -> StorageLocations:
+        """List storage locations, sorted by alias."""
+        raw = self._internal.get_storage_locations()
+        return StorageLocations(
+            locations=[StorageLocation(**location) for location in raw["locations"]],
+            default_alias=raw["default_alias"],
+        )
+
+    def version_info(self) -> VersionInfo:
+        """
+        Returns version and deployment information from the server.
+
+        Returns a `VersionInfo` object with `version`, `cloud_provider`, `cloud_region`, and `features` fields.
+        Cloud fields are `None` if the server is not deployed on a cloud provider.
+        """
+        version, cloud_provider, cloud_region, features = self._internal.version_info()
+        return VersionInfo(version=version, cloud_provider=cloud_provider, cloud_region=cloud_region, features=features)
+
+    @with_tracing("CatalogClient.benchmark")
+    def benchmark(self, *, num_bytes: int = 16 * 1024 * 1024, num_pings: int = 5) -> BenchmarkResult:
+        """
+        Measure round-trip time and download bandwidth to the server.
+
+        The RTT is estimated as the minimum elapsed time across `num_pings` 1-byte requests
+        (using the minimum rejects latency spikes from scheduling jitter or transient network
+        congestion). Bandwidth is measured by downloading `num_bytes` of pseudo-random
+        (incompressible) bytes, subtracting the RTT from the elapsed time, and dividing by the
+        payload size.
+
+        Parameters
+        ----------
+        num_bytes
+            Total payload size to download from the server when measuring bandwidth.
+        num_pings
+            How many 1-byte requests to send when estimating RTT.
+
+        Examples
+        --------
+        ```python
+        client = rr.catalog.CatalogClient("…")
+        print(client.benchmark())  # BenchmarkResult(rtt=12.0 ms, bandwidth=112.0 MiB/s)
+        ```
+
+        """
+        rtt_seconds = self._internal.rtt_seconds(num_pings)
+        bandwidth = self._internal.bandwidth_bytes_per_sec(num_bytes, rtt_seconds)
+        return BenchmarkResult(rtt=timedelta(seconds=rtt_seconds), bandwidth=bandwidth)
+
+    # TODO(RR-5830): Make optional by handing out structured storage urls.
+    # TODO(RR-6198): Accept binary readers and chunk iterators:
+    # - Upload sources of unknown length with multipart; S3 rejects chunked PUT bodies.
+    # - Bound read-ahead/retry buffers; hold the GIL only for Python reads.
+    # - Keep multipart handling in Rust and return only after completion.
+    @with_tracing("CatalogClient.stage")
+    def stage(self, source: str | os.PathLike[str] | bytes, *, key: str) -> str:
+        """
+        Upload one object to the catalog's storage and return its storage URL.
+
+        !!! note
+            ⚠️ This API is experimental and may change in future versions! ⚠️
+
+        This call blocks until the upload succeeds.
+        It does not validate recording contents, create a dataset, or register the object.
+        Pass the returned URL to [`DatasetEntry.register`][rerun.catalog.DatasetEntry.register] to register it separately.
+        Registration does not move or consume the object, and a failed registration does not remove it.
+        Staging does not provide automatic cleanup.
+
+        Parameters
+        ----------
+        source:
+            A local file path or the object's bytes.
+            File contents must remain unchanged until the upload completes.
+        key:
+            The object's key within catalog storage, for example `project/run-001/recording.rrd`.
+            Existing objects cannot be overwritten.
+            Use a unique key for each upload.
+
+        Returns
+        -------
+        str
+            The credential-free storage URL of the uploaded object.
+
+        Raises
+        ------
+        ValueError
+            If the key or upload size is invalid.
+        OSError
+            If the source cannot be opened or read.
+        RuntimeError
+            If the upload fails or staging is unavailable on the server.
+
+        Examples
+        --------
+        ```python
+        uri = client.stage("recording.rrd", key="project/run-001/recording.rrd")
+        dataset.register([uri]).wait()
+        ```
+
+        """
+        if isinstance(source, bytes):
+            return self._internal.stage_bytes(source, key=key, upload_method="auto")
+        return self._internal.stage_file(os.fspath(source), key=key, upload_method="auto")
+
+    def entries(self, *, include_hidden: bool = False) -> list[DatasetEntry | TableEntry]:
+        """
+        Returns a list of all entries in the catalog.
+
+        Parameters
+        ----------
+        include_hidden
+            If True, include hidden entries (blueprint and asset datasets, and system tables like `__entries`).
+
+        """
+        return self.datasets(include_hidden=include_hidden) + self.tables(include_hidden=include_hidden)
+
+    def datasets(self, *, include_hidden: bool = False) -> list[DatasetEntry]:
+        """
+        Returns a list of all dataset entries in the catalog.
+
+        Parameters
+        ----------
+        include_hidden
+            If True, include hidden datasets (blueprint and asset datasets).
+
+        """
+        from . import DatasetEntry
+
+        return [DatasetEntry(internal) for internal in self._internal.datasets(include_hidden=include_hidden)]
+
+    def tables(self, *, include_hidden: bool = False) -> list[TableEntry]:
+        """
+        Returns a list of all table entries in the catalog.
+
+        Parameters
+        ----------
+        include_hidden
+            If True, include system tables (e.g., `__entries`).
+
+        """
+        from . import TableEntry
+
+        return [TableEntry(internal) for internal in self._internal.tables(include_hidden=include_hidden)]
+
+    # ---
+
+    def entry_names(self, *, include_hidden: bool = False) -> list[str]:
+        """
+        Returns a list of all entry names in the catalog.
+
+        Parameters
+        ----------
+        include_hidden
+            If True, include hidden entries (blueprint datasets and system tables like `__entries`).
+
+        """
+        return [e.name for e in self.entries(include_hidden=include_hidden)]
+
+    def dataset_names(self, *, include_hidden: bool = False) -> list[str]:
+        """
+        Returns a list of all dataset names in the catalog.
+
+        Parameters
+        ----------
+        include_hidden
+            If True, include blueprint datasets.
+
+        """
+        return [d.name for d in self.datasets(include_hidden=include_hidden)]
+
+    def table_names(self, *, include_hidden: bool = False) -> list[str]:
+        """
+        Returns a list of all table names in the catalog.
+
+        Parameters
+        ----------
+        include_hidden
+            If True, include system tables (e.g., `__entries`).
+
+        """
+        return [t.name for t in self.tables(include_hidden=include_hidden)]
+
+    # ---
+
+    @overload
+    def get_dataset(self, *, id: EntryId | str) -> DatasetEntry: ...
+
+    @overload
+    def get_dataset(self, name: str) -> DatasetEntry: ...
+
+    def get_dataset(self, name: str | None = None, *, id: EntryId | str | None = None) -> DatasetEntry:
+        """
+        Returns a dataset by its ID or name.
+
+        Exactly one of `id` or `name` must be provided.
+
+        Parameters
+        ----------
+        name
+            The name of the dataset.
+        id
+            The unique identifier of the dataset. Can be an `EntryId` object or its string representation.
+
+        """
+        from . import DatasetEntry
+
+        return DatasetEntry(self._internal.get_dataset(self._resolve_name_or_id(id, name, entry_kind="dataset")))
+
+    @overload
+    def get_table(self, *, id: EntryId | str) -> TableEntry: ...
+
+    @overload
+    def get_table(self, name: str) -> TableEntry: ...
+
+    def get_table(self, name: str | None = None, *, id: EntryId | str | None = None) -> TableEntry:
+        """
+        Returns a table by its ID or name.
+
+        Exactly one of `id` or `name` must be provided.
+
+        Parameters
+        ----------
+        name
+            The name of the table.
+        id
+            The unique identifier of the table. Can be an `EntryId` object or its string representation.
+
+        """
+        from . import TableEntry
+
+        return TableEntry(self._internal.get_table(self._resolve_name_or_id(id, name, entry_kind="table")))
+
+    # ---
+
+    def create_dataset(
+        self, name: str, *, exist_ok: bool = False, chunk_indexing_policy: ChunkIndexingPolicy | None = None
+    ) -> DatasetEntry:
+        """
+        Creates a new dataset with the given name.
+
+        Entry names must be non-empty ASCII strings of at most 180 characters.
+        They may contain alphanumeric characters, underscores, hyphens, dots, colons, spaces, and brackets.
+
+        Parameters
+        ----------
+        name
+            The name of the dataset to create.
+        exist_ok
+            If True, return the existing dataset if it already exists; otherwise, raise an error.
+        chunk_indexing_policy
+            Entity paths and timelines to index. Each dimension is a list of names or `"all"`.
+            Entity path rules such as `/world/**` raise `ValueError`.
+            A new dataset has no schema to match them against.
+            `None` indexes everything.
+            Only Rerun Hub applies the policy. The OSS server stores it and ignores it.
+            With `exist_ok=True`, an existing dataset keeps its policy.
+
+        Raises
+        ------
+        AlreadyExistsError
+            If a dataset with the given name already exists and `exist_ok` is False.
+
+        """
+
+        from rerun_bindings import AlreadyExistsError
+
+        from . import DatasetEntry
+
+        try:
+            policy = None
+            if chunk_indexing_policy is not None:
+                policy = (chunk_indexing_policy.entity_paths, chunk_indexing_policy.timelines)
+            return DatasetEntry(self._internal.create_dataset(name, chunk_indexing_policy=policy))
+        except AlreadyExistsError:
+            if not exist_ok:
+                raise
+            return self.get_dataset(name)
+
+    def register_table(self, name: str, url: str) -> TableEntry:
+        """
+        Registers a foreign Lance table (identified by its URL) as a new table entry with the given name.
+
+        Parameters
+        ----------
+        name
+            The name of the table entry to create. It must be unique within all entries in the catalog. An exception
+            will be raised if an entry with the same name already exists.
+
+            Entry names must be non-empty ASCII strings of at most 180 characters.
+            They may contain alphanumeric characters, underscores, hyphens, dots, colons, spaces, and brackets.
+
+        url
+            The URL of the Lance table to register.
+
+        """
+        from . import TableEntry
+
+        return TableEntry(self._internal.register_table(name, url))
+
+    def create_table(self, name: str, schema: pa.Schema, url: str | None = None) -> TableEntry:
+        """
+        Create and register a new table.
+
+        Parameters
+        ----------
+        name
+            The name of the table entry to create. It must be unique within all entries in the catalog. An exception
+            will be raised if an entry with the same name already exists.
+
+            Entry names must be non-empty ASCII strings of at most 180 characters.
+            They may contain alphanumeric characters, underscores, hyphens, dots, colons, spaces, and brackets.
+
+        schema
+            The schema of the table to create.
+
+        url
+            The URL of the directory for where to store the Lance table. If provided, the table will be stored in a
+            globally unique subdirectory. If not provided, the server will use an automatically generated URL based on
+            its configured writable storage. On Rerun Hub, custom table URLs are currently not supported: the request
+            will be rejected unless this parameter is None.
+
+        """
+        from . import TableEntry
+
+        return TableEntry(self._internal.create_table(name, schema, url))
+
+    def do_global_maintenance(self) -> None:
+        """Perform maintenance tasks on the whole system."""
+        return self._internal.do_global_maintenance()
+
+    @property
+    def ctx(self) -> datafusion.SessionContext:
+        """
+        Returns a DataFusion session context for querying the catalog.
+
+        Catalog tables can be queried by name with `ctx.sql()`.
+        To query a dataset with SQL, register a `reader()` dataframe with `ctx.register_view()`.
+        """
+
+        return self._internal.ctx()
+
+    # ---
+
+    def _resolve_name_or_id(
+        self,
+        id: EntryId | str | None = None,
+        name: str | None = None,
+        *,
+        entry_kind: str = "entry",
+    ) -> EntryId:
+        """Helper method to resolve either ID or name. Returns the id or throw an error."""
+
+        match id, name:
+            case (None, None):
+                raise ValueError("Either 'id' or 'name' must be provided.")
+
+            case (EntryId(), None):
+                return id
+
+            case (str(id), None):
+                return EntryId(id)
+
+            case (None, str(name)):
+                try:
+                    return self._internal._entry_id_from_entry_name(name)
+                except LookupError:
+                    raise LookupError(f"No {entry_kind} found with name {name!r}") from None
+
+            case _:
+                raise ValueError("Only one of 'id' or 'name' must be provided.")

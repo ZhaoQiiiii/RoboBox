@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import TYPE_CHECKING, TypeAlias
+
+import numpy as np
+
+from rerun_bindings import (
+    format_bytes,
+    format_index_value,
+    format_uint,
+    timeline_datatype,
+    timeline_type_from_datatype,
+)
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+    from rerun_bindings import DatasetInfoInternal
+
+TimelineValue: TypeAlias = np.int64 | np.datetime64 | np.timedelta64
+
+
+class TimelineKind(StrEnum):
+    """
+    The kind of values a timeline holds, which fixes the Arrow datatype of its index column.
+
+    Attributes:
+        SEQUENCE: Integer steps, such as frame numbers, stored as `int64`.
+        DURATION: Nanoseconds relative to an arbitrary origin, stored as `duration[ns]`.
+        TIMESTAMP: Nanoseconds since the Unix epoch, stored as `timestamp[ns]`.
+
+    """
+
+    SEQUENCE = "sequence"
+    DURATION = "duration"
+    TIMESTAMP = "timestamp"
+
+    @property
+    def datatype(self) -> pa.DataType:
+        """The Arrow datatype of index columns of this kind, with no timezone for timestamps."""
+        return timeline_datatype(self.value)
+
+    @classmethod
+    def from_datatype(cls, datatype: pa.DataType) -> TimelineKind:
+        """
+        The kind of timeline an index column of this Arrow datatype holds.
+
+        Timestamps match with any timezone, since their values are UTC regardless.
+        Raises `ValueError` for any other datatype, including other time units.
+        """
+        name = timeline_type_from_datatype(datatype)
+        if name is None:
+            raise ValueError(f"Not a timeline datatype: {datatype}; expected int64, duration[ns], or timestamp[ns]")
+        return cls(name)
+
+
+@dataclass(frozen=True)
+class LayerInfo:
+    """Information about one layer of a dataset."""
+
+    name: str
+    num_segments: int
+    """Number of distinct segments that have this layer."""
+
+    def __repr__(self) -> str:
+        return f"LayerInfo({self._describe()})"
+
+    def _describe(self) -> str:
+        return f"{self.name}: in {_count(self.num_segments, 'segment')}"
+
+
+@dataclass(frozen=True)
+class TimelineInfo:
+    """Information about one timeline of a dataset, aggregated over its segments."""
+
+    name: str
+    kind: TimelineKind
+    num_segments: int
+    """Number of segments with data on this timeline, at least 1."""
+
+    min: TimelineValue
+    """Smallest index value across segments, with nanosecond precision for timestamps and durations."""
+
+    max: TimelineValue
+    """Largest index value across segments, with nanosecond precision for timestamps and durations."""
+
+    def __repr__(self) -> str:
+        return f"TimelineInfo({self._describe()})"
+
+    def _describe(self) -> str:
+        bounds = f"{_format_value(self.kind, self.min)} … {_format_value(self.kind, self.max)}"
+        return f"{self.name}: {self.kind}, {bounds}, in {_count(self.num_segments, 'segment')}"
+
+
+@dataclass(frozen=True)
+class DatasetInfo:
+    """
+    Overview of a dataset, as returned by [`DatasetEntry.info`][rerun.catalog.DatasetEntry.info] and [`DatasetSelection.info`][rerun.catalog.DatasetSelection.info].
+
+    The repr is a compact text overview; the fields are for programmatic use.
+    A segment with several layers counts once in `num_segments` and once per layer in `layers`.
+    """
+
+    dataset_name: str
+    num_segments: int
+    size_bytes: int
+    """Total size of the selected segments, including entities that content filters leave out."""
+
+    layers: frozenset[LayerInfo]
+    timelines: frozenset[TimelineInfo]
+    """The timelines that at least one selected segment has data on, covering all of its entities whatever the content filters."""
+
+    num_entities: int
+    """Number of selected entity paths, excluding properties."""
+
+    num_component_columns: int
+    """Number of component columns of the selected entities, excluding properties."""
+
+    property_columns: frozenset[str]
+    """Names of the dataset's segment table property columns, whatever the selection."""
+
+    def __repr__(self) -> str:
+        header = f"{self.dataset_name}: {_count(self.num_segments, 'segment')}, {format_bytes(self.size_bytes)}"
+        entities = _count(self.num_entities, "entity", "entities")
+        columns = _count(self.num_component_columns, "component column")
+        lines = [
+            f"DatasetInfo({header})",
+            f"  contents: {entities}, {columns}",
+            f"  properties: {', '.join(sorted(self.property_columns)) or '(none)'}",
+        ]
+        if self.layers:
+            lines.append("  layers:")
+            lines.extend(f"    {layer._describe()}" for layer in sorted(self.layers, key=lambda layer: layer.name))
+        if self.timelines:
+            lines.append("  timelines:")
+            lines.extend(
+                f"    {timeline._describe()}" for timeline in sorted(self.timelines, key=lambda timeline: timeline.name)
+            )
+        return "\n".join(lines)
+
+
+def _dataset_info_from_internal(info: DatasetInfoInternal) -> DatasetInfo:
+    return DatasetInfo(
+        dataset_name=info.dataset_name,
+        num_segments=info.num_segments,
+        size_bytes=info.size_bytes,
+        layers=frozenset(LayerInfo(name=name, num_segments=count) for name, count in info.layers),
+        timelines=frozenset(
+            TimelineInfo(
+                name=name,
+                kind=kind,
+                num_segments=count,
+                min=_to_numpy(kind, min_ns),
+                max=_to_numpy(kind, max_ns),
+            )
+            for name, kind_str, count, min_ns, max_ns in info.timelines
+            for kind in [TimelineKind(kind_str)]
+        ),
+        num_entities=info.num_entities,
+        num_component_columns=info.num_component_columns,
+        property_columns=frozenset(info.property_columns),
+    )
+
+
+def _to_numpy(kind: TimelineKind, value: int) -> TimelineValue:
+    match kind:
+        case TimelineKind.SEQUENCE:
+            return np.int64(value)
+        case TimelineKind.DURATION:
+            return np.timedelta64(value, "ns")
+        case TimelineKind.TIMESTAMP:
+            return np.datetime64(value, "ns")
+
+
+def _count(n: int, singular: str, plural: str | None = None) -> str:
+    noun = singular if n == 1 else (plural or f"{singular}s")
+    return f"{format_uint(n)} {noun}"
+
+
+def _format_value(kind: TimelineKind, value: TimelineValue) -> str:
+    if isinstance(value, np.datetime64):
+        nanos = int(value.astype("datetime64[ns]").astype(np.int64))
+    elif isinstance(value, np.timedelta64):
+        nanos = int(value.astype("timedelta64[ns]").astype(np.int64))
+    else:
+        nanos = int(value)
+    return format_index_value(kind.value, nanos)

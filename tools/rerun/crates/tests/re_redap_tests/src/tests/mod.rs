@@ -1,0 +1,264 @@
+mod column_projection;
+pub mod common;
+mod create_dataset;
+mod create_table;
+mod dataset_schema;
+mod entries_table;
+mod entry_id_header;
+mod fetch_chunks;
+mod find_chunks;
+mod find_entries_filters;
+mod get_schemas;
+mod multi_store;
+mod protocol_level;
+mod query_dataset;
+mod query_filter;
+mod query_index_values;
+mod register_asset;
+mod register_segment;
+mod rrd_manifest;
+mod scan_filter;
+mod segment_id_override;
+mod unregister_segment;
+mod update_entry;
+mod watch_events;
+mod write_table;
+
+/// Runs a test body with snapshots resolved from this crate's directory.
+async fn with_snapshot_dir<F: std::future::Future>(test: F) -> F::Output {
+    let mut settings = insta::Settings::clone_current();
+    if std::path::Path::new(file!()).is_absolute() {
+        settings.set_snapshot_path(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/snapshots"));
+    }
+    settings.bind_async(test).await
+}
+
+/// Generate wrappers and the `generate_redap_tests!`/`generate_oss_only_redap_tests!`
+/// instantiation macros.
+///
+/// Takes three semicolon-separated lists:
+///   - First list: tests whose bodies return `()`.
+///   - Second list: tests whose bodies return `anyhow::Result<()>` (wrapped with `.expect`).
+///   - Third list: like the second, but only instantiated by `generate_oss_only_redap_tests!`,
+///     for features the cloud server does not implement yet.
+///
+/// The `dead_code` lint fires if a test is accidentally omitted from all lists.
+macro_rules! define_redap_tests {
+    (
+        $( $mod:ident :: $test:ident ),* $(,)?
+        ;
+        $( $rmod:ident :: $rtest:ident ),* $(,)?
+        ;
+        $( $omod:ident :: $otest:ident ),* $(,)?
+    ) => {
+        $(
+            pub async fn $test<T>(service: T)
+            where
+                T: re_protos::cloud::v1alpha1::rerun_cloud_service_server::RerunCloudService,
+            {
+                with_snapshot_dir($mod::$test(service)).await;
+            }
+        )*
+
+        $(
+            pub async fn $rtest<T>(service: T)
+            where
+                T: re_protos::cloud::v1alpha1::rerun_cloud_service_server::RerunCloudService,
+            {
+                with_snapshot_dir($rmod::$rtest(service)).await.expect(stringify!($rtest));
+            }
+        )*
+
+        $(
+            pub async fn $otest<T>(service: T)
+            where
+                T: re_protos::cloud::v1alpha1::rerun_cloud_service_server::RerunCloudService,
+            {
+                with_snapshot_dir($omod::$otest(service)).await.expect(stringify!($otest));
+            }
+        )*
+
+        #[macro_export]
+        macro_rules! generate_redap_tests {
+            ($builder:ident) => {
+                $(
+                    #[tokio::test]
+                    async fn $test() {
+                        $crate::$test($builder().await).await
+                    }
+                )*
+                $(
+                    #[tokio::test]
+                    async fn $rtest() {
+                        $crate::$rtest($builder().await).await
+                    }
+                )*
+            };
+        }
+
+        /// Tests for features only implemented by the OSS server (`re_server`) so far.
+        #[macro_export]
+        macro_rules! generate_oss_only_redap_tests {
+            ($builder:ident) => {
+                $(
+                    #[tokio::test]
+                    async fn $otest() {
+                        $crate::$otest($builder().await).await
+                    }
+                )*
+            };
+        }
+    };
+}
+
+define_redap_tests! {
+    column_projection::test_dataset_manifest_column_projections,
+    column_projection::test_segment_table_column_projections,
+    create_dataset::create_dataset_tests,
+    create_table::create_table_entry,
+    create_table::create_table_entry_duplicate_url,
+    create_table::create_table_entry_failed_does_not_leak_name,
+    dataset_schema::empty_dataset_schema,
+    dataset_schema::simple_dataset_schema,
+    entries_table::delete_table_deletes_attached_blueprint_dataset,
+    entries_table::entries_table_with_empty_dataset,
+    entries_table::list_entries_table,
+    entry_id_header::deprecated_body_id_endpoints_accept_body_only,
+    entry_id_header::deprecated_body_id_endpoints_accept_header_only,
+    fetch_chunks::multi_dataset_fetch_chunk_completeness,
+    fetch_chunks::simple_dataset_fetch_chunk_snapshot,
+    find_chunks::find_chunks_fixed_schema,
+    find_chunks::find_chunks_invalid_requests,
+    find_chunks::find_chunks_range_bounds,
+    find_chunks::find_chunks_samples,
+    find_chunks::find_chunks_samples_resolve_clear_after_last_value,
+    find_chunks::find_chunks_samples_return_statics_and_resolve_like_full_store,
+    find_chunks::find_chunks_samples_shared_chunk_ids,
+    find_chunks::find_chunks_segment_scope,
+    find_chunks::find_chunks_simple_dataset,
+    find_chunks::find_chunks_with_layers,
+    find_entries_filters::find_entries_asset_by_id_requires_explicit_kind,
+    find_entries_filters::find_entries_asset_by_name_requires_explicit_kind,
+    find_entries_filters::find_entries_default_excludes_asset_datasets,
+    find_entries_filters::find_entries_entry_kinds_exact,
+    find_entries_filters::find_entries_entry_kinds_multi_kind_name_lookup,
+    find_entries_filters::find_entries_entry_kinds_rejects_unspecified,
+    find_entries_filters::find_entries_ignores_unknown_entry_kinds,
+    find_entries_filters::find_entries_legacy_entry_kind_miss_returns_empty,
+    find_entries_filters::find_entries_legacy_entry_kind_still_works,
+    find_entries_filters::find_entries_rejects_legacy_unspecified,
+    get_schemas::get_schemas,
+    get_schemas::get_schemas_empty_request,
+    get_schemas::get_schemas_invalid_id,
+    get_schemas::get_schemas_other_dataset_id,
+    get_schemas::get_schemas_too_many_ids,
+    protocol_level::dataset_with_segment_id_override_refuses_older_clients,
+    protocol_level::new_dataset_serves_clients_without_protocol_level,
+    protocol_level::who_am_i_advertises_protocol_level,
+    query_dataset::query_dataset_unknown_segment_id_returns_empty,
+    query_dataset::query_dataset_has_uncompressed_sizes,
+    query_dataset::query_dataset_matches_find_chunks,
+    query_dataset::query_dataset_with_various_queries,
+    query_dataset::query_empty_dataset,
+    query_dataset::query_simple_dataset,
+    query_dataset::query_simple_dataset_with_layers,
+    query_filter::query_dataset_entity_without_filtered_timeline_reads_null,
+    query_filter::query_dataset_foreign_selection_timeline_matches_oracle,
+    query_filter::query_dataset_or_of_ranges_fans_out,
+    query_filter::query_dataset_or_of_ranges_fans_out_query_dataset_path,
+    query_filter::query_dataset_or_with_empty_branch_and_projection,
+    query_filter::query_dataset_projection_narrows_components_without_view_contents,
+    query_filter::query_dataset_range_filter_with_and_without_latest_at_fill,
+    query_filter::query_dataset_simple_filter,
+    query_filter::query_dataset_with_limit,
+    query_index_values::query_dataset_emits_per_segment_pushdown,
+    query_index_values::query_dataset_emits_per_segment_pushdown_query_dataset_path,
+    query_index_values::query_dataset_index_values,
+    query_index_values::query_dataset_index_values_query_dataset_path,
+    query_index_values::query_dataset_per_segment_values_wire_level,
+    query_index_values::query_dataset_per_segment_values_validation_rejected,
+    query_index_values::query_dataset_per_segment_values_empty_entity_paths_short_circuits,
+    register_asset::asset_dataset_enforces_segment_size_limit,
+    register_asset::asset_dataset_rejects_temporal_recording,
+    register_asset::blueprint_dataset_enforces_segment_size_limit,
+    register_asset::deleting_dataset_deletes_asset_dataset,
+    register_asset::get_assets_for_segment_rejects_non_recording_dataset,
+    register_asset::get_assets_for_segment_returns_registered_assets,
+    register_asset::get_assets_for_segment_filters_by_properties,
+    register_asset::get_assets_for_segment_treats_missing_properties_as_opt_out,
+    register_asset::set_segment_properties_changes_asset_coverage_without_registering,
+    register_asset::set_segment_properties_refuses_a_stale_revision,
+    register_asset::set_segment_properties_rejects_a_multi_row_batch,
+    register_asset::get_segment_properties_reads_several_segments,
+    register_asset::get_segment_properties_rejects_an_empty_request,
+    register_asset::delete_segment_properties_drops_them,
+    register_asset::unregistering_a_segment_preserves_its_properties,
+    register_asset::dropping_the_last_layer_of_a_segment_preserves_its_properties,
+    register_segment::register_and_attach_table_blueprint_dataset,
+    register_segment::register_and_scan_blueprint_dataset,
+    register_segment::register_and_scan_empty_dataset,
+    register_segment::register_and_scan_simple_dataset,
+    register_segment::register_and_scan_simple_dataset_multiple_timelines,
+    register_segment::register_and_scan_simple_dataset_with_layers,
+    register_segment::register_and_scan_simple_dataset_with_properties,
+    register_segment::register_and_scan_simple_dataset_with_properties_out_of_order,
+    register_segment::register_bad_file_uri_should_error,
+    register_segment::register_bad_rrd_file_should_error,
+    register_segment::register_conflicting_property_schema,
+    register_segment::register_conflicting_schema,
+    register_segment::register_conflicting_schema_filters_segment_table,
+    register_segment::register_conflicting_schema_same_segment_filters_layer,
+    register_segment::register_empty_request,
+    register_segment::register_fully_skipped,
+    register_segment::register_intra_request_duplicates,
+    register_segment::register_non_rrd_file_should_error,
+    register_segment::register_segment_bumps_timestamp,
+    register_segment::register_with_dataset_if_duplicate_behavior_overwrite,
+    register_segment::register_with_dataset_if_duplicate_behavior_skip,
+    register_segment::register_with_prefix,
+    scan_filter::scan_segment_table_filter,
+    scan_filter::scan_dataset_manifest_filter,
+    scan_filter::scan_dataset_manifest_layer_filter,
+    segment_id_override::register_with_segment_id_override,
+    segment_id_override::segment_id_override_raises_required_client_protocol_level,
+    rrd_manifest::segment_id_not_found,
+    rrd_manifest::simple_dataset_rrd_manifest,
+    rrd_manifest::unregistered_segment,
+    rrd_manifest::layered_segment,
+    rrd_manifest::layered_segment_stress,
+    unregister_segment::unregister_invalid_args,
+    unregister_segment::unregister_layer_drops_its_logged_properties,
+    unregister_segment::unregister_missing_dataset,
+    unregister_segment::unregister_missing_segment,
+    unregister_segment::unregister_products,
+    unregister_segment::unregister_segment_drops_its_logged_properties,
+    unregister_segment::unregister_simple,
+    unregister_segment::unregister_then_query,
+    update_entry::apply_dataset_policy_stores_the_policy,
+    update_entry::create_dataset_entry_rejects_an_unset_selection,
+    update_entry::update_dataset_entry_keeps_asset_dataset,
+    update_entry::update_dataset_entry_keeps_policy,
+    update_entry::update_dataset_entry_rejects_invalid_asset_details,
+    update_entry::update_dataset_entry_rejects_invalid_blueprint_details,
+    update_entry::update_dataset_entry_replaces_deleted_asset_dataset,
+    update_entry::update_entry_bumps_timestamp,
+    update_entry::update_entry_tests,
+    update_entry::update_table_entry_blueprint_details,
+    update_entry::update_table_entry_rejects_invalid_blueprint_details,
+    write_table::write_table,
+    write_table::write_table_rejects_bad_batches,
+    ; // Tests that return `anyhow::Result<()>`:
+    register_asset::asset_dataset_enforces_segment_limit,
+    register_asset::asset_dataset_segment_limit_counts_layers,
+    register_segment::register_with_dataset_if_duplicate_behavior_error,
+    ; // OSS-only tests:
+    find_chunks::find_chunks_dispatch_follows_advertised_capabilities,
+    // TODO(RR-6283): the cloud server returns `Unimplemented` for a data source with a store id.
+    multi_store::register_store_by_id,
+    multi_store::register_store_by_id_rejects_unusable_store,
+    // The cloud server registers only the first store of a file, so it accepts this.
+    segment_id_override::register_multi_store_file_with_segment_id_override,
+    // TODO(RR-4859): the cloud server returns `Unimplemented` for `WatchEvents`.
+    watch_events::watch_events_entry_created,
+    watch_events::watch_events_entry_deleted,
+}

@@ -1,0 +1,1061 @@
+//! Main entry-point of the web app.
+
+#![allow(clippy::allow_attributes, clippy::mem_forget)] // False positives from #[wasm_bindgen] macro
+
+use std::rc::Rc;
+use std::str::FromStr as _;
+
+use ahash::HashMap;
+use arrow::array::RecordBatch;
+use itertools::Itertools as _;
+use re_async::AsyncRuntimeHandle;
+use re_log::ResultExt as _;
+use re_log_channel::{LogSender, RecordingOpenBehavior};
+use re_log_msg::TableMsg;
+use re_log_types::TableId;
+use re_memory::AccountingAllocator;
+use re_viewer_context::{SystemCommand, SystemCommandSender as _, viewer_url};
+use serde::Deserialize;
+use wasm_bindgen::prelude::*;
+
+use crate::saving::RrdSnapshot;
+use crate::web_history::install_popstate_listener;
+use crate::web_tools::{Callback, StringOrStringArray};
+
+#[global_allocator]
+static GLOBAL: AccountingAllocator<std::alloc::System> =
+    AccountingAllocator::new(std::alloc::System);
+
+#[wasm_bindgen]
+pub struct WebHandle {
+    runner: eframe::WebRunner,
+
+    /// A dedicated smart channel used by the [`WebHandle::add_rrd_from_bytes`] API.
+    ///
+    /// This exists because the direct bytes API is expected to submit many small RRD chunks
+    /// and allocating a new tx pair for each chunk doesn't make sense.
+    log_senders: HashMap<String, LogSender>,
+
+    /// Carries [`WebHandle::viewer_control`] requests to the viewer.
+    ///
+    /// Opened on the first request.
+    viewer_control_tx: std::cell::RefCell<Option<LogSender>>,
+
+    /// The connection registry to use for the viewer.
+    connection_registry: re_redap_client::ConnectionRegistryHandle,
+
+    app_options: AppOptions,
+}
+
+#[wasm_bindgen]
+impl WebHandle {
+    #[allow(
+        clippy::allow_attributes,
+        clippy::new_without_default,
+        clippy::use_self
+    )] // Can't use `Self` here because of `#[wasm_bindgen]`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(app_options: JsValue) -> Result<WebHandle, JsValue> {
+        re_log::setup_logging();
+
+        let app_options: Option<AppOptions> = serde_wasm_bindgen::from_value(app_options)?;
+
+        // Don't use persistent credentials when running tests
+        let connection_registry = if integration_test() {
+            re_redap_client::ConnectionRegistry::new_without_stored_credentials()
+        } else {
+            re_redap_client::ConnectionRegistry::new_with_stored_credentials()
+        };
+        let catalog = crate::internal_catalog::build(re_build_info::build_info!());
+        let connection_registry = connection_registry
+            .with_internal(catalog.connection.clone(), catalog.storage_dir().to_owned());
+
+        Ok(Self {
+            runner: eframe::WebRunner::new(),
+            log_senders: Default::default(),
+            viewer_control_tx: Default::default(),
+            connection_registry,
+            app_options: app_options.unwrap_or_default(),
+        })
+    }
+
+    #[wasm_bindgen]
+    pub async fn start(&self, canvas: JsValue) -> Result<(), wasm_bindgen::JsValue> {
+        let main_thread_token = crate::MainThreadToken::i_promise_i_am_on_the_main_thread();
+
+        let canvas = if let Some(canvas_id) = canvas.as_string() {
+            // For backwards compatibility with old JS/HTML written before 2024-08-30
+            let document = web_sys::window()
+                .ok_or_else(|| "Failed to get window. Are we not in a browser?".to_owned())?
+                .document()
+                .ok_or_else(|| {
+                    "Failed to get window.document. Are we not in a browser?".to_owned()
+                })?;
+            let element = document
+                .get_element_by_id(&canvas_id)
+                .ok_or_else(|| format!("Canvas element '{canvas_id}' not found."))?;
+            element
+                .dyn_into::<web_sys::HtmlCanvasElement>()
+                .map_err(|element| {
+                    format!("Expected a canvas element or canvas id, got {element:?}")
+                })?
+        } else {
+            canvas
+                .dyn_into::<web_sys::HtmlCanvasElement>()
+                .map_err(|element| {
+                    format!("Expected a canvas element or canvas id, got {element:?}")
+                })?
+        };
+
+        let app_options = self.app_options.clone();
+        let web_options = eframe::WebOptions {
+            wgpu_options: crate::wgpu_options(app_options.render_backend.as_deref()),
+            depth_buffer: 0,
+            dithering: true,
+            ..Default::default()
+        };
+
+        let connection_registry = self.connection_registry.clone();
+        self.runner
+            .start(
+                canvas,
+                web_options,
+                Box::new(move |cc| {
+                    Ok(Box::new(create_app(
+                        main_thread_token,
+                        cc,
+                        connection_registry,
+                        app_options,
+                    )?))
+                }),
+            )
+            .await?;
+
+        re_log::debug!("Web app started.");
+
+        Ok(())
+    }
+
+    /// Handle an encoded `egui_inspection` request.
+    #[wasm_bindgen]
+    pub async fn inspect(&self, request_bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+        let egui_ctx = {
+            let Some(app) = self.runner.app_mut::<crate::App>() else {
+                return Err(JsValue::from_str("Viewer is not running"));
+            };
+            app.egui_ctx.clone()
+        };
+
+        let (reply_tx, reply_rx) = futures::channel::oneshot::channel();
+        crate::app::serve_egui_inspect_request(
+            &egui_ctx,
+            request_bytes,
+            re_log_channel::UiCallback::new(move |result| {
+                reply_tx.send(result).ok();
+            }),
+        );
+
+        reply_rx
+            .await
+            .map_err(|futures::channel::oneshot::Canceled| {
+                JsValue::from_str("Inspection request produced no reply")
+            })?
+            .map_err(|err| {
+                JsValue::from_str(&format!("Failed to encode inspection response: {err}"))
+            })
+    }
+
+    /// Perform one operation of the [`ViewerControlService`] API, defined by `viewer_control.proto`.
+    ///
+    /// Takes an encoded [`ViewerControlRequest`], and resolves to the encoded
+    /// [`ViewerControlResponse`].
+    /// A failed operation rejects with an `Error` named `ViewerControlError`, whose `code` property
+    /// is the gRPC status code of the failure, e.g. `NOT_FOUND`.
+    ///
+    /// Not an `async fn`: that would borrow `self` until the viewer answers, and every `&mut self`
+    /// method, like `open_channel`, would fail while a request is pending.
+    ///
+    /// [`ViewerControlService`]: re_protos::viewer_control::v1alpha1::viewer_control_service_server::ViewerControlService
+    /// [`ViewerControlRequest`]: re_protos::viewer_control::v1alpha1::ViewerControlRequest
+    /// [`ViewerControlResponse`]: re_protos::viewer_control::v1alpha1::ViewerControlResponse
+    #[wasm_bindgen(unchecked_return_type = "Promise<Uint8Array>")]
+    pub fn viewer_control(&self, request_bytes: &[u8]) -> js_sys::Promise {
+        use re_log_channel::ViewerControlErrorCode;
+        use re_protos::external::prost::Message as _;
+        use re_protos::viewer_control::v1alpha1::ViewerControlRequest;
+
+        let reply_rx = ViewerControlRequest::decode(request_bytes)
+            .map_err(|err| {
+                viewer_control_error(
+                    "INVALID_ARGUMENT",
+                    &format!("Failed to decode `ViewerControlRequest`: {err}"),
+                )
+            })
+            .and_then(|request| self.send_viewer_control(request));
+        let reply_rx = match reply_rx {
+            Ok(reply_rx) => reply_rx,
+            Err(err) => return js_sys::Promise::reject(&err),
+        };
+
+        wasm_bindgen_futures::future_to_promise(async move {
+            let response = reply_rx
+                .await
+                .map_err(|err| {
+                    viewer_control_error(
+                        "INTERNAL",
+                        &format!("Viewer dropped the request without answering: {err}"),
+                    )
+                })?
+                .map_err(|err| {
+                    let code = match err.code {
+                        ViewerControlErrorCode::InvalidArgument => "INVALID_ARGUMENT",
+                        ViewerControlErrorCode::NotFound => "NOT_FOUND",
+                        ViewerControlErrorCode::FailedPrecondition => "FAILED_PRECONDITION",
+                        ViewerControlErrorCode::Internal => "INTERNAL",
+                    };
+                    viewer_control_error(code, &err.message)
+                })?;
+
+            Ok(js_sys::Uint8Array::from(response.encode_to_vec().as_slice()).into())
+        })
+    }
+
+    /// The encoded `GetStateResponse` of the Viewer Control API, computed right away.
+    ///
+    /// Unlike [`Self::viewer_control`], this doesn't wait for the next frame,
+    /// so it can back synchronous JS APIs.
+    #[wasm_bindgen]
+    pub fn viewer_state(&self) -> Result<Vec<u8>, JsValue> {
+        use re_protos::external::prost::Message as _;
+
+        let Some(mut app) = self.runner.app_mut::<crate::App>() else {
+            return Err(viewer_control_error(
+                "FAILED_PRECONDITION",
+                "Viewer is not running, or is busy painting a frame",
+            ));
+        };
+        Ok(app.viewer_state().encode_to_vec())
+    }
+
+    #[wasm_bindgen]
+    pub fn toggle_panel_overrides(&self, value: Option<bool>) {
+        let Some(mut app) = self.runner.app_mut::<crate::App>() else {
+            return;
+        };
+
+        match value {
+            Some(value) => app.panel_state_overrides.enabled = value,
+            None => app.panel_state_overrides.enabled ^= true,
+        }
+
+        // request repaint, because the overrides may cause panels to expand/collapse
+        app.egui_ctx.request_repaint();
+    }
+
+    #[wasm_bindgen]
+    pub fn override_panel_state(&self, panel: &str, state: Option<String>) -> Result<(), JsValue> {
+        let Some(mut app) = self.runner.app_mut::<crate::App>() else {
+            return Ok(());
+        };
+
+        let panel = Panel::from_str(panel)
+            .map_err(|err| js_sys::TypeError::new(&format!("invalid panel: {err}")))?;
+
+        let state = match state {
+            Some(state) => Some(
+                PanelState::from_str(&state)
+                    .map_err(|err| js_sys::TypeError::new(&format!("invalid state: {err}")))?
+                    .into(),
+            ),
+            None => None,
+        };
+
+        let overrides = &mut app.panel_state_overrides.overrides;
+        match panel {
+            Panel::Top => overrides.top = state,
+            Panel::Blueprint => overrides.blueprint = state,
+            Panel::Selection => overrides.selection = state,
+            Panel::Time => overrides.time = state,
+        }
+
+        // request repaint, because the overrides may cause panels to expand/collapse
+        app.egui_ctx.request_repaint();
+
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn destroy(&self) {
+        self.runner.destroy();
+    }
+
+    /// Encode the active recording as RRD data.
+    #[wasm_bindgen]
+    pub fn save_recording(&self) -> Result<Vec<u8>, JsValue> {
+        let app = self
+            .runner
+            .app_mut::<crate::App>()
+            .ok_or_else(|| JsValue::from_str("Viewer is not running"))?;
+        let recording_id = app
+            .active_recording_id()
+            .cloned()
+            .ok_or_else(|| JsValue::from_str("No active recording to save"))?;
+        let recording = app
+            .store_hub
+            .entity_db(&recording_id)
+            .ok_or_else(|| JsValue::from_str("Active recording is unavailable"))?;
+
+        RrdSnapshot::recording(recording, None)
+            .encode()
+            .map_err(|err| JsValue::from_str(&format!("Failed to save recording: {err}")))
+    }
+
+    /// Encode the active blueprint as RRD data.
+    #[wasm_bindgen]
+    pub fn save_blueprint(&self) -> Result<Vec<u8>, JsValue> {
+        let app = self
+            .runner
+            .app_mut::<crate::App>()
+            .ok_or_else(|| JsValue::from_str("Viewer is not running"))?;
+        let recording_id = app
+            .active_recording_id()
+            .cloned()
+            .ok_or_else(|| JsValue::from_str("No active recording for blueprint"))?;
+        let blueprint = app
+            .store_hub
+            .active_blueprint_for_app(recording_id.application_id())
+            .ok_or_else(|| JsValue::from_str("No active blueprint to save"))?;
+        let undo_state = app.stores.blueprint_undo_state.get(blueprint.store_id());
+
+        RrdSnapshot::blueprint(blueprint, undo_state)
+            .and_then(RrdSnapshot::encode)
+            .map_err(|err| JsValue::from_str(&format!("Failed to save blueprint: {err}")))
+    }
+
+    #[wasm_bindgen]
+    pub fn has_panicked(&self) -> bool {
+        self.runner.panic_summary().is_some()
+    }
+
+    #[wasm_bindgen]
+    pub fn panic_message(&self) -> Option<String> {
+        self.runner.panic_summary().map(|s| s.message())
+    }
+
+    #[wasm_bindgen]
+    pub fn panic_callstack(&self) -> Option<String> {
+        self.runner.panic_summary().map(|s| s.callstack())
+    }
+
+    /// Add a new receiver streaming data from the given url.
+    ///
+    /// Websocket streams are always opened in `Following` mode.
+    ///
+    /// It is an error to open a channel twice with the same id.
+    #[wasm_bindgen]
+    pub fn add_receiver(&self, url: &str) {
+        let Some(app) = self.runner.app_mut::<crate::App>() else {
+            return;
+        };
+
+        match url.parse::<viewer_url::ViewerUrl>() {
+            Ok(url) => {
+                url.open(
+                    &app.egui_ctx,
+                    &viewer_url::OpenUrlOptions {
+                        recording_open_behavior: RecordingOpenBehavior::OpenAndSelect,
+                        show_loader: true,
+                    },
+                    &app.command_sender,
+                );
+            }
+            Err(err) => {
+                re_log::warn!(?url, "Failed to open URL: {err}");
+            }
+        }
+    }
+
+    /// Open a new channel for streaming data.
+    ///
+    /// It is an error to open a channel twice with the same id.
+    #[wasm_bindgen]
+    pub fn open_channel(&mut self, id: &str, channel_name: &str) {
+        let Some(mut app) = self.runner.app_mut::<crate::App>() else {
+            return;
+        };
+
+        if self.log_senders.contains_key(id) {
+            re_log::warn!("Channel with id '{}' already exists.", id);
+            return;
+        }
+
+        let (log_tx, log_rx) = re_log_channel::log_channel(re_log_channel::LogSource::JsChannel {
+            channel_name: channel_name.to_owned(),
+        });
+
+        app.add_log_receiver(log_rx);
+        self.log_senders.insert(id.to_owned(), log_tx);
+    }
+
+    /// Close an existing channel for streaming data.
+    ///
+    /// No-op if the channel is already closed.
+    #[wasm_bindgen]
+    pub fn close_channel(&mut self, id: &str) {
+        let Some(app) = self.runner.app_mut::<crate::App>() else {
+            return;
+        };
+
+        if let Some(log_tx) = self.log_senders.remove(id) {
+            log_tx
+                .quit(None)
+                .warn_on_err_once("Failed to send quit marker");
+        }
+
+        // Request a repaint since closing the channel may update the top bar.
+        app.egui_ctx
+            .request_repaint_after(std::time::Duration::from_millis(10));
+    }
+
+    /// Add an rrd to the viewer directly from a byte array.
+    #[wasm_bindgen]
+    pub fn send_rrd_to_channel(&self, id: &str, data: &[u8]) {
+        use std::ops::ControlFlow;
+        use std::sync::Arc;
+        let Some(app) = self.runner.app_mut::<crate::App>() else {
+            return;
+        };
+
+        if let Some(log_tx) = self.log_senders.get(id) {
+            let log_tx = log_tx.clone();
+            let data: Vec<u8> = data.to_vec();
+
+            let egui_ctx = app.egui_ctx.clone();
+
+            let ui_waker = Box::new(move || {
+                // Spend a few more milliseconds decoding incoming messages,
+                // then trigger a repaint (https://github.com/rerun-io/rerun/issues/963):
+                egui_ctx.request_repaint_after(std::time::Duration::from_millis(10));
+            });
+
+            re_log_encoding::rrd::stream_from_http::web_decode::decode_rrd(
+                data,
+                Arc::new({
+                    move |msg| {
+                        ui_waker();
+                        use re_log_encoding::rrd::stream_from_http::HttpMessage;
+                        match msg {
+                            HttpMessage::LogMsg(msg) => {
+                                if log_tx.send(msg.into()).is_ok() {
+                                    ControlFlow::Continue(())
+                                } else {
+                                    re_log::info_once!("Failed to dispatch log message to viewer.");
+                                    ControlFlow::Break(())
+                                }
+                            }
+                            // TODO(jleibs): Unclear what we want to do here. More data is coming.
+                            HttpMessage::Success => ControlFlow::Continue(()),
+                            HttpMessage::Failure(err) => {
+                                log_tx
+                                    .quit(Some(Box::new(err)))
+                                    .warn_on_err_once("Failed to send quit marker");
+                                ControlFlow::Break(())
+                            }
+                        }
+                    }
+                }),
+            );
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn send_table_to_channel(&self, id: &str, data: &[u8]) {
+        let Some(app) = self.runner.app_mut::<crate::App>() else {
+            return;
+        };
+
+        if let Some(log_tx) = self.log_senders.get(id) {
+            let log_tx = log_tx.clone();
+
+            let cursor = std::io::Cursor::new(data);
+            let stream_reader = match arrow::ipc::reader::StreamReader::try_new(cursor, None) {
+                Ok(stream_reader) => stream_reader,
+                Err(err) => {
+                    re_log::error_once!("Failed to interpret data as IPC-encoded arrow: {err}");
+                    return;
+                }
+            };
+
+            let mut batches: Vec<_> = match stream_reader.try_collect() {
+                Ok(batches) => batches,
+                Err(err) => {
+                    re_log::error_once!("Could not read from IPC stream: {err}");
+                    return;
+                }
+            };
+
+            if batches.len() != 1 {
+                re_log::warn_once!("Expected exactly one record batch, got {}", batches.len());
+                return;
+            }
+
+            let record_batch = batches.remove(0);
+
+            let msg = match table_msg_from_record_batch(record_batch) {
+                Ok(msg) => msg,
+                Err(err) => {
+                    re_log::error_once!("Failed to decode Arrow message: {err}");
+                    return;
+                }
+            };
+
+            let egui_ctx = app.egui_ctx.clone();
+
+            match log_tx.send(msg.into()) {
+                Ok(()) => egui_ctx.request_repaint_after(std::time::Duration::from_millis(10)),
+                Err(err) => {
+                    re_log::info_once!("Failed to dispatch log message to viewer: {err}");
+                }
+            }
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn set_credentials(&self, access_token: &str, email: &str) {
+        let Some(mut app) = self.runner.app_mut::<crate::App>() else {
+            return;
+        };
+        let crate::AppCore {
+            command_sender,
+            egui_ctx,
+            ..
+        } = &mut **app;
+
+        command_sender.send_system(SystemCommand::SetAuthCredentials {
+            access_token: access_token.to_owned(),
+            email: email.to_owned(),
+        });
+        egui_ctx.request_repaint();
+    }
+}
+
+// TODO(jprochazk): figure out a way to auto-generate these types on JS side
+
+// Keep in sync with the `Panel` typedef in `rerun_js/web-viewer/index.js`
+#[derive(Clone, Deserialize, strum_macros::EnumString)]
+#[strum(serialize_all = "snake_case")]
+enum Panel {
+    Top,
+    Blueprint,
+    Selection,
+    Time,
+}
+
+// Keep in sync with the `PanelState` typedef in `rerun_js/web-viewer/index.js`
+#[derive(Clone, Deserialize, strum_macros::EnumString)]
+#[strum(serialize_all = "snake_case")]
+enum PanelState {
+    Hidden,
+    Collapsed,
+    Expanded,
+}
+
+impl From<PanelState> for re_sdk_types::blueprint::components::PanelState {
+    fn from(value: PanelState) -> Self {
+        match value {
+            PanelState::Hidden => Self::Hidden,
+            PanelState::Collapsed => Self::Collapsed,
+            PanelState::Expanded => Self::Expanded,
+        }
+    }
+}
+
+// Keep in sync with the `AppOptions` interface in `rerun_js/web-viewer/index.ts`.
+#[derive(Clone, Default, Deserialize)]
+// `WebViewer.start` passes its camelCase options through without converting the keys,
+// and `web_viewer/index.html` uses the same keys.
+// JavaScript built against older `@rerun-io/web-viewer` releases passes snake_case keys,
+// so every renamed field needs a snake_case alias.
+// Callers must pass one spelling per key: passing both is a deserialization error.
+#[serde(rename_all = "camelCase")]
+pub struct AppOptions {
+    #[serde(alias = "manifest_url")]
+    manifest_url: Option<String>,
+
+    #[serde(alias = "render_backend")]
+    render_backend: Option<String>,
+
+    #[serde(alias = "video_decoder")]
+    video_decoder: Option<String>,
+
+    #[serde(alias = "memory_limit")]
+    memory_limit: Option<String>,
+
+    #[serde(alias = "hide_welcome_screen")]
+    hide_welcome_screen: Option<bool>,
+
+    #[serde(alias = "check_for_updates_on_startup")]
+    check_for_updates_on_startup: Option<bool>,
+    // allow_fullscreen: Option<bool>, // Not serialized from js as it governs how the `fullscreen` option is used.
+    #[serde(alias = "enable_history")]
+    enable_history: Option<bool>,
+    // width: Option<String>, // Width & height aren't serialized and only used to configure the canvas.
+    // height: Option<String>,
+    #[serde(alias = "fallback_token")]
+    fallback_token: Option<String>,
+    theme: Option<String>,
+    login: Option<crate::LoginOptions>,
+    analytics: Option<String>,
+
+    // Hidden `WebViewerOptions`
+    // ------------
+    #[serde(alias = "viewer_base_url")]
+    viewer_base_url: Option<String>,
+    notebook: Option<bool>,
+    url: Option<StringOrStringArray>,
+
+    #[serde(alias = "panel_state_overrides")]
+    panel_state_overrides: Option<PanelStateOverrides>,
+
+    #[serde(alias = "on_viewer_event")]
+    on_viewer_event: Option<Callback>,
+    fullscreen: Option<FullscreenOptions>,
+}
+
+/// The web counterpart of the native viewer's first-run analytics disclaimer.
+///
+/// Shown until the user has had the chance to read it once in this browser.
+fn show_analytics_notice(command_sender: &crate::CommandSender) {
+    use re_ui::notifications::{Notification, NotificationAction, NotificationLevel};
+
+    let turn_off_sender = command_sender.clone();
+    let is_first_run = re_analytics::Analytics::global_or_init()
+        .is_some_and(|analytics| analytics.config().is_first_run());
+    let text = if is_first_run {
+        "We collect usage data to improve our products, never the data you view. \
+         Nothing is sent during this first visit, so you can turn it off first. \
+         [Privacy policy](https://rerun.io/privacy). Change anytime in Settings."
+    } else {
+        "We collect usage data to improve our products, never the data you view. \
+         [Privacy policy](https://rerun.io/privacy). Change anytime in Settings."
+    };
+    let notification = Notification::new(NotificationLevel::Info, text)
+        .with_action(NotificationAction::new("Turn off analytics", move || {
+            match re_analytics::set_user_switch(re_analytics::AnalyticsSwitch::Disabled) {
+                Ok(()) => {
+                    turn_off_sender.send_system(SystemCommand::ShowNotification(
+                        Notification::new(
+                            NotificationLevel::Success,
+                            "Analytics turned off. You can turn them back on in Settings.",
+                        ),
+                    ));
+                }
+                Err(err) => re_log::warn!("Failed to save the analytics setting: {err}"),
+            }
+        }))
+        .show_once(egui::Id::unique("web_analytics_notice"));
+    command_sender.send_system(SystemCommand::ShowNotification(notification));
+}
+
+/// The embedder's `analytics` option; unset means [`re_analytics::AnalyticsMode::On`].
+///
+/// An unknown value turns analytics off, so a typo never turns tracking on.
+fn parse_analytics_mode(value: Option<&str>) -> re_analytics::AnalyticsMode {
+    match value.map(str::parse) {
+        None => re_analytics::AnalyticsMode::default(),
+        Some(Ok(mode)) => mode,
+        Some(Err(err)) => {
+            re_log::warn_once!("{err}; turning analytics off");
+            re_analytics::AnalyticsMode::Off
+        }
+    }
+}
+
+// Keep in sync with the `FullscreenOptions` interface in `rerun_js/web-viewer/index.ts`
+#[derive(Clone, Deserialize)]
+// JavaScript callers pass camelCase or snake_case keys, like for `AppOptions`.
+#[serde(rename_all = "camelCase")]
+pub struct FullscreenOptions {
+    /// This returns the current fullscreen state, which is a boolean representing on/off.
+    #[serde(alias = "get_state")]
+    pub get_state: Callback,
+
+    /// This calls the JS version of "toggle fullscreen".
+    #[serde(alias = "on_toggle")]
+    pub on_toggle: Callback,
+}
+
+#[derive(Clone, Default, Deserialize)]
+pub struct PanelStateOverrides {
+    top: Option<PanelState>,
+    blueprint: Option<PanelState>,
+    selection: Option<PanelState>,
+    time: Option<PanelState>,
+}
+
+impl From<PanelStateOverrides> for crate::app_blueprint::PanelStateOverrides {
+    fn from(value: PanelStateOverrides) -> Self {
+        Self {
+            top: value.top.map(|v| v.into()),
+            blueprint: value.blueprint.map(|v| v.into()),
+            selection: value.selection.map(|v| v.into()),
+            time: value.time.map(|v| v.into()),
+        }
+    }
+}
+
+fn create_app(
+    main_thread_token: crate::MainThreadToken,
+    cc: &eframe::CreationContext<'_>,
+    connection_registry: re_redap_client::ConnectionRegistryHandle,
+    app_options: AppOptions,
+) -> Result<crate::App, re_renderer::RenderContextError> {
+    let build_info = re_build_info::build_info!();
+
+    // Don't persist storage when running tests.
+    let integration_test = integration_test();
+
+    let app_env = if integration_test {
+        crate::AppEnvironment::Test
+    } else {
+        crate::AppEnvironment::Web {
+            url: cc.integration_info.web_info.location.url.clone(),
+        }
+    };
+
+    let AppOptions {
+        viewer_base_url,
+        url,
+        manifest_url,
+        render_backend,
+        video_decoder,
+        memory_limit,
+        hide_welcome_screen,
+        check_for_updates_on_startup,
+        panel_state_overrides,
+        on_viewer_event,
+        fullscreen,
+        enable_history,
+
+        notebook,
+
+        fallback_token,
+        theme,
+        login,
+        analytics,
+    } = app_options;
+
+    let analytics_mode = parse_analytics_mode(analytics.as_deref());
+
+    if let Some(fallback_token) = fallback_token {
+        match re_auth::Jwt::try_from(fallback_token) {
+            Ok(token) => connection_registry.set_fallback_token(token),
+            Err(err) => {
+                re_log::warn!("Failed to parse JWT token: {err}");
+            }
+        }
+    }
+
+    let enable_history = enable_history.unwrap_or(false);
+
+    let video_decoder_hw_acceleration = video_decoder.and_then(|s| match s.parse() {
+        Err(()) => {
+            re_log::warn_once!("Failed to parse --video-decoder value: {s}. Ignoring.");
+            None
+        }
+        Ok(hw_accell) => Some(hw_accell),
+    });
+
+    let startup_options = crate::StartupOptions {
+        location: Some(cc.integration_info.web_info.location.clone()),
+        // Don't persist state in integration-test mode.
+        persist_state: !integration_test,
+        check_for_updates_on_startup,
+        is_in_notebook: notebook.unwrap_or(false),
+        expect_data_soon: None,
+        force_wgpu_backend: render_backend.clone(),
+        video_decoder_hw_acceleration,
+        hide_welcome_screen: hide_welcome_screen.unwrap_or(false),
+
+        on_event: on_viewer_event.clone().map(|on_event| {
+            Rc::new(move |event: crate::ViewerEvent| {
+                let Some(event) = serde_json::to_string(&event).ok_or_log_error() else {
+                    return;
+                };
+                on_event.call1(&JsValue::from_str(&event)).ok_or_log_error();
+            }) as crate::event::ViewerEventCallback
+        }),
+
+        fullscreen_options: fullscreen.clone(),
+        panel_state_overrides: panel_state_overrides.unwrap_or_default().into(),
+
+        enable_history,
+        viewer_base_url,
+        login,
+        analytics_mode,
+    };
+    crate::customize_eframe_and_setup_renderer(cc)?;
+
+    let mut app = crate::App::new(
+        main_thread_token,
+        build_info,
+        app_env,
+        startup_options,
+        cc,
+        Some(connection_registry),
+        AsyncRuntimeHandle::from_current_tokio_runtime_or_wasmbindgen().expect("Infallible on web"),
+    );
+
+    // `App::new` has enabled analytics for this mode, so `is_enabled` is now meaningful.
+    if analytics_mode.allows_analytics() && re_analytics::is_enabled() {
+        show_analytics_notice(&app.command_sender);
+    }
+
+    // An explicit web option takes precedence over the restored theme preference.
+    if let Some(theme) = theme {
+        match theme.to_ascii_lowercase().as_str() {
+            "dark" => app
+                .egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::Dark),
+            "light" => app
+                .egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::Light),
+            "system" => app
+                .egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::System),
+            _ => {
+                re_log::warn!(
+                    "Ignoring unknown `theme` value {theme:?}; expected `dark`, `light`, or `system`."
+                );
+            }
+        }
+    }
+
+    // An explicit web option takes precedence over the restored memory limit.
+    if let Some(memory_limit) = memory_limit {
+        match re_memory::MemoryLimit::parse(&memory_limit) {
+            Ok(limit) => {
+                let default_limit = re_memory::MemoryLimit::default_for_current_platform();
+                app.app_options_mut().memory_limit = if default_limit.as_bytes() < limit.as_bytes()
+                {
+                    re_log::warn!(
+                        "Memory limit of {limit} is above the web viewer's maximum of {default_limit}. Using {default_limit} instead."
+                    );
+                    default_limit
+                } else {
+                    limit
+                };
+            }
+            Err(err) => {
+                re_log::warn!("Ignoring bad `memory_limit` value {memory_limit:?}: {err}");
+            }
+        }
+    }
+
+    if enable_history {
+        install_popstate_listener(&mut app).ok_or_log_error();
+    }
+
+    if let Some(manifest_url) = manifest_url {
+        app.set_examples_manifest_url(manifest_url);
+    }
+
+    if let Some(urls) = url {
+        for url in urls.into_inner() {
+            match url.parse::<viewer_url::ViewerUrl>() {
+                Ok(url) => {
+                    url.open(
+                        &app.egui_ctx,
+                        &viewer_url::OpenUrlOptions {
+                            recording_open_behavior: RecordingOpenBehavior::OpenAndSelect,
+                            show_loader: true,
+                        },
+                        &app.command_sender,
+                    );
+                }
+                Err(err) => {
+                    re_log::warn!(?url, "Failed to open URL: {err}");
+                }
+            }
+        }
+    }
+
+    Ok(app)
+}
+
+/// Whether we are running inside a test.
+///
+/// Set via the `integration_test` url query param in integration tests.
+fn integration_test() -> bool {
+    let Some(search) = web_sys::window().and_then(|w| w.location().search().ok()) else {
+        return false;
+    };
+    web_sys::UrlSearchParams::new_with_str(&search)
+        .is_ok_and(|params| params.has("integration_test"))
+}
+
+/// Where the answer to a [`WebHandle::viewer_control`] request lands.
+type ViewerControlReply = futures::channel::oneshot::Receiver<
+    Result<
+        re_protos::viewer_control::v1alpha1::ViewerControlResponse,
+        re_log_channel::ViewerControlError,
+    >,
+>;
+
+impl WebHandle {
+    /// Hand a request to the viewer, and return where its answer will land.
+    fn send_viewer_control(
+        &self,
+        request: re_protos::viewer_control::v1alpha1::ViewerControlRequest,
+    ) -> Result<ViewerControlReply, JsValue> {
+        let Some(mut app) = self.runner.app_mut::<crate::App>() else {
+            return Err(viewer_control_error(
+                "FAILED_PRECONDITION",
+                "Viewer is not running, or is busy painting a frame",
+            ));
+        };
+
+        let (reply_tx, reply_rx) = futures::channel::oneshot::channel();
+        let mut viewer_control_tx = self.viewer_control_tx.borrow_mut();
+        let viewer_control_tx = viewer_control_tx.get_or_insert_with(|| {
+            let (tx, rx) = re_log_channel::log_channel(re_log_channel::LogSource::JsChannel {
+                channel_name: "viewer_control".to_owned(),
+            });
+            app.add_log_receiver(rx);
+            tx
+        });
+        viewer_control_tx
+            .send(re_log_channel::DataSourceMessage::ViewerControl(
+                re_log_channel::ViewerControlCommand::ViewerControl {
+                    request,
+                    on_done: re_log_channel::UiCallback::new(move |result| {
+                        reply_tx.send(result).ok();
+                    }),
+                },
+            ))
+            .map_err(|err| {
+                viewer_control_error("INTERNAL", &format!("Viewer stopped listening: {err}"))
+            })?;
+        app.egui_ctx.request_repaint();
+
+        Ok(reply_rx)
+    }
+}
+
+/// A JS `ViewerControlError` with the gRPC status `code`, for a failed [`WebHandle::viewer_control`].
+fn viewer_control_error(code: &str, message: &str) -> JsValue {
+    let error = js_sys::Error::new(message);
+    error.set_name("ViewerControlError");
+    js_sys::Reflect::set(&error, &"code".into(), &code.into()).ok();
+    error.into()
+}
+
+/// Used to set the "email" property in the analytics config,
+/// in the same way as `rerun analytics email YOURNAME@rerun.io`.
+///
+/// This one just panics when it fails, as it's only ever really run
+/// by rerun employees manually in `app.rerun.io`.
+#[cfg(feature = "analytics")]
+#[allow(clippy::allow_attributes, clippy::unwrap_used)] // This is only run by rerun employees, so it's fine to panic
+#[wasm_bindgen]
+pub fn set_email(email: String) {
+    let mut config = re_analytics::Config::load().unwrap().unwrap_or_default();
+    config.opt_in_metadata.insert("email".into(), email.into());
+
+    config.save().unwrap();
+}
+
+/// Returns the [`TableMsg`] back from a encoded record batch.
+// This is required to send bytes around in the notebook.
+// If you ever change this, you also need to adapt `notebook.py` too.
+fn table_msg_from_record_batch(
+    mut data: RecordBatch,
+) -> Result<TableMsg, Box<dyn std::error::Error>> {
+    let id = data
+        .schema_metadata_mut()
+        .remove("__table_id")
+        .ok_or("encoded record batch is missing `__table_id` metadata.")?;
+
+    Ok(TableMsg {
+        id: TableId::new(id),
+        data,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::ArrowError;
+    use arrow::array::{RecordBatch, RecordBatchOptions};
+
+    use super::*;
+
+    /// Returns the [`TableMsg`] encoded as a record batch.
+    // This is required to send bytes to a viewer running in a notebook.
+    // If you ever change this, you also need to adapt `notebook.py` too.
+    pub fn to_arrow_encoded(table: &TableMsg) -> Result<RecordBatch, ArrowError> {
+        let current_schema = table.data.schema();
+        let mut metadata = current_schema.metadata().clone();
+        metadata.insert("__table_id".to_owned(), table.id.as_str().to_owned());
+
+        // Create a new schema with the updated metadata
+        let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            current_schema.fields().clone(),
+            metadata,
+        ));
+
+        // Create a new record batch with the same data but updated schema
+        RecordBatch::try_new_with_options(
+            new_schema,
+            table.data.columns().to_vec(),
+            &RecordBatchOptions::default(),
+        )
+    }
+
+    #[test]
+    fn table_msg_encoded_roundtrip() {
+        use arrow::array::{ArrayRef, StringArray, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let data = {
+            let schema = Arc::new(Schema::new_with_metadata(
+                vec![
+                    Field::new("id", DataType::UInt64, false),
+                    Field::new("name", DataType::Utf8, false),
+                ],
+                Default::default(),
+            ));
+
+            // Create a UInt64 array
+            let id_array = UInt64Array::from(vec![1, 2, 3, 4, 5]);
+
+            // Create a String array
+            let name_array = StringArray::from(vec![
+                "Alice",
+                "Bob",
+                "Charlie",
+                "Dave",
+                "http://www.rerun.io",
+            ]);
+
+            // Convert arrays to ArrayRef (trait objects)
+            let arrays: Vec<ArrayRef> = vec![
+                Arc::new(id_array) as ArrayRef,
+                Arc::new(name_array) as ArrayRef,
+            ];
+
+            // Create a RecordBatch
+            ArrowRecordBatch::try_new_with_options(schema, arrays, &RecordBatchOptions::default())
+                .unwrap()
+        };
+
+        let msg = TableMsg {
+            id: TableId::new("test123".to_owned()),
+            data,
+        };
+
+        let encoded = to_arrow_encoded(&msg).expect("to encoded failed");
+        let decoded = table_msg_from_record_batch(encoded).expect("from concatenated failed");
+
+        assert_eq!(msg, decoded);
+    }
+}

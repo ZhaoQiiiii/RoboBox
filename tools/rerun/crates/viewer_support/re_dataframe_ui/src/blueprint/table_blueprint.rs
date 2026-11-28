@@ -1,0 +1,352 @@
+use re_log_types::TimelineName;
+use re_sdk_types::blueprint::archetypes::{
+    CardLayout as CardLayoutArchetype, PreviewsConfig as PreviewsConfigArchetype,
+    TableBlueprint as TableBlueprintArchetype, TableLayout as TableLayoutArchetype,
+};
+use re_sdk_types::blueprint::components::{
+    ColumnDisplayMode, ColumnName, PlayState, PlaybackSpeed, SortBy as BlueprintSortBy,
+    SqlFilterExpression, TableLayoutKind, TimelineFraction, TimelineName as BlueprintTimelineName,
+};
+use re_types_core::Archetype as _;
+use re_viewer_context::{AppBlueprintCtx, BlueprintContext as _};
+
+use crate::SortBy;
+use crate::blueprint::{CardLayout, TableColumn, TableLayout};
+use crate::datafusion_table_widget::{DataColumns, TableColumnHeuristic};
+
+/// Shared configuration for preview columns in every layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewsConfig {
+    pub timeline: Option<TimelineName>,
+
+    /// Whether every preview plays, as set by the play-all button.
+    pub playing: bool,
+
+    /// Playback speed of every preview, as a multiple of real time.
+    pub playback_speed: f32,
+
+    /// Where every preview starts, from 0.0 at the start of the recording to 1.0 at the end.
+    pub start_point: f64,
+}
+
+impl Default for PreviewsConfig {
+    fn default() -> Self {
+        Self {
+            timeline: None,
+            playing: false,
+            playback_speed: 1.0,
+            start_point: *TimelineFraction::default().0,
+        }
+    }
+}
+
+impl PreviewsConfig {
+    /// Write whether every preview plays, taking effect next frame.
+    pub fn save_playing(blueprint_ctx: &AppBlueprintCtx<'_>, playing: bool) {
+        let play_state = if playing {
+            PlayState::Playing
+        } else {
+            PlayState::Paused
+        };
+        blueprint_ctx.save_blueprint_archetype(
+            "/table".into(),
+            &PreviewsConfigArchetype::update_fields().with_play_state(play_state),
+        );
+    }
+
+    /// Write the playback speed of every preview, taking effect next frame.
+    pub fn save_playback_speed(blueprint_ctx: &AppBlueprintCtx<'_>, speed: f32) {
+        blueprint_ctx.save_blueprint_archetype(
+            "/table".into(),
+            &PreviewsConfigArchetype::update_fields().with_playback_speed(speed as f64),
+        );
+    }
+}
+
+/// The sort of a table and where it comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedSortBy {
+    /// The sort stored in the table blueprint.
+    Blueprint(SortBy),
+
+    /// The default sort, used when the table blueprint has no sort.
+    Default(SortBy),
+}
+
+impl ResolvedSortBy {
+    pub fn sort_by(&self) -> &SortBy {
+        match self {
+            Self::Blueprint(sort_by) | Self::Default(sort_by) => sort_by,
+        }
+    }
+}
+
+/// Resolved runtime configuration for presenting a table.
+///
+/// Initial values are loaded from registered blueprint archetypes and completed from the table's
+/// schema and runtime heuristics.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TableBlueprint<'a> {
+    /// The currently selected layout.
+    ///
+    /// If unset, defaults to card layout if available.
+    /// `Cards` falls back to table layout when no [`CardLayout`] is configured.
+    layout: Option<TableLayoutKind>,
+
+    pub column_display_mode: ColumnDisplayMode,
+
+    /// SQL expressions that select the shown rows.
+    pub filters: Vec<String>,
+
+    /// The column the rows are sorted by.
+    ///
+    /// `None` when neither the blueprint nor the default has a sort.
+    pub sort_by: Option<ResolvedSortBy>,
+
+    /// Shared configuration for preview columns in every layout.
+    pub previews_config: PreviewsConfig,
+
+    /// The configuration for displaying rows and columns.
+    pub table_layout: TableLayout<'a>,
+
+    /// The optional configuration for displaying records as cards.
+    pub card_layout: Option<CardLayout<'a>>,
+}
+
+impl<'a> TableBlueprint<'a> {
+    /// Load the table blueprint and resolve its layouts against the table schema and data.
+    ///
+    /// `default_sort_by` is used when the blueprint has no sort.
+    pub fn load_and_resolve(
+        blueprint_ctx: &AppBlueprintCtx<'_>,
+        data_columns: &'a DataColumns<'a>,
+        additional_column_heuristics: &TableColumnHeuristic<'_>,
+        default_sort_by: Option<&SortBy>,
+    ) -> Self {
+        re_tracing::profile_function!();
+
+        let results = blueprint_ctx.latest_at_in_current_blueprint(
+            &"/table".into(),
+            std::iter::chain(
+                TableBlueprintArchetype::all_component_identifiers(),
+                PreviewsConfigArchetype::all_component_identifiers(),
+            ),
+        );
+
+        let column_display_mode = results
+            .component_mono(TableBlueprintArchetype::descriptor_column_display_mode().component)
+            .unwrap_or_default();
+        // Default labels are resolved here based on display mode, so that computation of unique
+        // names stays efficient
+        let column_labels = data_columns.compute_labels(column_display_mode);
+        let column_heuristics: TableColumnHeuristic<'_> = Box::new(|layout, desc, column| {
+            let column = additional_column_heuristics(layout, desc, column);
+            if let Some(index) = data_columns.index_by_physical_name(column.physical_name()) {
+                column.with_default_display_name(&column_labels[index])
+            } else {
+                column
+            }
+        });
+
+        let sort_by = results
+            .component_mono::<BlueprintSortBy>(
+                TableBlueprintArchetype::descriptor_sort_by().component,
+            )
+            .map(|sort_by| ResolvedSortBy::Blueprint(sort_by.into()))
+            .or_else(|| default_sort_by.cloned().map(ResolvedSortBy::Default));
+
+        // TODO(andreas): Should we only resolve the active layout?
+        Self {
+            column_display_mode,
+            filters: Self::load_filters(blueprint_ctx),
+            sort_by,
+            layout: results.component_mono(TableBlueprintArchetype::descriptor_layout().component),
+            previews_config: PreviewsConfig {
+                timeline: results
+                    .component_mono::<BlueprintTimelineName>(
+                        PreviewsConfigArchetype::descriptor_timeline().component,
+                    )
+                    .and_then(|timeline| TimelineName::try_new(timeline.as_str()).ok()),
+                playing: results
+                    .component_mono::<PlayState>(
+                        PreviewsConfigArchetype::descriptor_play_state().component,
+                    )
+                    .is_some_and(|play_state| play_state != PlayState::Paused),
+                playback_speed: results
+                    .component_mono::<PlaybackSpeed>(
+                        PreviewsConfigArchetype::descriptor_playback_speed().component,
+                    )
+                    .map_or(1.0, |speed| **speed as f32),
+                start_point: results
+                    .component_mono::<TimelineFraction>(
+                        PreviewsConfigArchetype::descriptor_start_point().component,
+                    )
+                    .map(|fraction| **fraction)
+                    .filter(|fraction| fraction.is_finite())
+                    .map_or_else(
+                        || *TimelineFraction::default().0,
+                        |fraction| fraction.clamp(0.0, 1.0),
+                    ),
+            },
+            table_layout: TableLayout::load_and_resolve(
+                blueprint_ctx,
+                data_columns,
+                &column_heuristics,
+            ),
+            card_layout: CardLayout::load_and_resolve(
+                blueprint_ctx,
+                data_columns,
+                &column_heuristics,
+            ),
+        }
+    }
+
+    /// Write the complete column order for a layout while preserving resolved visibility.
+    ///
+    /// This will be in effect next frame.
+    pub fn save_column_order<'column>(
+        blueprint_ctx: &AppBlueprintCtx<'_>,
+        layout: TableLayoutKind,
+        columns: impl IntoIterator<Item = &'column TableColumn<'column>>,
+    ) {
+        let column_order = columns.into_iter().map(|column| {
+            if !column.is_visible(layout) {
+                TableColumn::save_visibility(blueprint_ctx, column.physical_name(), layout, false);
+            }
+            column.physical_name().clone()
+        });
+
+        match layout {
+            TableLayoutKind::Table => blueprint_ctx.save_blueprint_archetype(
+                "/table/layouts/table".into(),
+                &TableLayoutArchetype::update_fields().with_column_order(column_order),
+            ),
+
+            TableLayoutKind::Cards => blueprint_ctx.save_blueprint_archetype(
+                "/table/layouts/cards".into(),
+                &CardLayoutArchetype::update_fields().with_field_order(column_order),
+            ),
+        }
+    }
+
+    /// Returns the selected layout, resolved against the available layouts.
+    ///
+    /// Without a card layout, cards can only be selected where `cards_supported`. They then show
+    /// a screen to set the cards up.
+    pub fn layout(&self, cards_supported: bool) -> TableLayoutKind {
+        if self.card_layout.is_some() {
+            // If cards are available show cards unless configured otherwise.
+            self.layout.unwrap_or(TableLayoutKind::Cards)
+        } else if cards_supported {
+            self.layout.unwrap_or(TableLayoutKind::Table)
+        } else {
+            // If no cards are available, ignore the configuration.
+            TableLayoutKind::Table
+        }
+    }
+
+    /// Write the selected layout.
+    ///
+    /// This will be in effect next frame.
+    pub fn save_layout(blueprint_ctx: &AppBlueprintCtx<'_>, layout: TableLayoutKind) {
+        blueprint_ctx.save_blueprint_archetype(
+            "/table".into(),
+            &TableBlueprintArchetype::update_fields().with_layout(layout),
+        );
+    }
+
+    /// Write the column display mode for both layouts, taking effect next frame.
+    pub fn save_column_display_mode(blueprint_ctx: &AppBlueprintCtx<'_>, mode: ColumnDisplayMode) {
+        blueprint_ctx.save_blueprint_archetype(
+            "/table".into(),
+            &TableBlueprintArchetype::update_fields().with_column_display_mode(mode),
+        );
+    }
+
+    /// Load the row filters without resolving the rest of the blueprint.
+    pub fn load_filters(blueprint_ctx: &AppBlueprintCtx<'_>) -> Vec<String> {
+        blueprint_ctx
+            .latest_at_in_current_blueprint(
+                &"/table".into(),
+                [TableBlueprintArchetype::descriptor_filters().component],
+            )
+            .component_batch::<SqlFilterExpression>(
+                TableBlueprintArchetype::descriptor_filters().component,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|filter| filter.as_str().to_owned())
+            .collect()
+    }
+
+    /// Write the row filters, taking effect next frame.
+    pub fn save_filters(blueprint_ctx: &AppBlueprintCtx<'_>, filters: &[String]) {
+        blueprint_ctx.save_blueprint_archetype(
+            "/table".into(),
+            &TableBlueprintArchetype::update_fields().with_filters(
+                filters
+                    .iter()
+                    .map(|filter| SqlFilterExpression::from(filter.as_str())),
+            ),
+        );
+    }
+
+    /// Load the sort without resolving the rest of the blueprint.
+    ///
+    /// `default_sort_by` is used when the blueprint has no sort.
+    pub fn load_sort_by(
+        blueprint_ctx: &AppBlueprintCtx<'_>,
+        default_sort_by: Option<&SortBy>,
+    ) -> Option<SortBy> {
+        let component = TableBlueprintArchetype::descriptor_sort_by().component;
+        blueprint_ctx
+            .latest_at_in_current_blueprint(&"/table".into(), [component])
+            .component_mono::<BlueprintSortBy>(component)
+            .map(SortBy::from)
+            .or_else(|| default_sort_by.cloned())
+    }
+
+    /// Write the sort, taking effect next frame.
+    pub fn save_sort_by(blueprint_ctx: &AppBlueprintCtx<'_>, sort_by: &SortBy) {
+        blueprint_ctx.save_blueprint_archetype(
+            "/table".into(),
+            &TableBlueprintArchetype::update_fields().with_sort_by(BlueprintSortBy::from(sort_by)),
+        );
+    }
+
+    /// Remove the sort, taking effect next frame.
+    pub fn clear_sort_by(blueprint_ctx: &AppBlueprintCtx<'_>) {
+        blueprint_ctx.clear_blueprint_component(
+            "/table".into(),
+            TableBlueprintArchetype::descriptor_sort_by(),
+        );
+    }
+
+    /// Iterates over all columns for the given layout.
+    pub fn iter_columns(&self, layout: TableLayoutKind) -> impl Iterator<Item = &TableColumn<'a>> {
+        match layout {
+            TableLayoutKind::Table => itertools::Either::Left(self.table_layout.columns.iter()),
+
+            TableLayoutKind::Cards => {
+                itertools::Either::Right(self.card_layout.iter().flat_map(CardLayout::fields))
+            }
+        }
+    }
+
+    pub fn iter_visible_columns(
+        &self,
+        layout: TableLayoutKind,
+    ) -> impl Iterator<Item = &TableColumn<'a>> {
+        self.iter_columns(layout)
+            .filter(move |c| c.is_visible(layout))
+    }
+
+    pub fn column_by_physical_name(
+        &self,
+        layout: TableLayoutKind,
+        physical_name: &ColumnName,
+    ) -> Option<&TableColumn<'a>> {
+        self.iter_columns(layout)
+            .find(|column| column.physical_name() == physical_name)
+    }
+}

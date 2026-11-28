@@ -1,0 +1,4214 @@
+use std::collections::BTreeSet;
+use std::num::NonZeroU32;
+use std::sync::Arc;
+
+use arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema};
+use arrow::error::ArrowError;
+use itertools::Itertools as _;
+use prost::Name as _;
+use re_arrow_util::ArrowArrayDowncastRef as _;
+use re_chunk::TimelineName;
+use re_log_types::AbsoluteTimeRange;
+use re_log_types::{EntryId, TimeInt};
+use re_sorbet::SchemaId;
+use re_types_core::LayerName;
+
+use crate::cloud::v1alpha1::ext::ScanSegmentTableDataframe;
+use crate::cloud::v1alpha1::{
+    DoBandwidthTestResponse, EntryKind, GetDatasetSchemaResponse, QueryTasksResponse,
+    ScanDatasetManifestResponse, ScanSegmentTableResponse, UnregisterFromDatasetResponse,
+    UploadMethod,
+};
+use crate::common::v1alpha1::ext as common_ext;
+use crate::common::v1alpha1::ext::{DatasetHandle, IfDuplicateBehavior, SegmentId};
+use crate::common::v1alpha1::{DataframePart, TaskId};
+use crate::protocol_level::ProtocolLevel;
+pub use crate::storage_location::{
+    InvalidStorageStringValue, StorageBucketName, StoragePrefix, StorageRegion,
+};
+use crate::{TypeConversionError, invalid_field, missing_field};
+
+/// Helper to simplify writing `field_XXX() -> FieldRef` methods.
+macro_rules! lazy_field_ref {
+    ($fld:expr) => {{
+        static FIELD: std::sync::OnceLock<FieldRef> = std::sync::OnceLock::new();
+        let field = FIELD.get_or_init(|| Arc::new($fld));
+        Arc::clone(field)
+    }};
+}
+
+// --- SegmentRegistrationStatus ---
+
+/// Registration status for a segment/layer in the dataset manifest.
+//
+// TODO(cmc): not the greatest name I guess... (rename in follow up?)
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRegistrationStatus {
+    /// Legacy value.
+    /// Marks rows that are pending full registration; no current server writes this status.
+    Pending = 0,
+
+    /// Registration for this layer has completed successfully.
+    Done = 1,
+
+    /// Registration for this layer has failed.
+    Error = 2,
+
+    /// Legacy value.
+    /// Marks rows that have been soft-deleted. This layer has been removed.
+    #[deprecated = "soft deletes are no longer used"]
+    Deleted = 3,
+}
+
+impl LayerRegistrationStatus {
+    const PENDING_STR: &str = "pending";
+    const DONE_STR: &str = "done";
+    const ERROR_STR: &str = "error";
+    const DELETED_STR: &str = "deleted";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => Self::PENDING_STR,
+            Self::Done => Self::DONE_STR,
+            Self::Error => Self::ERROR_STR,
+            #[allow(deprecated)]
+            Self::Deleted => Self::DELETED_STR,
+        }
+    }
+}
+
+impl std::fmt::Display for LayerRegistrationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LayerRegistrationStatus {
+    type Err = crate::TypeConversionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            Self::PENDING_STR => Ok(Self::Pending),
+            Self::DONE_STR => Ok(Self::Done),
+            Self::ERROR_STR => Ok(Self::Error),
+            #[allow(deprecated)]
+            Self::DELETED_STR => Ok(Self::Deleted),
+            _ => Err(crate::TypeConversionError::InvalidField {
+                package_name: "rerun.cloud.v1alpha1",
+                type_name: "SegmentRegistrationStatus",
+                field_name: "value",
+                reason: format!("invalid registration status: {s}"),
+            }),
+        }
+    }
+}
+
+impl TryFrom<u8> for LayerRegistrationStatus {
+    type Error = crate::TypeConversionError;
+
+    fn try_from(value: u8) -> Result<Self, <Self as TryFrom<u8>>::Error> {
+        match value {
+            0 => Ok(Self::Pending),
+            1 => Ok(Self::Done),
+            2 => Ok(Self::Error),
+            #[allow(deprecated)]
+            3 => Ok(Self::Deleted),
+            _ => Err(crate::TypeConversionError::InvalidField {
+                package_name: "rerun.cloud.v1alpha1",
+                type_name: "SegmentRegistrationStatus",
+                field_name: "value",
+                reason: format!("invalid registration status: {value}"),
+            }),
+        }
+    }
+}
+
+// --- RegisterWithDatasetRequest ---
+
+#[derive(Debug, Clone)]
+pub struct RegisterWithDatasetRequest {
+    pub data_sources: Vec<DataSource>,
+    pub on_duplicate: IfDuplicateBehavior,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::RegisterWithDatasetRequest> for RegisterWithDatasetRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::RegisterWithDatasetRequest,
+    ) -> Result<Self, Self::Error> {
+        let crate::cloud::v1alpha1::RegisterWithDatasetRequest {
+            data_sources,
+            on_duplicate,
+        } = value;
+
+        Ok(Self {
+            data_sources: data_sources
+                .into_iter()
+                .map(TryInto::try_into)
+                .try_collect()?,
+            on_duplicate: on_duplicate.try_into()?,
+        })
+    }
+}
+
+impl From<RegisterWithDatasetRequest> for crate::cloud::v1alpha1::RegisterWithDatasetRequest {
+    fn from(value: RegisterWithDatasetRequest) -> Self {
+        Self {
+            data_sources: value.data_sources.into_iter().map(Into::into).collect(),
+            on_duplicate: crate::common::v1alpha1::IfDuplicateBehavior::from(value.on_duplicate)
+                as i32,
+        }
+    }
+}
+
+// --- UnregisterFromDatasetRequest ---
+
+#[derive(Debug)]
+pub struct UnregisterFromDatasetRequest {
+    pub segments_to_drop: Vec<SegmentId>,
+    pub layers_to_drop: Vec<LayerName>,
+    pub force: bool,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::UnregisterFromDatasetRequest>
+    for UnregisterFromDatasetRequest
+{
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::UnregisterFromDatasetRequest,
+    ) -> Result<Self, Self::Error> {
+        let crate::cloud::v1alpha1::UnregisterFromDatasetRequest {
+            segments_to_drop,
+            layers_to_drop,
+            force,
+        } = value;
+
+        Ok(Self {
+            segments_to_drop: segments_to_drop
+                .into_iter()
+                .map(TryInto::try_into)
+                .try_collect()?,
+            layers_to_drop: layers_to_drop
+                .into_iter()
+                .map(LayerName::try_new)
+                .try_collect()?,
+            force,
+        })
+    }
+}
+
+impl From<UnregisterFromDatasetRequest> for crate::cloud::v1alpha1::UnregisterFromDatasetRequest {
+    fn from(value: UnregisterFromDatasetRequest) -> Self {
+        Self {
+            segments_to_drop: value.segments_to_drop.into_iter().map(Into::into).collect(),
+            layers_to_drop: value.layers_to_drop.into_iter().map(Into::into).collect(),
+            force: value.force,
+        }
+    }
+}
+
+impl crate::cloud::v1alpha1::UnregisterFromDatasetRequest {
+    pub fn sanity_check(&self) -> tonic::Result<()> {
+        let Self {
+            segments_to_drop,
+            layers_to_drop,
+            force: _,
+        } = self;
+
+        if segments_to_drop.is_empty() && layers_to_drop.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "must specify at least 1 segment ID or layer for removal",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+// --- DoMaintenanceRequest ---
+
+#[derive(Debug, Clone)]
+pub struct DoMaintenanceRequest {
+    pub optimize_indexes: bool,
+    pub retrain_indexes: bool,
+    pub compact_fragments: bool,
+    pub cleanup_before: Option<jiff::Timestamp>,
+    pub gc_object_store: bool,
+    pub unsafe_allow_recent_cleanup: bool,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::DoMaintenanceRequest> for DoMaintenanceRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::DoMaintenanceRequest) -> Result<Self, Self::Error> {
+        let cleanup_before = value
+            .cleanup_before
+            .map(|ts| jiff::Timestamp::new(ts.seconds, ts.nanos))
+            .transpose()?;
+
+        Ok(Self {
+            optimize_indexes: value.optimize_indexes,
+            retrain_indexes: value.retrain_indexes,
+            compact_fragments: value.compact_fragments,
+            cleanup_before,
+            gc_object_store: value.gc_object_store,
+            unsafe_allow_recent_cleanup: value.unsafe_allow_recent_cleanup,
+        })
+    }
+}
+
+impl From<DoMaintenanceRequest> for crate::cloud::v1alpha1::DoMaintenanceRequest {
+    fn from(value: DoMaintenanceRequest) -> Self {
+        Self {
+            optimize_indexes: value.optimize_indexes,
+            retrain_indexes: value.retrain_indexes,
+            compact_fragments: value.compact_fragments,
+            cleanup_before: value.cleanup_before.map(common_ext::timestamp_to_proto),
+            gc_object_store: value.gc_object_store,
+            unsafe_allow_recent_cleanup: value.unsafe_allow_recent_cleanup,
+        }
+    }
+}
+
+// --- Bandwidth test ---
+
+/// Default chunk size used when streaming `DoBandwidthTest` responses.
+pub const BANDWIDTH_TEST_CHUNK_BYTES: u64 = 1024 * 1024;
+
+/// Hard upper bound on `DoBandwidthTestRequest.num_bytes`.
+///
+/// The endpoint is purely diagnostic, so there is no legitimate reason to ask the server for
+/// more than this. Larger requests are rejected with `InvalidArgument` to prevent abuse
+/// (server egress / CPU / long-lived streams).
+pub const MAX_BANDWIDTH_TEST_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Iterator that yields `DoBandwidthTestResponse` chunks of pseudo-random,
+/// incompressible bytes (xorshift64*), summing to exactly `num_bytes`.
+///
+/// Used by both the local `re_server` and the production `redap_frontend` to
+/// implement the `DoBandwidthTest` RPC.
+pub struct BandwidthTestPayloadIter {
+    remaining: u64,
+    chunk_size: u64,
+    state: u64,
+}
+
+impl BandwidthTestPayloadIter {
+    pub fn new(num_bytes: u64) -> Self {
+        Self {
+            remaining: num_bytes,
+            chunk_size: BANDWIDTH_TEST_CHUNK_BYTES,
+            state: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+}
+
+impl Iterator for BandwidthTestPayloadIter {
+    type Item = DoBandwidthTestResponse;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let chunk_len = self.remaining.min(self.chunk_size) as usize;
+        let mut buf = vec![0u8; chunk_len];
+        let mut i = 0;
+        while i < chunk_len {
+            let mut x = self.state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.state = x;
+            let v = x.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes();
+            let n = (chunk_len - i).min(8);
+            buf[i..i + n].copy_from_slice(&v[..n]);
+            i += n;
+        }
+        self.remaining -= chunk_len as u64;
+        Some(DoBandwidthTestResponse {
+            payload: buf.into(),
+        })
+    }
+}
+
+// --- Tasks ---
+
+impl QueryTasksResponse {
+    pub fn dataframe_part(&self) -> Result<&DataframePart, TypeConversionError> {
+        Ok(self
+            .data
+            .as_ref()
+            .ok_or_else(|| missing_field!(QueryTasksResponse, "data"))?)
+    }
+}
+
+// --- EntryFilter ---
+
+impl crate::cloud::v1alpha1::EntryFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_id(mut self, id: EntryId) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    // deprecated: use `with_entry_kinds` instead.
+    //
+    // Exception: use this for backwards compatibility with 0.14 Hub or earlier.
+    #[deprecated]
+    pub fn with_entry_kind(mut self, kind: EntryKind) -> Self {
+        self.entry_kind = Some(kind as i32);
+        self
+    }
+
+    pub fn with_entry_kinds(mut self, kinds: impl IntoIterator<Item = EntryKind>) -> Self {
+        self.entry_kinds = kinds.into_iter().map(|k| k as i32).collect();
+        self
+    }
+
+    /// Requests every entry kind known to the client.
+    pub fn with_all_kinds(mut self) -> Self {
+        // Exhaustive match with no logic of its own: if a new `EntryKind` variant is added, this
+        // fails to compile as a reminder to add it to the vector below.
+        let _ = |kind: EntryKind| match kind {
+            EntryKind::Unspecified
+            | EntryKind::Dataset
+            | EntryKind::DatasetView
+            | EntryKind::Table
+            | EntryKind::TableView
+            | EntryKind::BlueprintDataset
+            | EntryKind::AssetDataset => {}
+        };
+
+        self.entry_kinds = vec![
+            EntryKind::Dataset as i32,
+            EntryKind::DatasetView as i32,
+            EntryKind::Table as i32,
+            EntryKind::TableView as i32,
+            EntryKind::BlueprintDataset as i32,
+            EntryKind::AssetDataset as i32,
+        ];
+        self
+    }
+}
+
+pub use crate::EntryName;
+
+// --- EntryDetails ---
+
+#[derive(Debug, Clone)]
+pub struct EntryDetails {
+    pub id: re_log_types::EntryId,
+    pub name: EntryName,
+    pub kind: crate::cloud::v1alpha1::EntryKind,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::EntryDetails> for EntryDetails {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::EntryDetails) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: value
+                .id
+                .ok_or(missing_field!(crate::cloud::v1alpha1::EntryDetails, "id"))?
+                .try_into()?,
+            name: EntryName::new(
+                value
+                    .name
+                    .ok_or(missing_field!(crate::cloud::v1alpha1::EntryDetails, "name"))?,
+            )?,
+            kind: value.entry_kind.try_into()?,
+            created_at: {
+                let ts = value.created_at.ok_or(missing_field!(
+                    crate::cloud::v1alpha1::EntryDetails,
+                    "created_at"
+                ))?;
+                jiff::Timestamp::new(ts.seconds, ts.nanos)?
+            },
+            updated_at: {
+                let ts = value.updated_at.ok_or(missing_field!(
+                    crate::cloud::v1alpha1::EntryDetails,
+                    "updated_at"
+                ))?;
+                jiff::Timestamp::new(ts.seconds, ts.nanos)?
+            },
+        })
+    }
+}
+
+impl From<EntryDetails> for crate::cloud::v1alpha1::EntryDetails {
+    fn from(value: EntryDetails) -> Self {
+        Self {
+            id: Some(value.id.into()),
+            name: Some(value.name.to_string()),
+            entry_kind: value.kind as _,
+            created_at: Some(common_ext::timestamp_to_proto(value.created_at)),
+            updated_at: Some(common_ext::timestamp_to_proto(value.updated_at)),
+        }
+    }
+}
+
+// --- WatchEventsRequest ---
+
+impl crate::cloud::v1alpha1::EventKind {
+    /// Subscribe to all catalog entry lifecycle events.
+    pub fn entry() -> Self {
+        use crate::cloud::v1alpha1::{EntryEvents, event_kind::Kind};
+        Self {
+            kind: Some(Kind::Entry(EntryEvents {})),
+        }
+    }
+}
+
+impl crate::cloud::v1alpha1::watch_events_response::Kind {
+    /// Is this a catalog entry lifecycle event (created or deleted)?
+    pub fn is_entry_kind(&self) -> bool {
+        use crate::cloud::v1alpha1::watch_events_response::Kind;
+        match self {
+            Kind::EntryCreated(_) | Kind::EntryDeleted(_) => true,
+        }
+    }
+}
+
+// --- WatchEventsResponse ---
+
+/// A catalog lifecycle event delivered over the `WatchEvents` stream.
+//
+// TODO(RR-4853): add register events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WatchEventsResponse {
+    EntryCreated(EntryId),
+    EntryDeleted(EntryId),
+}
+
+impl TryFrom<crate::cloud::v1alpha1::WatchEventsResponse> for WatchEventsResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::WatchEventsResponse) -> Result<Self, Self::Error> {
+        use crate::cloud::v1alpha1::watch_events_response::Kind;
+
+        match value.kind.ok_or(missing_field!(
+            crate::cloud::v1alpha1::WatchEventsResponse,
+            "kind"
+        ))? {
+            Kind::EntryCreated(event) => Ok(Self::EntryCreated(
+                event
+                    .id
+                    .ok_or(missing_field!(
+                        crate::cloud::v1alpha1::EntryCreatedEvent,
+                        "id"
+                    ))?
+                    .try_into()?,
+            )),
+            Kind::EntryDeleted(event) => Ok(Self::EntryDeleted(
+                event
+                    .id
+                    .ok_or(missing_field!(
+                        crate::cloud::v1alpha1::EntryDeletedEvent,
+                        "id"
+                    ))?
+                    .try_into()?,
+            )),
+        }
+    }
+}
+
+impl From<WatchEventsResponse> for crate::cloud::v1alpha1::WatchEventsResponse {
+    fn from(value: WatchEventsResponse) -> Self {
+        use crate::cloud::v1alpha1::watch_events_response::Kind;
+        use crate::cloud::v1alpha1::{EntryCreatedEvent, EntryDeletedEvent};
+
+        let kind = match value {
+            WatchEventsResponse::EntryCreated(id) => Kind::EntryCreated(EntryCreatedEvent {
+                id: Some(id.into()),
+            }),
+            WatchEventsResponse::EntryDeleted(id) => Kind::EntryDeleted(EntryDeletedEvent {
+                id: Some(id.into()),
+            }),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+// --- DatasetDetails / TableDetails validation ---
+
+/// Error returned when the blueprint configuration in [`DatasetDetails`] or [`TableDetails`] is
+/// internally inconsistent.
+///
+/// This only covers checks that can be made without consulting the store. Callers with store
+/// access must additionally verify that the referenced `blueprint_dataset` exists and is itself a
+/// blueprint dataset.
+#[derive(Debug, thiserror::Error)]
+#[error("default {entry_kind} blueprint requires a blueprint dataset")]
+pub struct InconsistentBlueprintDetailsError {
+    entry_kind: &'static str,
+}
+
+// --- DatasetPolicy ---
+
+/// Selects every name of a dimension, or an explicit set.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexingPolicySelection {
+    /// Every name, including names that appear later.
+    All,
+
+    /// Exactly the listed names. An empty set selects nothing.
+    Explicit(BTreeSet<String>),
+}
+
+impl IndexingPolicySelection {
+    /// Whether `name` is selected. Names match exactly.
+    pub fn contains(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Explicit(names) => names.contains(name),
+        }
+    }
+
+    /// The names both selections contain.
+    pub fn intersection(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::All, other) | (other, Self::All) => other.clone(),
+            (Self::Explicit(a), Self::Explicit(b)) => Self::Explicit(a & b),
+        }
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::IndexingPolicySelection> for IndexingPolicySelection {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::IndexingPolicySelection,
+    ) -> Result<Self, Self::Error> {
+        use crate::cloud::v1alpha1::indexing_policy_selection::Selection;
+
+        let selection = value.selection.ok_or(missing_field!(
+            crate::cloud::v1alpha1::IndexingPolicySelection,
+            "selection"
+        ))?;
+        Ok(match selection {
+            Selection::All(()) => Self::All,
+            Selection::Explicit(list) => Self::Explicit(list.names.into_iter().collect()),
+        })
+    }
+}
+
+impl From<IndexingPolicySelection> for crate::cloud::v1alpha1::IndexingPolicySelection {
+    fn from(value: IndexingPolicySelection) -> Self {
+        use crate::cloud::v1alpha1::indexing_policy_selection::Selection;
+
+        let selection = match value {
+            IndexingPolicySelection::All => Selection::All(()),
+            IndexingPolicySelection::Explicit(names) => {
+                Selection::Explicit(crate::cloud::v1alpha1::IndexingPolicyNameList {
+                    names: names.into_iter().collect(),
+                })
+            }
+        };
+        Self {
+            selection: Some(selection),
+        }
+    }
+}
+
+/// Which entity paths and timelines a dataset indexes for chunk queries.
+///
+/// Entity paths match the way [`re_log_types::EntityPath`] prints them, so `a/b` and `/a/b`
+/// select the same entity. Decoding from protobuf and [`Self::explicit`] normalize them; a
+/// struct literal must use the normalized form itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChunkIndexingPolicy {
+    /// The entity paths the dataset indexes.
+    pub entity_paths: IndexingPolicySelection,
+
+    /// The timelines the dataset indexes.
+    pub timelines: IndexingPolicySelection,
+}
+
+impl ChunkIndexingPolicy {
+    /// Every entity path and every timeline.
+    pub const ALL: Self = Self {
+        entity_paths: IndexingPolicySelection::All,
+        timelines: IndexingPolicySelection::All,
+    };
+
+    /// No entity path and no timeline.
+    pub const NOTHING: Self = Self {
+        entity_paths: IndexingPolicySelection::Explicit(BTreeSet::new()),
+        timelines: IndexingPolicySelection::Explicit(BTreeSet::new()),
+    };
+
+    /// Exactly the listed entity paths and timelines, with the entity paths normalized.
+    pub fn explicit(
+        entity_paths: impl IntoIterator<Item = impl AsRef<str>>,
+        timelines: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Self {
+        Self {
+            entity_paths: IndexingPolicySelection::Explicit(
+                entity_paths
+                    .into_iter()
+                    .map(|path| normalized_entity_path(path.as_ref()))
+                    .collect(),
+            ),
+            timelines: IndexingPolicySelection::Explicit(
+                timelines
+                    .into_iter()
+                    .map(|timeline| timeline.as_ref().to_owned())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Whether this is [`Self::ALL`].
+    pub fn indexes_everything(&self) -> bool {
+        *self == Self::ALL
+    }
+
+    /// The entity paths and timelines both policies index.
+    pub fn intersection(&self, other: &Self) -> Self {
+        Self {
+            entity_paths: self.entity_paths.intersection(&other.entity_paths),
+            timelines: self.timelines.intersection(&other.timelines),
+        }
+    }
+}
+
+fn normalized_entity_path(path: &str) -> String {
+    re_log_types::EntityPath::from(path).to_string()
+}
+
+impl TryFrom<crate::cloud::v1alpha1::ChunkIndexingPolicy> for ChunkIndexingPolicy {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::ChunkIndexingPolicy) -> Result<Self, Self::Error> {
+        let crate::cloud::v1alpha1::ChunkIndexingPolicy {
+            entity_paths,
+            timelines,
+        } = value;
+        let entity_paths = entity_paths.ok_or(missing_field!(
+            crate::cloud::v1alpha1::ChunkIndexingPolicy,
+            "entity_paths"
+        ))?;
+        let timelines = timelines.ok_or(missing_field!(
+            crate::cloud::v1alpha1::ChunkIndexingPolicy,
+            "timelines"
+        ))?;
+        let entity_paths = match IndexingPolicySelection::try_from(entity_paths)? {
+            IndexingPolicySelection::All => IndexingPolicySelection::All,
+            IndexingPolicySelection::Explicit(paths) => IndexingPolicySelection::Explicit(
+                paths
+                    .iter()
+                    .map(|path| normalized_entity_path(path))
+                    .collect(),
+            ),
+        };
+        Ok(Self {
+            entity_paths,
+            timelines: timelines.try_into()?,
+        })
+    }
+}
+
+impl From<ChunkIndexingPolicy> for crate::cloud::v1alpha1::ChunkIndexingPolicy {
+    fn from(value: ChunkIndexingPolicy) -> Self {
+        let ChunkIndexingPolicy {
+            entity_paths,
+            timelines,
+        } = value;
+        Self {
+            entity_paths: Some(entity_paths.into()),
+            timelines: Some(timelines.into()),
+        }
+    }
+}
+
+/// Dataset-level policies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatasetPolicy {
+    /// `None` states no preference. The server that stores the entry then picks a policy.
+    pub chunk_indexing_policy: Option<ChunkIndexingPolicy>,
+}
+
+impl DatasetPolicy {
+    /// Replaces an unset chunk indexing policy with `default`.
+    pub fn resolve_chunk_indexing_policy(&mut self, default: ChunkIndexingPolicy) {
+        self.chunk_indexing_policy.get_or_insert(default);
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::DatasetPolicy> for DatasetPolicy {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::DatasetPolicy) -> Result<Self, Self::Error> {
+        Ok(Self {
+            chunk_indexing_policy: value
+                .chunk_indexing_policy
+                .map(TryInto::try_into)
+                .transpose()?,
+        })
+    }
+}
+
+impl From<DatasetPolicy> for crate::cloud::v1alpha1::DatasetPolicy {
+    fn from(value: DatasetPolicy) -> Self {
+        Self {
+            chunk_indexing_policy: value.chunk_indexing_policy.map(Into::into),
+        }
+    }
+}
+
+// --- DatasetDetails ---
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatasetDetails {
+    pub blueprint_dataset: Option<EntryId>,
+    pub asset_dataset: Option<EntryId>,
+    pub default_blueprint_segment: Option<SegmentId>,
+    pub default_segment_table_blueprint_segment: Option<SegmentId>,
+
+    /// The dataset's policies. On an update, `None` keeps the stored policy.
+    pub policy: Option<DatasetPolicy>,
+}
+
+impl DatasetDetails {
+    /// Checks that the blueprint configuration is internally consistent.
+    ///
+    /// A default blueprint (for either the dataset or its segment table) can only be set if a
+    /// [`Self::blueprint_dataset`] is set too.
+    ///
+    /// This does *not* check that the blueprint dataset actually exists or is itself a blueprint
+    /// dataset — callers with store access must verify that separately.
+    pub fn validate_consistency(&self) -> Result<(), InconsistentBlueprintDetailsError> {
+        let has_default_blueprint = self.default_blueprint_segment.is_some()
+            || self.default_segment_table_blueprint_segment.is_some();
+        if has_default_blueprint && self.blueprint_dataset.is_none() {
+            return Err(InconsistentBlueprintDetailsError {
+                entry_kind: "dataset",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the default blueprint for this dataset.
+    ///
+    /// Both `blueprint_dataset` and `default_blueprint_segment` must be set.
+    pub fn default_blueprint(&self) -> Option<(EntryId, SegmentId)> {
+        let blueprint = self.blueprint_dataset.as_ref()?;
+        self.default_blueprint_segment
+            .as_ref()
+            .map(|default| (blueprint.clone(), default.clone()))
+    }
+
+    /// Returns the default blueprint for this dataset's segment table.
+    ///
+    /// Both `blueprint_dataset` and `default_segment_table_blueprint_segment` must be set.
+    pub fn default_segment_table_blueprint(&self) -> Option<(EntryId, SegmentId)> {
+        let blueprint = self.blueprint_dataset.as_ref()?;
+        self.default_segment_table_blueprint_segment
+            .as_ref()
+            .map(|default| (blueprint.clone(), default.clone()))
+    }
+
+    /// Replaces an absent or unset chunk indexing policy with `default`, so the details name an
+    /// explicit one.
+    pub fn resolve_chunk_indexing_policy(&mut self, default: ChunkIndexingPolicy) {
+        self.policy
+            .get_or_insert_default()
+            .resolve_chunk_indexing_policy(default);
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::DatasetDetails> for DatasetDetails {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::DatasetDetails) -> Result<Self, Self::Error> {
+        let default_blueprint_segment = value
+            .default_blueprint_segment
+            .map(TryInto::try_into)
+            .transpose()?;
+
+        let default_segment_table_blueprint_segment = value
+            .default_segment_table_blueprint_segment
+            .map(TryInto::try_into)
+            .transpose()?;
+
+        Ok(Self {
+            blueprint_dataset: value.blueprint_dataset.map(TryInto::try_into).transpose()?,
+            asset_dataset: value.asset_dataset.map(TryInto::try_into).transpose()?,
+            default_blueprint_segment,
+            default_segment_table_blueprint_segment,
+            policy: value.policy.map(TryInto::try_into).transpose()?,
+        })
+    }
+}
+
+impl From<DatasetDetails> for crate::cloud::v1alpha1::DatasetDetails {
+    fn from(value: DatasetDetails) -> Self {
+        Self {
+            blueprint_dataset: value.blueprint_dataset.map(Into::into),
+            asset_dataset: value.asset_dataset.map(Into::into),
+            default_blueprint_segment: value.default_blueprint_segment.clone().map(Into::into),
+            default_segment_table_blueprint_segment: value
+                .default_segment_table_blueprint_segment
+                .clone()
+                .map(Into::into),
+            policy: value.policy.map(Into::into),
+        }
+    }
+}
+
+// --- TableDetails ---
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableDetails {
+    pub blueprint_dataset: Option<EntryId>,
+    pub default_blueprint_segment: Option<SegmentId>,
+}
+
+impl TableDetails {
+    /// Checks that the blueprint configuration is internally consistent.
+    ///
+    /// A default blueprint can only be set if a [`Self::blueprint_dataset`] is set too.
+    ///
+    /// This does *not* check that the blueprint dataset actually exists or is itself a blueprint
+    /// dataset — callers with store access must verify that separately.
+    pub fn validate_consistency(&self) -> Result<(), InconsistentBlueprintDetailsError> {
+        if self.default_blueprint_segment.is_some() && self.blueprint_dataset.is_none() {
+            return Err(InconsistentBlueprintDetailsError {
+                entry_kind: "table",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the default blueprint for this table.
+    ///
+    /// Both `blueprint_dataset` and `default_blueprint_segment` must be set.
+    pub fn default_blueprint(&self) -> Option<(EntryId, SegmentId)> {
+        let blueprint = self.blueprint_dataset.as_ref()?;
+        self.default_blueprint_segment
+            .as_ref()
+            .map(|default| (blueprint.clone(), default.clone()))
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::TableDetails> for TableDetails {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::TableDetails) -> Result<Self, Self::Error> {
+        Ok(Self {
+            blueprint_dataset: value.blueprint_dataset.map(TryInto::try_into).transpose()?,
+            default_blueprint_segment: value
+                .default_blueprint_segment
+                .map(TryInto::try_into)
+                .transpose()?,
+        })
+    }
+}
+
+impl From<TableDetails> for crate::cloud::v1alpha1::TableDetails {
+    fn from(value: TableDetails) -> Self {
+        Self {
+            blueprint_dataset: value.blueprint_dataset.map(Into::into),
+            default_blueprint_segment: value.default_blueprint_segment.map(Into::into),
+        }
+    }
+}
+
+// --- DatasetEntry ---
+
+#[derive(Debug, Clone)]
+pub struct DatasetEntry {
+    pub details: EntryDetails,
+    pub dataset_details: DatasetDetails,
+    pub handle: DatasetHandle,
+
+    /// The lowest protocol level a client needs to read this dataset. Server-managed.
+    pub required_client_protocol_level: ProtocolLevel,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::DatasetEntry> for DatasetEntry {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::DatasetEntry) -> Result<Self, Self::Error> {
+        Ok(Self {
+            details: value
+                .details
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::DatasetEntry,
+                    "details"
+                ))?
+                .try_into()?,
+            dataset_details: value
+                .dataset_details
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::DatasetDetails,
+                    "dataset_details"
+                ))?
+                .try_into()?,
+            handle: value
+                .dataset_handle
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::DatasetEntry,
+                    "handle"
+                ))?
+                .try_into()?,
+            required_client_protocol_level: value.required_client_protocol_level.into(),
+        })
+    }
+}
+
+impl From<DatasetEntry> for crate::cloud::v1alpha1::DatasetEntry {
+    fn from(value: DatasetEntry) -> Self {
+        Self {
+            details: Some(value.details.into()),
+            dataset_details: Some(value.dataset_details.into()),
+            dataset_handle: Some(value.handle.into()),
+            required_client_protocol_level: value.required_client_protocol_level.as_u32(),
+        }
+    }
+}
+
+// --- CreateDatasetEntryRequest ---
+
+#[derive(Debug, Clone)]
+pub struct CreateDatasetEntryRequest {
+    /// Entry name (must be unique in catalog).
+    pub name: EntryName,
+
+    /// Override, use at your own risk.
+    pub id: Option<EntryId>,
+
+    /// The dataset's policies. An unset chunk indexing policy states no preference.
+    pub policy: DatasetPolicy,
+}
+
+impl From<CreateDatasetEntryRequest> for crate::cloud::v1alpha1::CreateDatasetEntryRequest {
+    fn from(value: CreateDatasetEntryRequest) -> Self {
+        Self {
+            name: Some(value.name.to_string()),
+            id: value.id.map(Into::into),
+            policy: Some(value.policy.into()),
+        }
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::CreateDatasetEntryRequest> for CreateDatasetEntryRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::CreateDatasetEntryRequest,
+    ) -> Result<Self, Self::Error> {
+        let name_str = value.name.ok_or(missing_field!(
+            crate::cloud::v1alpha1::CreateDatasetEntryRequest,
+            "name"
+        ))?;
+        Ok(Self {
+            name: EntryName::new(name_str).map_err(TypeConversionError::InvalidEntryName)?,
+            id: value.id.map(TryInto::try_into).transpose()?,
+            policy: value
+                .policy
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+}
+
+// --- CreateDatasetEntryResponse ---
+
+#[derive(Debug, Clone)]
+pub struct CreateDatasetEntryResponse {
+    pub dataset: DatasetEntry,
+}
+
+impl From<CreateDatasetEntryResponse> for crate::cloud::v1alpha1::CreateDatasetEntryResponse {
+    fn from(value: CreateDatasetEntryResponse) -> Self {
+        Self {
+            dataset: Some(value.dataset.into()),
+        }
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::CreateDatasetEntryResponse> for CreateDatasetEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::CreateDatasetEntryResponse,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            dataset: value
+                .dataset
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::CreateDatasetEntryResponse,
+                    "dataset"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+// --- CreateTableEntryRequest ---
+
+#[derive(Debug, Clone)]
+pub struct CreateTableEntryRequest {
+    pub name: EntryName,
+    pub schema: Schema,
+    pub provider_details: Option<ProviderDetails>,
+}
+
+impl TryFrom<CreateTableEntryRequest> for crate::cloud::v1alpha1::CreateTableEntryRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(value: CreateTableEntryRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: value.name.to_string(),
+            schema: Some((&value.schema).try_into()?),
+            provider_details: value
+                .provider_details
+                .map(|d| (&d).try_into())
+                .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<&crate::cloud::v1alpha1::CreateTableEntryRequest> for CreateTableEntryRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: &crate::cloud::v1alpha1::CreateTableEntryRequest,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: EntryName::new(value.name.clone())
+                .map_err(TypeConversionError::InvalidEntryName)?,
+            schema: value
+                .schema
+                .as_ref()
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::CreateTableEntryRequest,
+                    "schema"
+                ))?
+                .try_into()?,
+            provider_details: value
+                .provider_details
+                .as_ref()
+                .map(|v| ProviderDetails::try_from(v))
+                .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::CreateTableEntryRequest> for CreateTableEntryRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::CreateTableEntryRequest,
+    ) -> Result<Self, Self::Error> {
+        Self::try_from(&value)
+    }
+}
+
+// --- CreateTableEntryResponse ---
+
+#[derive(Debug, Clone)]
+pub struct CreateTableEntryResponse {
+    pub table: TableEntry,
+}
+
+impl TryFrom<CreateTableEntryResponse> for crate::cloud::v1alpha1::CreateTableEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(value: CreateTableEntryResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            table: Some(value.table.try_into()?),
+        })
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::CreateTableEntryResponse> for CreateTableEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::CreateTableEntryResponse,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            table: value
+                .table
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::CreateTableEntryResponse,
+                    "table"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+// --- ReadDatasetEntryResponse ---
+
+#[derive(Debug, Clone)]
+pub struct ReadDatasetEntryResponse {
+    pub dataset_entry: DatasetEntry,
+}
+
+impl From<ReadDatasetEntryResponse> for crate::cloud::v1alpha1::ReadDatasetEntryResponse {
+    fn from(value: ReadDatasetEntryResponse) -> Self {
+        Self {
+            dataset: Some(value.dataset_entry.into()),
+        }
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::ReadDatasetEntryResponse> for ReadDatasetEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::ReadDatasetEntryResponse,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            dataset_entry: value
+                .dataset
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::ReadDatasetEntryResponse,
+                    "dataset"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+// --- UpdateDatasetEntryRequest ---
+
+#[derive(Debug, Clone)]
+pub struct UpdateDatasetEntryRequest {
+    pub id: EntryId,
+    pub dataset_details: DatasetDetails,
+}
+
+impl UpdateDatasetEntryRequest {
+    /// Builds this from the wire request plus an entry id already resolved from the
+    /// `x-rerun-entry-id` header or the deprecated body field.
+    pub fn from_resolved(
+        id: EntryId,
+        value: crate::cloud::v1alpha1::UpdateDatasetEntryRequest,
+    ) -> Result<Self, TypeConversionError> {
+        Ok(Self {
+            id,
+            dataset_details: value
+                .dataset_details
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::UpdateDatasetEntryRequest,
+                    "dataset_details"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+/// The entry id is not part of the message: the caller must send it in the `x-rerun-entry-id`
+/// header.
+impl From<UpdateDatasetEntryRequest> for crate::cloud::v1alpha1::UpdateDatasetEntryRequest {
+    fn from(value: UpdateDatasetEntryRequest) -> Self {
+        Self {
+            dataset_details: Some(value.dataset_details.into()),
+            ..Default::default()
+        }
+    }
+}
+
+// --- UpdateDatasetEntryResponse ---
+
+#[derive(Debug, Clone)]
+pub struct UpdateDatasetEntryResponse {
+    pub dataset_entry: DatasetEntry,
+}
+
+impl From<UpdateDatasetEntryResponse> for crate::cloud::v1alpha1::UpdateDatasetEntryResponse {
+    fn from(value: UpdateDatasetEntryResponse) -> Self {
+        Self {
+            dataset: Some(value.dataset_entry.into()),
+        }
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::UpdateDatasetEntryResponse> for UpdateDatasetEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::UpdateDatasetEntryResponse,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            dataset_entry: value
+                .dataset
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::UpdateDatasetEntryResponse,
+                    "dataset"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+// --- ApplyDatasetPolicyRequest ---
+
+#[derive(Debug, Clone, Default)]
+pub struct ApplyDatasetPolicyRequest {
+    pub policy: DatasetPolicy,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::ApplyDatasetPolicyRequest> for ApplyDatasetPolicyRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::ApplyDatasetPolicyRequest,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            policy: value
+                .policy
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+}
+
+impl From<ApplyDatasetPolicyRequest> for crate::cloud::v1alpha1::ApplyDatasetPolicyRequest {
+    fn from(value: ApplyDatasetPolicyRequest) -> Self {
+        Self {
+            policy: Some(value.policy.into()),
+        }
+    }
+}
+
+// --- ApplyDatasetPolicyResponse ---
+
+#[derive(Debug, Clone)]
+pub struct ApplyDatasetPolicyResponse {
+    pub dataset_entry: DatasetEntry,
+
+    /// The tasks that apply the policy.
+    pub task_ids: Vec<crate::common::v1alpha1::TaskId>,
+}
+
+impl From<ApplyDatasetPolicyResponse> for crate::cloud::v1alpha1::ApplyDatasetPolicyResponse {
+    fn from(value: ApplyDatasetPolicyResponse) -> Self {
+        Self {
+            dataset: Some(value.dataset_entry.into()),
+            task_ids: value.task_ids,
+        }
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::ApplyDatasetPolicyResponse> for ApplyDatasetPolicyResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::ApplyDatasetPolicyResponse,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            dataset_entry: value
+                .dataset
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::ApplyDatasetPolicyResponse,
+                    "dataset"
+                ))?
+                .try_into()?,
+            task_ids: value.task_ids,
+        })
+    }
+}
+
+// --- DeleteEntryRequest ---
+
+impl TryFrom<crate::cloud::v1alpha1::DeleteEntryRequest> for re_log_types::EntryId {
+    type Error = TypeConversionError;
+
+    #[expect(deprecated, reason = "reads the body id that old clients send")]
+    fn try_from(value: crate::cloud::v1alpha1::DeleteEntryRequest) -> Result<Self, Self::Error> {
+        Ok(value
+            .id
+            .ok_or(missing_field!(
+                crate::cloud::v1alpha1::DeleteEntryRequest,
+                "id"
+            ))?
+            .try_into()?)
+    }
+}
+
+// --- EntryDetailsUpdate ---
+
+#[derive(Debug, Clone, Default)]
+pub struct EntryDetailsUpdate {
+    pub name: Option<EntryName>,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::EntryDetailsUpdate> for EntryDetailsUpdate {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::EntryDetailsUpdate) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: value
+                .name
+                .map(EntryName::new)
+                .transpose()
+                .map_err(TypeConversionError::InvalidEntryName)?,
+        })
+    }
+}
+
+impl From<EntryDetailsUpdate> for crate::cloud::v1alpha1::EntryDetailsUpdate {
+    fn from(value: EntryDetailsUpdate) -> Self {
+        Self {
+            name: value.name.map(|name| name.to_string()),
+        }
+    }
+}
+
+// --- UpdateEntryRequest ---
+
+#[derive(Debug, Clone)]
+pub struct UpdateEntryRequest {
+    pub id: re_log_types::EntryId,
+    pub entry_details_update: EntryDetailsUpdate,
+}
+
+impl UpdateEntryRequest {
+    /// Builds this from the wire request plus an entry id already resolved from the
+    /// `x-rerun-entry-id` header or the deprecated body field.
+    pub fn from_resolved(
+        id: re_log_types::EntryId,
+        value: crate::cloud::v1alpha1::UpdateEntryRequest,
+    ) -> Result<Self, TypeConversionError> {
+        Ok(Self {
+            id,
+            entry_details_update: value
+                .entry_details_update
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::UpdateEntryRequest,
+                    "entry_details_update"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+/// The entry id is not part of the message: the caller must send it in the `x-rerun-entry-id`
+/// header.
+impl From<UpdateEntryRequest> for crate::cloud::v1alpha1::UpdateEntryRequest {
+    fn from(value: UpdateEntryRequest) -> Self {
+        Self {
+            entry_details_update: Some(value.entry_details_update.into()),
+            ..Default::default()
+        }
+    }
+}
+
+// --- UpdateEntryResponse ---
+
+#[derive(Debug, Clone)]
+pub struct UpdateEntryResponse {
+    pub entry_details: EntryDetails,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::UpdateEntryResponse> for UpdateEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::UpdateEntryResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            entry_details: value
+                .entry_details
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::UpdateEntryResponse,
+                    "entry_details"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+impl From<UpdateEntryResponse> for crate::cloud::v1alpha1::UpdateEntryResponse {
+    fn from(value: UpdateEntryResponse) -> Self {
+        Self {
+            entry_details: Some(value.entry_details.into()),
+        }
+    }
+}
+
+// --- ReadTableEntryRequest ---
+
+impl TryFrom<crate::cloud::v1alpha1::ReadTableEntryRequest> for re_log_types::EntryId {
+    type Error = TypeConversionError;
+
+    #[expect(deprecated, reason = "reads the body id that old clients send")]
+    fn try_from(value: crate::cloud::v1alpha1::ReadTableEntryRequest) -> Result<Self, Self::Error> {
+        Ok(value
+            .id
+            .ok_or(missing_field!(
+                crate::cloud::v1alpha1::ReadTableEntryRequest,
+                "id"
+            ))?
+            .try_into()?)
+    }
+}
+
+// --- ReadTableEntryResponse ---
+
+#[derive(Debug, Clone)]
+pub struct ReadTableEntryResponse {
+    pub table_entry: TableEntry,
+}
+
+impl TryFrom<ReadTableEntryResponse> for crate::cloud::v1alpha1::ReadTableEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(value: ReadTableEntryResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            table: Some(value.table_entry.try_into()?),
+        })
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::ReadTableEntryResponse> for ReadTableEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::ReadTableEntryResponse,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            table_entry: value
+                .table
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::ReadTableEntryResponse,
+                    "table_entry"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+// --- UpdateTableEntryRequest ---
+
+#[derive(Debug, Clone)]
+pub struct UpdateTableEntryRequest {
+    pub id: EntryId,
+    pub table_details: TableDetails,
+}
+
+impl UpdateTableEntryRequest {
+    /// Builds this from the wire request plus an entry id already resolved from the
+    /// `x-rerun-entry-id` header or the deprecated body field.
+    pub fn from_resolved(
+        id: EntryId,
+        value: crate::cloud::v1alpha1::UpdateTableEntryRequest,
+    ) -> Result<Self, TypeConversionError> {
+        Ok(Self {
+            id,
+            table_details: value
+                .table_details
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::UpdateTableEntryRequest,
+                    "table_details"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+/// The entry id is not part of the message: the caller must send it in the `x-rerun-entry-id`
+/// header.
+impl From<UpdateTableEntryRequest> for crate::cloud::v1alpha1::UpdateTableEntryRequest {
+    fn from(value: UpdateTableEntryRequest) -> Self {
+        Self {
+            table_details: Some(value.table_details.into()),
+            ..Default::default()
+        }
+    }
+}
+
+// --- UpdateTableEntryResponse ---
+
+#[derive(Debug, Clone)]
+pub struct UpdateTableEntryResponse {
+    pub table_entry: TableEntry,
+}
+
+impl TryFrom<UpdateTableEntryResponse> for crate::cloud::v1alpha1::UpdateTableEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(value: UpdateTableEntryResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            table: Some(value.table_entry.try_into()?),
+        })
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::UpdateTableEntryResponse> for UpdateTableEntryResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::UpdateTableEntryResponse,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            table_entry: value
+                .table
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::UpdateTableEntryResponse,
+                    "table_entry"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+// --- RegisterTableRequest ---
+
+#[derive(Debug, Clone)]
+pub struct RegisterTableRequest {
+    pub name: EntryName,
+    pub provider_details: ProviderDetails,
+}
+
+impl TryFrom<RegisterTableRequest> for crate::cloud::v1alpha1::RegisterTableRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(value: RegisterTableRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: value.name.to_string(),
+            provider_details: Some((&value.provider_details).try_into()?),
+        })
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::RegisterTableRequest> for RegisterTableRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::RegisterTableRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: EntryName::new(value.name).map_err(TypeConversionError::InvalidEntryName)?,
+            provider_details: ProviderDetails::try_from(&value.provider_details.ok_or(
+                missing_field!(
+                    crate::cloud::v1alpha1::RegisterTableRequest,
+                    "provider_details"
+                ),
+            )?)?,
+        })
+    }
+}
+
+// --- RegisterTableResponse ---
+
+#[derive(Debug, Clone)]
+pub struct RegisterTableResponse {
+    pub table_entry: TableEntry,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::RegisterTableResponse> for RegisterTableResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::RegisterTableResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            table_entry: value
+                .table_entry
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::RegisterTableResponse,
+                    "table_entry"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+// --- TableEntry ---
+
+#[derive(Debug, Clone)]
+pub struct TableEntry {
+    pub details: EntryDetails,
+    pub provider_details: ProviderDetails,
+    pub table_details: TableDetails,
+}
+
+impl TryFrom<TableEntry> for crate::cloud::v1alpha1::TableEntry {
+    type Error = TypeConversionError;
+
+    fn try_from(value: TableEntry) -> Result<Self, Self::Error> {
+        Ok(Self {
+            details: Some(value.details.into()),
+            provider_details: Some((&value.provider_details).try_into()?),
+            table_details: Some(value.table_details.into()),
+        })
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::TableEntry> for TableEntry {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::TableEntry) -> Result<Self, Self::Error> {
+        Ok(Self {
+            details: value
+                .details
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::TableEntry,
+                    "details"
+                ))?
+                .try_into()?,
+            provider_details: ProviderDetails::try_from(
+                &value
+                    .provider_details
+                    .ok_or(missing_field!(crate::cloud::v1alpha1::TableEntry, "handle"))?,
+            )?,
+            table_details: value
+                .table_details
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+}
+
+// --- ProviderDetails ---
+
+#[derive(Debug, Clone)]
+pub enum ProviderDetails {
+    SystemTable(SystemTable),
+    LanceTable(LanceTable),
+}
+
+impl TryFrom<&prost_types::Any> for ProviderDetails {
+    type Error = TypeConversionError;
+
+    fn try_from(value: &prost_types::Any) -> Result<Self, Self::Error> {
+        if value.type_url == crate::cloud::v1alpha1::LanceTable::type_url() {
+            let as_proto = value.to_msg::<crate::cloud::v1alpha1::LanceTable>()?;
+            let table = LanceTable::try_from(as_proto)?;
+            Ok(Self::LanceTable(table))
+        } else if value.type_url == crate::cloud::v1alpha1::SystemTable::type_url() {
+            let as_proto = value.to_msg::<crate::cloud::v1alpha1::SystemTable>()?;
+            let table = SystemTable::try_from(as_proto)?;
+            Ok(Self::SystemTable(table))
+        } else {
+            Err(TypeConversionError::InvalidField {
+                package_name: "rerun.cloud.v1alpha1",
+                type_name: "ProviderDetails",
+                field_name: "",
+                reason: "enum value unspecified".to_owned(),
+            })
+        }
+    }
+}
+
+impl TryFrom<&ProviderDetails> for prost_types::Any {
+    type Error = TypeConversionError;
+
+    fn try_from(value: &ProviderDetails) -> Result<Self, Self::Error> {
+        match value {
+            ProviderDetails::SystemTable(table) => {
+                let as_proto: crate::cloud::v1alpha1::SystemTable = table.clone().into();
+                Ok(prost_types::Any::from_msg(&as_proto)?)
+            }
+            ProviderDetails::LanceTable(table) => {
+                let as_proto: crate::cloud::v1alpha1::LanceTable = table.clone().into();
+                Ok(prost_types::Any::from_msg(&as_proto)?)
+            }
+        }
+    }
+}
+
+impl ProviderDetails {
+    pub fn type_url(&self) -> String {
+        match self {
+            Self::SystemTable(_) => crate::cloud::v1alpha1::SystemTable::type_url(),
+            Self::LanceTable(_) => crate::cloud::v1alpha1::LanceTable::type_url(),
+        }
+    }
+}
+
+// --- SystemTable ---
+
+#[derive(Debug, Clone)]
+pub struct SystemTable {
+    pub kind: crate::cloud::v1alpha1::SystemTableKind,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::SystemTable> for SystemTable {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::SystemTable) -> Result<Self, Self::Error> {
+        Ok(Self {
+            kind: value.kind.try_into()?,
+        })
+    }
+}
+
+impl From<SystemTable> for crate::cloud::v1alpha1::SystemTable {
+    fn from(value: SystemTable) -> Self {
+        Self {
+            kind: value.kind as _,
+        }
+    }
+}
+
+// --- LanceTable ---
+
+#[derive(Debug, Clone)]
+pub struct LanceTable {
+    pub table_url: url::Url,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::LanceTable> for LanceTable {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::LanceTable) -> Result<Self, Self::Error> {
+        Ok(Self {
+            table_url: url::Url::parse(&value.table_url)?,
+        })
+    }
+}
+
+impl From<LanceTable> for crate::cloud::v1alpha1::LanceTable {
+    fn from(value: LanceTable) -> Self {
+        Self {
+            table_url: value.table_url.to_string(),
+        }
+    }
+}
+
+// --- EntryKind ---
+
+impl EntryKind {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            EntryKind::Dataset => "Dataset",
+            EntryKind::Table => "Table",
+            EntryKind::Unspecified => "Unspecified",
+            EntryKind::DatasetView => "Dataset View",
+            EntryKind::TableView => "Table View",
+            EntryKind::BlueprintDataset => "Blueprint Dataset",
+            EntryKind::AssetDataset => "Asset Dataset",
+        }
+    }
+
+    /// Was this EntryKind a kind that legacy clients expected to get by default
+    /// in /FindEntries calls?
+    ///
+    /// 0.34 clients and older expected to get those kinds on `entry_kind: None`
+    /// find requests. This helper method is used to maintain backwards
+    /// compatibility with such clients.
+    ///
+    /// See RR-5186 for more details.
+    pub fn is_legacy_default_kind(self) -> bool {
+        matches!(
+            self,
+            EntryKind::Dataset
+                | EntryKind::Table
+                | EntryKind::DatasetView
+                | EntryKind::TableView
+                | EntryKind::BlueprintDataset
+        )
+    }
+}
+
+impl std::fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
+// --- QueryDataset ---
+
+#[derive(Debug, Default, Clone)]
+pub struct Query {
+    pub latest_at: Option<QueryLatestAt>,
+    pub range: Option<QueryRange>,
+    pub columns_always_include_everything: bool,
+    pub columns_always_include_byte_offsets: bool,
+    pub columns_always_include_entity_paths: bool,
+    pub columns_always_include_static_indexes: bool,
+    pub columns_always_include_global_indexes: bool,
+    pub columns_always_include_component_indexes: bool,
+}
+
+impl Query {
+    /// Create a query that returns everything that is needed to view every time point
+    /// in the given range with latest-at semantics.
+    pub fn latest_at_range(timeline_name: TimelineName, time_range: AbsoluteTimeRange) -> Self {
+        Self {
+            // So that we can show the state at the start:
+            latest_at: Some(QueryLatestAt::global(Some(timeline_name), time_range.min)),
+            // Show we can show everything in the range:
+            range: Some(QueryRange {
+                index: timeline_name,
+                index_range: time_range.into(),
+            }),
+            ..Self::default()
+        }
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::Query> for Query {
+    type Error = tonic::Status;
+
+    fn try_from(value: crate::cloud::v1alpha1::Query) -> Result<Self, Self::Error> {
+        let latest_at = value
+            .latest_at
+            .map(|latest_at| {
+                Ok::<QueryLatestAt, tonic::Status>(QueryLatestAt {
+                    index: latest_at
+                        .index
+                        .and_then(|index| index.timeline)
+                        .map(|timeline| {
+                            re_log_types::TimelineName::try_new(timeline.name)
+                                .map_err(|err| tonic::Status::invalid_argument(err.to_string()))
+                        })
+                        .transpose()?,
+                    at: latest_at
+                        .at
+                        .map(|at| TimeInt::new_temporal(at))
+                        .unwrap_or_else(|| TimeInt::STATIC),
+                    per_segment_values: latest_at
+                        .per_segment_values
+                        .into_iter()
+                        .map(|ivl| ivl.values)
+                        .collect(),
+                })
+            })
+            .transpose()?;
+
+        let range = value
+            .range
+            .map(|range| {
+                Ok::<QueryRange, tonic::Status>(QueryRange {
+                    index_range: range
+                        .index_range
+                        .ok_or_else(|| {
+                            tonic::Status::invalid_argument(
+                                "index_range is required for range query",
+                            )
+                        })?
+                        .into(),
+                    index: range
+                        .index
+                        .and_then(|index| index.timeline)
+                        .ok_or_else(|| {
+                            tonic::Status::invalid_argument("index is required for range query")
+                        })
+                        .and_then(|timeline| {
+                            re_log_types::TimelineName::try_new(timeline.name)
+                                .map_err(|err| tonic::Status::invalid_argument(err.to_string()))
+                        })?,
+                })
+            })
+            .transpose()?;
+
+        Ok(Self {
+            latest_at,
+            range,
+            columns_always_include_byte_offsets: value.columns_always_include_byte_offsets,
+            columns_always_include_component_indexes: value
+                .columns_always_include_component_indexes,
+            columns_always_include_entity_paths: value.columns_always_include_entity_paths,
+            columns_always_include_everything: value.columns_always_include_everything,
+            columns_always_include_global_indexes: value.columns_always_include_global_indexes,
+            columns_always_include_static_indexes: value.columns_always_include_static_indexes,
+        })
+    }
+}
+
+impl From<Query> for crate::cloud::v1alpha1::Query {
+    fn from(value: Query) -> Self {
+        crate::cloud::v1alpha1::Query {
+            latest_at: value.latest_at.map(Into::into),
+            range: value.range.map(|range| crate::cloud::v1alpha1::QueryRange {
+                index: Some({
+                    let timeline: TimelineName = range.index.into();
+                    timeline.into()
+                }),
+                index_range: Some(range.index_range.into()),
+            }),
+            columns_always_include_byte_offsets: value.columns_always_include_byte_offsets,
+            columns_always_include_component_indexes: value
+                .columns_always_include_component_indexes,
+            columns_always_include_entity_paths: value.columns_always_include_entity_paths,
+            columns_always_include_everything: value.columns_always_include_everything,
+            columns_always_include_global_indexes: value.columns_always_include_global_indexes,
+            columns_always_include_static_indexes: value.columns_always_include_static_indexes,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryLatestAt {
+    /// Index name (timeline) to query.
+    ///
+    /// Use `None` for static only data.
+    pub index: Option<TimelineName>,
+
+    /// Global query value — applied to all segments.
+    ///
+    /// Use `TimeInt::STATIC` to query for static only data.
+    /// Mutually exclusive with `per_segment_values`.
+    pub at: TimeInt,
+
+    /// Per-segment index values, positionally matched to
+    /// `QueryDatasetRequest.segment_ids`.
+    ///
+    /// When non-empty, `at` and `Query.range` must be unset — the server
+    /// reconstructs global bounds from these values.
+    pub per_segment_values: Vec<Vec<i64>>,
+}
+
+impl QueryLatestAt {
+    /// Construct a global `QueryLatestAt` (single value applied to all segments,
+    /// no per-segment values).
+    pub fn global(index: Option<TimelineName>, at: TimeInt) -> Self {
+        Self {
+            index,
+            at,
+            per_segment_values: Vec::new(),
+        }
+    }
+
+    pub fn new_static() -> Self {
+        Self::global(None, TimeInt::STATIC)
+    }
+
+    pub fn is_static(&self) -> bool {
+        self.index.is_none()
+    }
+}
+
+impl From<QueryLatestAt> for crate::cloud::v1alpha1::QueryLatestAt {
+    fn from(value: QueryLatestAt) -> Self {
+        // Map `TimeInt::STATIC` (sentinel for "unset") to `None` on the wire
+        // so the receiving side's `at.map(TimeInt::new_temporal).unwrap_or(STATIC)`
+        // round-trips correctly.
+        let at = if value.at == TimeInt::STATIC {
+            None
+        } else {
+            Some(value.at.as_i64())
+        };
+        crate::cloud::v1alpha1::QueryLatestAt {
+            index: value.index.map(|index| {
+                let timeline: TimelineName = index.into();
+                timeline.into()
+            }),
+            at,
+            per_segment_values: value
+                .per_segment_values
+                .into_iter()
+                .map(|values| crate::cloud::v1alpha1::IndexValueList { values })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryRange {
+    pub index: TimelineName,
+    pub index_range: re_log_types::AbsoluteTimeRange,
+}
+
+// --- GetDatasetSchemaResponse ---
+
+#[derive(Debug, thiserror::Error)]
+pub enum GetDatasetSchemaResponseError {
+    #[error(transparent)]
+    ArrowError(#[from] ArrowError),
+
+    #[error(transparent)]
+    TypeConversionError(#[from] TypeConversionError),
+}
+
+impl GetDatasetSchemaResponse {
+    pub fn schema(self) -> Result<Schema, GetDatasetSchemaResponseError> {
+        Ok(self
+            .schema
+            .ok_or_else(|| {
+                TypeConversionError::missing_field::<GetDatasetSchemaResponse>("schema")
+            })?
+            .try_into()?)
+    }
+}
+
+// --- ClientMeta ---
+
+impl crate::cloud::v1alpha1::ClientMeta {
+    /// The metadata of this build, as a client.
+    pub fn current() -> Self {
+        Self {
+            protocol_level: ProtocolLevel::CURRENT.as_u32(),
+        }
+    }
+}
+
+// --- GetSchemasRequest ---
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GetSchemasRequest {
+    pub schema_ids: BTreeSet<SchemaId>,
+}
+
+impl GetSchemasRequest {
+    /// The most identifiers one request may carry, duplicates included.
+    ///
+    /// Servers and clients are released independently, so a server may raise this limit but
+    /// never lower it. Clients with more identifiers split them across several requests.
+    pub const MAX_SCHEMA_IDS: usize = 1024;
+}
+
+impl TryFrom<crate::cloud::v1alpha1::GetSchemasRequest> for GetSchemasRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::GetSchemasRequest) -> Result<Self, Self::Error> {
+        let crate::cloud::v1alpha1::GetSchemasRequest { schema_ids } = value;
+
+        if schema_ids.len() > Self::MAX_SCHEMA_IDS {
+            return Err(invalid_field!(
+                crate::cloud::v1alpha1::GetSchemasRequest,
+                "schema_ids",
+                format!(
+                    "got {} identifiers, but at most {} are allowed",
+                    schema_ids.len(),
+                    Self::MAX_SCHEMA_IDS
+                )
+            ));
+        }
+
+        Ok(Self {
+            schema_ids: schema_ids
+                .into_iter()
+                .map(TryInto::try_into)
+                .try_collect()?,
+        })
+    }
+}
+
+impl From<GetSchemasRequest> for crate::cloud::v1alpha1::GetSchemasRequest {
+    fn from(value: GetSchemasRequest) -> Self {
+        Self {
+            schema_ids: value.schema_ids.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+// --- GetSchemasResponse ---
+
+/// One message of the `GetSchemas` stream, without its `meta`.
+#[derive(Debug, Clone)]
+pub struct GetSchemasResponse {
+    pub schema_id: SchemaId,
+    pub schema: Schema,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::GetSchemasResponse> for GetSchemasResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::GetSchemasResponse) -> Result<Self, Self::Error> {
+        let crate::cloud::v1alpha1::GetSchemasResponse {
+            schema_id,
+            schema,
+            meta: _,
+        } = value;
+
+        Ok(Self {
+            schema_id: schema_id
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::GetSchemasResponse,
+                    "schema_id"
+                ))?
+                .try_into()?,
+            schema: schema
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::GetSchemasResponse,
+                    "schema"
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+impl TryFrom<GetSchemasResponse> for crate::cloud::v1alpha1::GetSchemasResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(value: GetSchemasResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema_id: Some(value.schema_id.into()),
+            schema: Some((&value.schema).try_into()?),
+            meta: None,
+        })
+    }
+}
+
+// --- RegisterWithDatasetResponse ---
+
+//TODO(ab): this should be an actual grpc message, returned by `RegisterWithDataset` instead of a dataframe
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct RegisterWithDatasetTaskDescriptor {
+    pub layer_name: LayerName,
+    pub segment_id: SegmentId,
+    pub segment_type: DataSourceKind,
+    pub storage_url: url::Url,
+    pub task_id: TaskId,
+}
+
+// --- UnregisterFromDatasetResponse ---
+
+/// The dataframe follows the same schema as
+/// [`ScanDatasetManifestDataframe`](crate::cloud::v1alpha1::ext::ScanDatasetManifestDataframe).
+impl UnregisterFromDatasetResponse {
+    pub fn data(&self) -> Result<&DataframePart, TypeConversionError> {
+        Ok(self
+            .data
+            .as_ref()
+            .ok_or_else(|| missing_field!(Self, "data"))?)
+    }
+}
+
+// --- ScanSegmentTableResponse --
+
+// One row per segment; see [`ScanSegmentTableDataframe`].
+impl ScanSegmentTableResponse {
+    /// The inner field of the list columns, using arrow's conventional `"item"` name.
+    pub fn list_item_field() -> FieldRef {
+        lazy_field_ref!(Field::new("item", DataType::Utf8, false))
+    }
+
+    /// Helper to simplify instantiation of the dataframe in [`Self::data`].
+    pub fn create_dataframe(
+        segment_ids: Vec<SegmentId>,
+        layer_names: Vec<Vec<LayerName>>,
+        storage_urls: Vec<Vec<String>>,
+        last_updated_at: Vec<i64>,
+        num_chunks: Vec<u64>,
+        size_bytes: Vec<u64>,
+    ) -> arrow::error::Result<RecordBatch> {
+        type Df = ScanSegmentTableDataframe;
+        Df {
+            rerun_segment_id: Df::COLUMN_RERUN_SEGMENT_ID.new_from_values(segment_ids),
+            rerun_layer_names: Df::COLUMN_RERUN_LAYER_NAMES.new_from_values(layer_names),
+            rerun_storage_urls: Df::COLUMN_RERUN_STORAGE_URLS.new_from_values(storage_urls),
+            rerun_last_updated_at: Df::COLUMN_RERUN_LAST_UPDATED_AT
+                .new_from_values(last_updated_at),
+            rerun_num_chunks: Df::COLUMN_RERUN_NUM_CHUNKS.new_from_values(num_chunks),
+            rerun_size_bytes: Df::COLUMN_RERUN_SIZE_BYTES.new_from_values(size_bytes),
+            extra_columns: vec![],
+        }
+        .into_record_batch()
+        .map_err(|err| ArrowError::InvalidArgumentError(err.to_string()))
+    }
+
+    pub fn data(&self) -> Result<&DataframePart, TypeConversionError> {
+        Ok(self
+            .data
+            .as_ref()
+            .ok_or_else(|| missing_field!(Self, "data"))?)
+    }
+}
+
+// --- ScanDatasetManifestResponse --
+
+/// Column constants and helpers for the dataset manifest.
+///
+/// Terminology:
+/// * A *layer* is a named slice of data that spans many segments (e.g. "base", "embeddings"),
+///   with one source per segment it appears in.
+/// * A *source* is a single `.rrd` (or, in the future, `.mcap` etc)
+/// * A single segment is the concatenation of all the sources of all the layers it has data in.
+///
+/// The dataset manifest has one row per (layer, segment) pair,
+/// i.e. a layer appears once per segment it has data in.
+impl ScanDatasetManifestResponse {
+    pub fn data(&self) -> Result<&DataframePart, TypeConversionError> {
+        Ok(self
+            .data
+            .as_ref()
+            .ok_or_else(|| missing_field!(Self, "data"))?)
+    }
+}
+
+// --- Grants ---
+
+/// The key of one object below a storage location's base, including the file name.
+///
+/// A key is at most [`Self::MAX_LEN`] bytes of slash-separated non-empty segments.
+/// A segment contains only ASCII letters, digits, `.`, `-`, or `_` and neither starts nor ends
+/// with `.`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectKey(
+    /// Always ASCII, so byte and character lengths agree.
+    String,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid object key: {reason}")]
+pub struct InvalidObjectKeyError {
+    reason: String,
+}
+
+impl ObjectKey {
+    /// The longest key accepted, well within the limits of every supported storage backend.
+    pub const MAX_LEN: usize = 255;
+
+    pub fn try_new(key: impl Into<String>) -> Result<Self, InvalidObjectKeyError> {
+        let key = key.into();
+        let reject = |reason: String| InvalidObjectKeyError { reason };
+
+        if key.is_empty() {
+            return Err(reject("must not be empty".to_owned()));
+        }
+        if key.len() > Self::MAX_LEN {
+            return Err(reject(format!("must be at most {} bytes", Self::MAX_LEN)));
+        }
+        for segment in key.split('/') {
+            if segment.is_empty() {
+                return Err(reject("segments must not be empty".to_owned()));
+            }
+            if !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+            {
+                return Err(reject(format!(
+                    "segment {segment:?} contains a character other than ASCII letters, digits, `.`, `-`, or `_`"
+                )));
+            }
+            if segment.starts_with('.') || segment.ends_with('.') {
+                return Err(reject(format!(
+                    "segment {segment:?} starts or ends with `.`"
+                )));
+            }
+        }
+        Ok(Self(key))
+    }
+}
+
+impl std::fmt::Display for ObjectKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Names a storage location configured in a catalog deployment.
+///
+/// The alias is only meaningful within one deployment: it does not identify the underlying storage.
+///
+/// An alias has at most 253 characters: lowercase ASCII letters, digits, `-`, and `.`.
+/// Each dot-separated part must be non-empty and start and end with a letter or digit.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String", into = "String")]
+pub struct StorageLocationAlias(String);
+
+/// Returned when an alias does not follow the [`StorageLocationAlias`] format.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "storage location alias must use 1 to 253 lowercase ASCII letters, digits, `-`, and `.`, \
+     with each dot-separated part starting and ending with a letter or digit"
+)]
+pub struct InvalidStorageLocationAliasError;
+
+impl StorageLocationAlias {
+    pub fn try_new(alias: impl Into<String>) -> Result<Self, InvalidStorageLocationAliasError> {
+        let alias = alias.into();
+        let is_alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+        let is_valid = alias.len() <= 253
+            && alias.split('.').all(|label| {
+                let bytes = label.as_bytes();
+                bytes.first().is_some_and(|&byte| is_alphanumeric(byte))
+                    && bytes.last().is_some_and(|&byte| is_alphanumeric(byte))
+                    && bytes
+                        .iter()
+                        .all(|&byte| is_alphanumeric(byte) || byte == b'-')
+            });
+        if !is_valid {
+            return Err(InvalidStorageLocationAliasError);
+        }
+        Ok(Self(alias))
+    }
+
+    /// The alias as a string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for StorageLocationAlias {
+    type Error = InvalidStorageLocationAliasError;
+
+    fn try_from(alias: String) -> Result<Self, Self::Error> {
+        Self::try_new(alias)
+    }
+}
+
+impl std::str::FromStr for StorageLocationAlias {
+    type Err = InvalidStorageLocationAliasError;
+
+    fn from_str(alias: &str) -> Result<Self, Self::Err> {
+        Self::try_new(alias)
+    }
+}
+
+impl From<StorageLocationAlias> for String {
+    fn from(alias: StorageLocationAlias) -> Self {
+        alias.0
+    }
+}
+
+impl std::fmt::Display for StorageLocationAlias {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Storage locations and the alias selected when none is specified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageLocations {
+    pub locations: Vec<StorageLocation>,
+    pub default_alias: StorageLocationAlias,
+}
+
+/// A storage location configured in this catalog deployment.
+// TODO(RR-6055): Define provider and network constraints for location selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageLocation {
+    pub alias: StorageLocationAlias,
+    pub display_name: Option<String>,
+    pub region: StorageRegion,
+
+    /// Bucket name, without a URI scheme or object path.
+    pub bucket_name: StorageBucketName,
+    pub prefix: Option<StoragePrefix>,
+    pub read_only: bool,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::StorageLocation> for StorageLocation {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::StorageLocation) -> Result<Self, Self::Error> {
+        Ok(Self {
+            alias: StorageLocationAlias::try_new(value.alias).map_err(|err| {
+                invalid_field!(
+                    crate::cloud::v1alpha1::StorageLocation,
+                    "alias",
+                    err.to_string()
+                )
+            })?,
+            display_name: value.display_name,
+            region: StorageRegion::try_new(value.region).map_err(|err| {
+                invalid_field!(
+                    crate::cloud::v1alpha1::StorageLocation,
+                    "region",
+                    err.to_string()
+                )
+            })?,
+            bucket_name: StorageBucketName::try_new(value.bucket_name).map_err(|err| {
+                invalid_field!(
+                    crate::cloud::v1alpha1::StorageLocation,
+                    "bucket_name",
+                    err.to_string()
+                )
+            })?,
+            prefix: value
+                .prefix
+                .map(StoragePrefix::try_new)
+                .transpose()
+                .map_err(|err| {
+                    invalid_field!(
+                        crate::cloud::v1alpha1::StorageLocation,
+                        "prefix",
+                        err.to_string()
+                    )
+                })?,
+            read_only: value.read_only,
+        })
+    }
+}
+
+impl From<StorageLocation> for crate::cloud::v1alpha1::StorageLocation {
+    fn from(value: StorageLocation) -> Self {
+        Self {
+            alias: value.alias.into(),
+            display_name: value.display_name,
+            region: value.region.into(),
+            bucket_name: value.bucket_name.into(),
+            prefix: value.prefix.map(Into::into),
+            read_only: value.read_only,
+        }
+    }
+}
+
+/// Requests authorization to write one object at `key`.
+#[derive(Debug, Clone)]
+pub struct GetWriteAccessGrantRequest {
+    pub key: ObjectKey,
+
+    /// The requested storage location, or the server's default.
+    /// TODO(RR-6055): Negotiate server support before sending an explicit alias.
+    pub storage_location: Option<StorageLocationAlias>,
+
+    /// Exact object size, if known.
+    pub size_bytes: Option<u64>,
+
+    /// Upload methods the client supports. Empty means none.
+    pub supported_upload_methods: Vec<UploadMethod>,
+
+    /// Required signing mode for the grant's HTTP requests.
+    pub signing: UrlSigning,
+}
+
+impl GetWriteAccessGrantRequest {
+    /// Whether the client accepts a grant using `method`.
+    pub fn accepts(&self, method: UploadMethod) -> bool {
+        method != UploadMethod::Unspecified && self.supported_upload_methods.contains(&method)
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::GetWriteAccessGrantRequest> for GetWriteAccessGrantRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::GetWriteAccessGrantRequest,
+    ) -> Result<Self, Self::Error> {
+        let crate::cloud::v1alpha1::GetWriteAccessGrantRequest {
+            key,
+            size_bytes,
+            supported_upload_methods,
+            signing,
+            storage_location,
+        } = value;
+        Ok(Self {
+            key: ObjectKey::try_new(key)?,
+            storage_location: storage_location
+                .map(StorageLocationAlias::try_new)
+                .transpose()
+                .map_err(|err| {
+                    invalid_field!(
+                        crate::cloud::v1alpha1::GetWriteAccessGrantRequest,
+                        "storage_location",
+                        err.to_string()
+                    )
+                })?,
+            size_bytes,
+            supported_upload_methods: if supported_upload_methods.is_empty() {
+                vec![UploadMethod::SingleRequest]
+            } else {
+                supported_upload_methods
+                    .into_iter()
+                    .filter_map(|method| UploadMethod::try_from(method).ok())
+                    .filter(|method| *method != UploadMethod::Unspecified)
+                    .collect()
+            },
+            signing: signing.try_into().map_err(|err: prost::UnknownEnumValue| {
+                invalid_field!(
+                    crate::cloud::v1alpha1::GetWriteAccessGrantRequest,
+                    "signing",
+                    err.to_string()
+                )
+            })?,
+        })
+    }
+}
+
+impl From<GetWriteAccessGrantRequest> for crate::cloud::v1alpha1::GetWriteAccessGrantRequest {
+    fn from(value: GetWriteAccessGrantRequest) -> Self {
+        let GetWriteAccessGrantRequest {
+            key,
+            storage_location,
+            size_bytes,
+            supported_upload_methods,
+            signing,
+        } = value;
+        Self {
+            key: key.0,
+            storage_location: storage_location.map(Into::into),
+            size_bytes,
+            supported_upload_methods: if supported_upload_methods.is_empty() {
+                // An empty wire list means single-request only, so encode no support explicitly.
+                vec![UploadMethod::Unspecified.into()]
+            } else {
+                supported_upload_methods
+                    .into_iter()
+                    .map(Into::into)
+                    .collect()
+            },
+            signing: signing.into(),
+        }
+    }
+}
+
+/// Who supplies authorization for an upload's HTTP requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlSigning {
+    /// Server-signed URLs, usable without client-managed object-store credentials.
+    Signed,
+
+    /// Unsigned URLs that the client authorizes with its own object-store credentials.
+    Unsigned,
+}
+
+impl TryFrom<i32> for UrlSigning {
+    type Error = prost::UnknownEnumValue;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        use crate::cloud::v1alpha1::UrlSigning as Proto;
+
+        Ok(match Proto::try_from(value)? {
+            Proto::Unspecified | Proto::Signed => Self::Signed,
+            Proto::Unsigned => Self::Unsigned,
+        })
+    }
+}
+
+impl From<UrlSigning> for i32 {
+    fn from(value: UrlSigning) -> Self {
+        use crate::cloud::v1alpha1::UrlSigning as Proto;
+
+        match value {
+            UrlSigning::Signed => Proto::Signed.into(),
+            UrlSigning::Unsigned => Proto::Unsigned.into(),
+        }
+    }
+}
+
+/// Authorization to write one object, and the URL that names it once written.
+///
+/// Redeem [`Self::grant`] first, then pass [`Self::storage_url`] to `RegisterWithDataset` as a
+/// separate operation.
+#[derive(Debug, Clone)]
+pub struct GetWriteAccessGrantResponse {
+    /// Stable, credential-free URL naming the object.
+    pub storage_url: url::Url,
+    pub grant: AccessGrant,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::GetWriteAccessGrantResponse> for GetWriteAccessGrantResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::GetWriteAccessGrantResponse,
+    ) -> Result<Self, Self::Error> {
+        let crate::cloud::v1alpha1::GetWriteAccessGrantResponse { storage_url, grant } = value;
+        Ok(Self {
+            storage_url: storage_url.parse().map_err(|err: url::ParseError| {
+                invalid_field!(
+                    crate::cloud::v1alpha1::GetWriteAccessGrantResponse,
+                    "storage_url",
+                    err.to_string()
+                )
+            })?,
+            grant: grant
+                .ok_or_else(|| {
+                    missing_field!(crate::cloud::v1alpha1::GetWriteAccessGrantResponse, "grant")
+                })?
+                .try_into()?,
+        })
+    }
+}
+
+impl TryFrom<GetWriteAccessGrantResponse> for crate::cloud::v1alpha1::GetWriteAccessGrantResponse {
+    type Error = TypeConversionError;
+
+    fn try_from(value: GetWriteAccessGrantResponse) -> Result<Self, Self::Error> {
+        let GetWriteAccessGrantResponse { storage_url, grant } = value;
+        Ok(Self {
+            storage_url: storage_url.to_string(),
+            grant: Some(grant.try_into()?),
+        })
+    }
+}
+
+/// Authorizes create-only publication through HTTP or a multipart session.
+///
+/// Publication must atomically reject an existing destination without modifying it.
+#[derive(Debug, Clone)]
+pub struct AccessGrant {
+    /// HTTP request deadline, or the session deadline for multipart renewal and publication.
+    /// Storage may reject HTTP requests earlier. Confirming publication and abort remain valid
+    /// after the session deadline; publishing an unfinished upload does not.
+    pub expires_at: jiff::Timestamp,
+
+    /// The server-selected mechanism; clients must support it before consuming the source.
+    pub redemption: Redemption,
+
+    /// Effective signing mode, including for renewed part requests. Must match the request.
+    pub signing: UrlSigning,
+}
+
+/// How the caller redeems an [`AccessGrant`].
+#[derive(Debug, Clone)]
+pub enum Redemption {
+    /// An HTTP request the caller performs directly.
+    HttpRequest(HttpRequest),
+
+    /// A multipart session whose bytes are uploaded directly to storage.
+    MultipartSession(MultipartSession),
+}
+
+/// A multipart session with initial part requests and an opaque token.
+#[derive(Debug, Clone)]
+pub struct MultipartSession {
+    /// Bearer token for part grants, completion, and abort. Return unchanged; do not log it.
+    pub upload_token: prost::bytes::Bytes,
+
+    /// Size of each part except the last, which may be smaller.
+    pub part_size_bytes: std::num::NonZeroU64,
+
+    /// Requests for consecutive parts starting at 1, in part-number order.
+    pub part_requests: Vec<HttpRequest>,
+
+    /// Maximum part count, including the final part. Absence selects the legacy 10,000-part limit.
+    pub max_part_count: Option<NonZeroU32>,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::MultipartSession> for MultipartSession {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::MultipartSession) -> Result<Self, Self::Error> {
+        use crate::cloud::v1alpha1::MultipartSession as Proto;
+
+        let Proto {
+            upload_token,
+            part_size_bytes,
+            part_requests,
+            max_part_count,
+        } = value;
+        if upload_token.is_empty() {
+            return Err(invalid_field!(
+                Proto,
+                "upload_token",
+                "expected a non-empty token"
+            ));
+        }
+        let part_size_bytes = std::num::NonZeroU64::new(part_size_bytes).ok_or_else(|| {
+            invalid_field!(Proto, "part_size_bytes", "expected a positive part size")
+        })?;
+        let max_part_count = max_part_count
+            .map(|count| {
+                NonZeroU32::new(count).ok_or_else(|| {
+                    invalid_field!(Proto, "max_part_count", "expected a positive part count")
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            upload_token,
+            part_size_bytes,
+            max_part_count,
+            part_requests: part_requests
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<MultipartSession> for crate::cloud::v1alpha1::MultipartSession {
+    type Error = TypeConversionError;
+
+    fn try_from(value: MultipartSession) -> Result<Self, Self::Error> {
+        let MultipartSession {
+            upload_token,
+            part_size_bytes,
+            part_requests,
+            max_part_count,
+        } = value;
+        Ok(Self {
+            upload_token,
+            part_size_bytes: part_size_bytes.get(),
+            max_part_count: max_part_count.map(NonZeroU32::get),
+            part_requests: part_requests
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::AccessGrant> for AccessGrant {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::AccessGrant) -> Result<Self, Self::Error> {
+        let crate::cloud::v1alpha1::AccessGrant {
+            expires_at,
+            redemption,
+            signing,
+        } = value;
+        let expires_at = expires_at
+            .ok_or_else(|| missing_field!(crate::cloud::v1alpha1::AccessGrant, "expires_at"))?;
+        let redemption = match redemption
+            .ok_or_else(|| missing_field!(crate::cloud::v1alpha1::AccessGrant, "redemption"))?
+        {
+            crate::cloud::v1alpha1::access_grant::Redemption::HttpRequest(request) => {
+                Redemption::HttpRequest(request.try_into()?)
+            }
+            crate::cloud::v1alpha1::access_grant::Redemption::MultipartSession(request) => {
+                Redemption::MultipartSession(request.try_into()?)
+            }
+        };
+        Ok(Self {
+            expires_at: jiff::Timestamp::new(expires_at.seconds, expires_at.nanos)?,
+            redemption,
+            signing: signing.try_into().map_err(|err: prost::UnknownEnumValue| {
+                invalid_field!(
+                    crate::cloud::v1alpha1::AccessGrant,
+                    "signing",
+                    err.to_string()
+                )
+            })?,
+        })
+    }
+}
+
+impl TryFrom<AccessGrant> for crate::cloud::v1alpha1::AccessGrant {
+    type Error = TypeConversionError;
+
+    fn try_from(value: AccessGrant) -> Result<Self, Self::Error> {
+        let AccessGrant {
+            expires_at,
+            redemption,
+            signing,
+        } = value;
+        Ok(Self {
+            expires_at: Some(common_ext::timestamp_to_proto(expires_at)),
+            signing: signing.into(),
+            redemption: Some(match redemption {
+                Redemption::HttpRequest(request) => {
+                    crate::cloud::v1alpha1::access_grant::Redemption::HttpRequest(
+                        request.try_into()?,
+                    )
+                }
+                Redemption::MultipartSession(request) => {
+                    crate::cloud::v1alpha1::access_grant::Redemption::MultipartSession(
+                        request.try_into()?,
+                    )
+                }
+            }),
+        })
+    }
+}
+
+/// An HTTP request the caller performs directly to redeem an [`AccessGrant`].
+#[derive(Debug, Clone)]
+pub enum HttpRequest {
+    /// A request to an external HTTP(S) URL.
+    External {
+        method: http::Method,
+        url: url::Url,
+        headers: http::HeaderMap,
+    },
+
+    /// A request to an absolute path on the catalog origin.
+    SameOrigin {
+        method: http::Method,
+        path_and_query: http::uri::PathAndQuery,
+        headers: http::HeaderMap,
+    },
+}
+
+impl HttpRequest {
+    /// The methods a redeemer must support.
+    pub const SUPPORTED_METHODS: [http::Method; 1] = [http::Method::PUT];
+}
+
+impl TryFrom<crate::cloud::v1alpha1::HttpRequest> for HttpRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::cloud::v1alpha1::HttpRequest) -> Result<Self, Self::Error> {
+        use crate::cloud::v1alpha1::HttpRequest as Proto;
+
+        let Proto {
+            method,
+            url,
+            headers,
+            same_origin,
+        } = value;
+
+        let method = http::Method::from_bytes(method.as_bytes())
+            .map_err(|err| invalid_field!(Proto, "method", err.to_string()))?;
+        if !Self::SUPPORTED_METHODS.contains(&method) {
+            return Err(invalid_field!(
+                Proto,
+                "method",
+                format!(
+                    "expected one of {:?}, got `{method}`",
+                    Self::SUPPORTED_METHODS
+                )
+            ));
+        }
+
+        // `HeaderMap::with_capacity` and `append` panic once the map exceeds its maximum size.
+        let mut header_map = http::HeaderMap::new();
+        for crate::cloud::v1alpha1::HttpHeader { name, value } in headers {
+            let name = http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|err| invalid_field!(Proto, "headers", err.to_string()))?;
+            let value = http::HeaderValue::from_str(&value)
+                .map_err(|err| invalid_field!(Proto, "headers", err.to_string()))?;
+            header_map
+                .try_append(name, value)
+                .map_err(|err| invalid_field!(Proto, "headers", err.to_string()))?;
+        }
+
+        if same_origin {
+            let path_and_query = url
+                .parse::<http::uri::PathAndQuery>()
+                .map_err(|err| invalid_field!(Proto, "url", err.to_string()))?;
+            if !path_and_query.as_str().starts_with('/') {
+                return Err(invalid_field!(
+                    Proto,
+                    "url",
+                    format!("expected an absolute path and query, got `{path_and_query}`")
+                ));
+            }
+            Ok(Self::SameOrigin {
+                method,
+                path_and_query,
+                headers: header_map,
+            })
+        } else {
+            let url: url::Url = url
+                .parse()
+                .map_err(|err: url::ParseError| invalid_field!(Proto, "url", err.to_string()))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(invalid_field!(
+                    Proto,
+                    "url",
+                    format!("expected an absolute http(s) URL, got `{url}`")
+                ));
+            }
+            Ok(Self::External {
+                method,
+                url,
+                headers: header_map,
+            })
+        }
+    }
+}
+
+impl TryFrom<HttpRequest> for crate::cloud::v1alpha1::HttpRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(value: HttpRequest) -> Result<Self, Self::Error> {
+        use crate::cloud::v1alpha1::HttpRequest as Proto;
+
+        let (method, url, headers, same_origin) = match value {
+            HttpRequest::External {
+                method,
+                url,
+                headers,
+            } => (method, url.to_string(), headers, false),
+            HttpRequest::SameOrigin {
+                method,
+                path_and_query,
+                headers,
+            } => (method, path_and_query.to_string(), headers, true),
+        };
+        let headers = headers
+            .iter()
+            .map(|(name, value)| {
+                // The proto field is a `string`, so a non-UTF-8 header value has no representation.
+                let value = std::str::from_utf8(value.as_bytes())
+                    .map_err(|err| invalid_field!(Proto, "headers", err.to_string()))?;
+                Ok(crate::cloud::v1alpha1::HttpHeader {
+                    name: name.to_string(),
+                    value: value.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, TypeConversionError>>()?;
+
+        Ok(Self {
+            method: method.to_string(),
+            url,
+            headers,
+            same_origin,
+        })
+    }
+}
+
+// --- DataSource --
+
+/// The file format of a [`DataSource`].
+// NOTE: Match the values of the Protobuf definition to keep life simple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum DataSourceKind {
+    /// Rerun recording data (`.rrd` files).
+    Rrd = 1,
+}
+
+impl std::fmt::Display for DataSourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rrd => write!(f, "rrd"),
+        }
+    }
+}
+
+impl From<DataSourceKind> for String {
+    fn from(kind: DataSourceKind) -> Self {
+        kind.to_string()
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::DataSourceKind> for DataSourceKind {
+    type Error = TypeConversionError;
+
+    fn try_from(kind: crate::cloud::v1alpha1::DataSourceKind) -> Result<Self, Self::Error> {
+        match kind {
+            crate::cloud::v1alpha1::DataSourceKind::Rrd => Ok(Self::Rrd),
+
+            crate::cloud::v1alpha1::DataSourceKind::Unspecified => {
+                return Err(TypeConversionError::InvalidField {
+                    package_name: "rerun.manifest_registry.v1alpha1",
+                    type_name: "DataSourceKind",
+                    field_name: "",
+                    reason: "enum value unspecified".to_owned(),
+                });
+            }
+        }
+    }
+}
+
+impl TryFrom<i32> for DataSourceKind {
+    type Error = TypeConversionError;
+
+    fn try_from(kind: i32) -> Result<Self, Self::Error> {
+        let kind = crate::cloud::v1alpha1::DataSourceKind::try_from(kind)?;
+        kind.try_into()
+    }
+}
+
+impl From<DataSourceKind> for crate::cloud::v1alpha1::DataSourceKind {
+    fn from(value: DataSourceKind) -> Self {
+        match value {
+            DataSourceKind::Rrd => Self::Rrd,
+        }
+    }
+}
+
+impl DataSourceKind {
+    pub fn to_arrow(self) -> ArrayRef {
+        match self {
+            Self::Rrd => {
+                let rec_type = StringArray::from_iter_values(["rrd".to_owned()]);
+                Arc::new(rec_type)
+            }
+        }
+    }
+
+    pub fn many_to_arrow(types: Vec<Self>) -> ArrayRef {
+        let data = types
+            .into_iter()
+            .map(|typ| match typ {
+                Self::Rrd => "rrd",
+            })
+            .collect::<Vec<_>>();
+        Arc::new(StringArray::from(data))
+    }
+
+    pub fn from_arrow(array: &dyn Array) -> Result<Self, TypeConversionError> {
+        let resource_type = array.try_downcast_array_ref::<StringArray>()?.value(0);
+
+        match resource_type {
+            "rrd" => Ok(Self::Rrd),
+            _ => Err(TypeConversionError::ArrowError(
+                ArrowError::InvalidArgumentError(format!("unknown resource type {resource_type}")),
+            )),
+        }
+    }
+
+    pub fn many_from_arrow(array: &dyn Array) -> Result<Vec<Self>, TypeConversionError> {
+        let string_array = array.try_downcast_array_ref::<StringArray>()?;
+
+        (0..string_array.len())
+            .map(|i| {
+                let resource_type = string_array.value(i);
+                match resource_type {
+                    "rrd" => Ok(Self::Rrd),
+                    _ => Err(TypeConversionError::ArrowError(
+                        ArrowError::InvalidArgumentError(format!(
+                            "unknown resource type {resource_type}"
+                        )),
+                    )),
+                }
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn datasourcekind_roundtrip() {
+    let kind = DataSourceKind::Rrd;
+    let kind: crate::cloud::v1alpha1::DataSourceKind = kind.into();
+    let kind = DataSourceKind::try_from(kind).unwrap();
+    assert_eq!(DataSourceKind::Rrd, kind);
+}
+
+/// A pointer to one or more recording files stored in object storage.
+///
+/// A `DataSource` identifies a single file (when `is_prefix = false`) or
+/// all files that share a common URL prefix (when `is_prefix = true`).
+/// Every source belongs to a named [`LayerName`] within the dataset.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DataSource {
+    /// URL of the recording file, or the common prefix when `is_prefix` is `true`.
+    pub storage_url: url::Url,
+
+    /// If `true`, `storage_url` is a prefix and matches all objects with that prefix.
+    pub is_prefix: bool,
+
+    /// The dataset layer this source belongs to (default: `"base"`).
+    pub layer: LayerName,
+
+    /// File format of the recording data.
+    pub kind: DataSourceKind,
+
+    /// The storage location that holds the data.
+    ///
+    /// If `None`, the server infers the object store from `storage_url`.
+    #[serde(rename = "object_store_config")]
+    pub storage_location: Option<StorageLocationAlias>,
+
+    /// The store to register out of this source.
+    ///
+    /// `None` picks the first store of the dataset's kind (recording or blueprint) in the source.
+    /// Must be `None` when `is_prefix` is `true`.
+    ///
+    /// Servers below [`crate::protocol_level::ProtocolLevel::REGISTER_STORE_ID`] reject it or
+    /// ignore it.
+    ///
+    /// Deserializes as `None` when absent, so serialized sources that predate it still load.
+    #[serde(default)]
+    pub store_id: Option<re_log_types::StoreId>,
+
+    /// The segment to register this source as, instead of the recording id of its store.
+    ///
+    /// Must be `None` when `is_prefix` is `true`.
+    ///
+    /// Servers without the [`crate::capabilities::CATALOG_WRITE_SEGMENT_ID_OVERRIDE`] capability
+    /// ignore it.
+    ///
+    /// Deserializes as `None` when absent, so serialized sources that predate it still load.
+    #[serde(default)]
+    pub segment_id_override: Option<SegmentId>,
+}
+
+impl DataSource {
+    pub const DEFAULT_LAYER: &str = LayerName::DEFAULT_STR;
+
+    /// Registers this source as `segment_id` instead of its store's recording id.
+    #[must_use]
+    pub fn with_segment_id_override(mut self, segment_id: SegmentId) -> Self {
+        self.segment_id_override = Some(segment_id);
+        self
+    }
+
+    /// Registers the store `store_id` out of this source.
+    #[must_use]
+    pub fn with_store_id(mut self, store_id: re_log_types::StoreId) -> Self {
+        self.store_id = Some(store_id);
+        self
+    }
+
+    pub fn new_rrd(
+        storage_url: impl AsRef<str>,
+        storage_location: Option<StorageLocationAlias>,
+    ) -> Result<Self, url::ParseError> {
+        Ok(Self {
+            storage_url: storage_url.as_ref().parse()?,
+            is_prefix: false,
+            layer: LayerName::base(),
+            kind: DataSourceKind::Rrd,
+            storage_location,
+            store_id: None,
+            segment_id_override: None,
+        })
+    }
+
+    pub fn new_rrd_prefix(
+        storage_url: impl AsRef<str>,
+        storage_location: Option<StorageLocationAlias>,
+    ) -> Result<Self, url::ParseError> {
+        Ok(Self {
+            storage_url: storage_url.as_ref().parse()?,
+            is_prefix: true,
+            layer: LayerName::base(),
+            kind: DataSourceKind::Rrd,
+            storage_location,
+            store_id: None,
+            segment_id_override: None,
+        })
+    }
+
+    pub fn new_rrd_layer(
+        layer: impl Into<LayerName>,
+        storage_url: impl AsRef<str>,
+        storage_location: Option<StorageLocationAlias>,
+    ) -> Result<Self, url::ParseError> {
+        Ok(Self {
+            storage_url: storage_url.as_ref().parse()?,
+            is_prefix: false,
+            layer: layer.into(),
+            kind: DataSourceKind::Rrd,
+            storage_location,
+            store_id: None,
+            segment_id_override: None,
+        })
+    }
+
+    pub fn new_rrd_layer_prefix(
+        layer: impl Into<LayerName>,
+        storage_url: impl AsRef<str>,
+        storage_location: Option<StorageLocationAlias>,
+    ) -> Result<Self, url::ParseError> {
+        Ok(Self {
+            storage_url: storage_url.as_ref().parse()?,
+            is_prefix: true,
+            layer: layer.into(),
+            kind: DataSourceKind::Rrd,
+            storage_location,
+            store_id: None,
+            segment_id_override: None,
+        })
+    }
+
+    pub fn new_rrd_url(
+        storage_url: url::Url,
+        storage_location: Option<StorageLocationAlias>,
+    ) -> Self {
+        Self {
+            storage_url,
+            is_prefix: false,
+            layer: LayerName::base(),
+            kind: DataSourceKind::Rrd,
+            storage_location,
+            store_id: None,
+            segment_id_override: None,
+        }
+    }
+
+    pub fn new_rrd_prefix_url(
+        storage_url: url::Url,
+        storage_location: Option<StorageLocationAlias>,
+    ) -> Self {
+        Self {
+            storage_url,
+            is_prefix: true,
+            layer: LayerName::base(),
+            kind: DataSourceKind::Rrd,
+            storage_location,
+            store_id: None,
+            segment_id_override: None,
+        }
+    }
+}
+
+impl From<DataSource> for crate::cloud::v1alpha1::DataSource {
+    #[expect(deprecated, reason = "Older servers require the legacy selector field")]
+    fn from(value: DataSource) -> Self {
+        let DataSource {
+            storage_url,
+            is_prefix,
+            layer,
+            kind,
+            storage_location,
+            store_id,
+            segment_id_override,
+        } = value;
+
+        crate::cloud::v1alpha1::DataSource {
+            storage_url: Some(storage_url.to_string()),
+            prefix: is_prefix,
+            layer: Some(layer.into()),
+            typ: kind as i32,
+            storage_location: storage_location.clone().map(String::from),
+            object_store_config: storage_location.map(String::from),
+            store_id: store_id.map(Into::into),
+            segment_id: segment_id_override.map(Into::into),
+        }
+    }
+}
+
+impl TryFrom<crate::cloud::v1alpha1::DataSource> for DataSource {
+    type Error = TypeConversionError;
+
+    #[expect(
+        deprecated,
+        reason = "Older clients only send the legacy selector field"
+    )]
+    fn try_from(data_source: crate::cloud::v1alpha1::DataSource) -> Result<Self, Self::Error> {
+        let parse_alias = |alias: Option<String>, field| {
+            alias
+                .map(StorageLocationAlias::try_new)
+                .transpose()
+                .map_err(|err| {
+                    invalid_field!(crate::cloud::v1alpha1::DataSource, field, err.to_string())
+                })
+        };
+        let storage_location = parse_alias(data_source.storage_location, "storage_location")?;
+        let object_store_config =
+            parse_alias(data_source.object_store_config, "object_store_config")?;
+        if let (Some(alias), Some(legacy_alias)) = (&storage_location, &object_store_config)
+            && alias != legacy_alias
+        {
+            return Err(invalid_field!(
+                crate::cloud::v1alpha1::DataSource,
+                "storage_location",
+                "must match object_store_config when both are supplied"
+            ));
+        }
+
+        let storage_url = data_source
+            .storage_url
+            .ok_or_else(|| missing_field!(crate::cloud::v1alpha1::DataSource, "storage_url"))?
+            .parse()?;
+
+        // An empty layer name is treated as absent, for backwards compatibility.
+        let layer = data_source
+            .layer
+            .filter(|layer| !layer.is_empty())
+            .map(LayerName::try_new)
+            .transpose()?
+            .unwrap_or_else(LayerName::base);
+
+        let kind = DataSourceKind::try_from(data_source.typ)?;
+
+        let prefix = data_source.prefix;
+
+        let store_id = data_source
+            .store_id
+            .map(re_log_types::StoreId::try_from)
+            .transpose()?;
+        if prefix && store_id.is_some() {
+            return Err(invalid_field!(
+                crate::cloud::v1alpha1::DataSource,
+                "store_id",
+                "a prefix data source cannot select a store",
+            ));
+        }
+
+        let segment_id_override = data_source
+            .segment_id
+            .map(SegmentId::try_from)
+            .transpose()?;
+        if prefix && segment_id_override.is_some() {
+            return Err(invalid_field!(
+                crate::cloud::v1alpha1::DataSource,
+                "segment_id",
+                "a prefix data source cannot set a segment id",
+            ));
+        }
+        if segment_id_override
+            .as_ref()
+            .is_some_and(|segment_id| segment_id.as_str().is_empty())
+        {
+            return Err(invalid_field!(
+                crate::cloud::v1alpha1::DataSource,
+                "segment_id",
+                "the segment id must not be empty",
+            ));
+        }
+
+        Ok(Self {
+            storage_url,
+            is_prefix: prefix,
+            layer,
+            kind,
+            storage_location: storage_location.or(object_store_config),
+            store_id,
+            segment_id_override,
+        })
+    }
+}
+
+#[test]
+#[expect(deprecated, reason = "Exercise legacy selector decoding")]
+fn datasource_layer_from_proto() {
+    let proto = |layer: Option<&str>| crate::cloud::v1alpha1::DataSource {
+        storage_url: Some("s3://bucket/file.rrd".to_owned()),
+        prefix: false,
+        layer: layer.map(ToOwned::to_owned),
+        typ: crate::cloud::v1alpha1::DataSourceKind::Rrd as i32,
+        object_store_config: Some("custom".to_owned()),
+        storage_location: None,
+        store_id: None,
+        segment_id: None,
+    };
+
+    let data_source = DataSource::try_from(proto(None)).unwrap();
+    assert_eq!(data_source.layer, LayerName::base());
+
+    // An empty layer name is treated as absent, for backwards compatibility.
+    let data_source = DataSource::try_from(proto(Some(""))).unwrap();
+    assert_eq!(data_source.layer, LayerName::base());
+
+    let data_source = DataSource::try_from(proto(Some("my_layer"))).unwrap();
+    assert_eq!(data_source.layer, "my_layer");
+
+    assert_eq!(
+        data_source
+            .storage_location
+            .as_ref()
+            .map(StorageLocationAlias::as_str),
+        Some("custom")
+    );
+}
+
+#[test]
+fn datasource_store_id_from_proto() {
+    let store_id = re_log_types::StoreId::recording("app", "rec");
+    let proto = |prefix: bool| crate::cloud::v1alpha1::DataSource {
+        storage_url: Some("s3://bucket/file.rrd".to_owned()),
+        prefix,
+        layer: None,
+        typ: crate::cloud::v1alpha1::DataSourceKind::Rrd as i32,
+        store_id: Some(store_id.clone().into()),
+        ..Default::default()
+    };
+
+    let data_source = DataSource::try_from(proto(false)).unwrap();
+    assert_eq!(data_source.store_id, Some(store_id.clone()));
+
+    assert!(
+        DataSource::try_from(proto(true)).is_err(),
+        "a prefix must not select a store"
+    );
+}
+
+#[test]
+fn datasource_segment_id_roundtrip() {
+    let segment_id = SegmentId::from("my_segment");
+    let data_source = DataSource::new_rrd("s3://bucket/file.rrd", None)
+        .unwrap()
+        .with_segment_id_override(segment_id.clone());
+
+    let proto = crate::cloud::v1alpha1::DataSource::from(data_source);
+    let data_source = DataSource::try_from(proto.clone()).unwrap();
+    assert_eq!(data_source.segment_id_override, Some(segment_id));
+
+    let prefix = crate::cloud::v1alpha1::DataSource {
+        prefix: true,
+        ..proto.clone()
+    };
+    assert!(
+        DataSource::try_from(prefix).is_err(),
+        "a prefix must not set a segment id"
+    );
+
+    let empty = crate::cloud::v1alpha1::DataSource {
+        segment_id: Some(String::new().into()),
+        ..proto
+    };
+    assert!(
+        DataSource::try_from(empty).is_err(),
+        "a segment id must not be empty"
+    );
+}
+
+// --- Tasks ---
+
+pub struct QueryTasksOnCompletionRequest {
+    pub task_ids: Vec<TaskId>,
+    pub timeout: std::time::Duration,
+}
+
+pub struct QueryTasksRequest {
+    pub task_ids: Vec<TaskId>,
+}
+
+impl TryFrom<QueryTasksOnCompletionRequest>
+    for crate::cloud::v1alpha1::QueryTasksOnCompletionRequest
+{
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: QueryTasksOnCompletionRequest,
+    ) -> Result<crate::cloud::v1alpha1::QueryTasksOnCompletionRequest, Self::Error> {
+        if value.task_ids.is_empty() {
+            return Err(missing_field!(
+                crate::cloud::v1alpha1::QueryTasksOnCompletionRequest,
+                "task_ids"
+            ));
+        }
+        let timeout: prost_types::Duration = value.timeout.try_into().map_err(|err| {
+            invalid_field!(
+                crate::cloud::v1alpha1::QueryTasksOnCompletionRequest,
+                "timeout",
+                err
+            )
+        })?;
+        Ok(Self {
+            ids: value.task_ids,
+            timeout: Some(timeout),
+        })
+    }
+}
+
+impl TryFrom<QueryTasksRequest> for crate::cloud::v1alpha1::QueryTasksRequest {
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: QueryTasksRequest,
+    ) -> Result<crate::cloud::v1alpha1::QueryTasksRequest, Self::Error> {
+        Ok(Self {
+            ids: value.task_ids,
+        })
+    }
+}
+
+// --
+
+pub struct QueryTasksOnCompletionResponse {
+    pub data: arrow::record_batch::RecordBatch,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::QueryTasksOnCompletionResponse>
+    for QueryTasksOnCompletionResponse
+{
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::QueryTasksOnCompletionResponse,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            data: value
+                .data
+                .ok_or_else(|| {
+                    missing_field!(
+                        crate::cloud::v1alpha1::QueryTasksOnCompletionResponse,
+                        "data"
+                    )
+                })?
+                .try_into()?,
+        })
+    }
+}
+
+// --
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TableInsertMode {
+    Append,
+    Overwrite,
+    Replace,
+    Update,
+}
+
+impl Default for TableInsertMode {
+    fn default() -> Self {
+        Self::Append
+    }
+}
+
+impl TryFrom<i32> for TableInsertMode {
+    type Error = TypeConversionError;
+
+    fn try_from(value: i32) -> Result<Self, TypeConversionError> {
+        let proto_value = crate::cloud::v1alpha1::TableInsertMode::try_from(value)?;
+        Ok(Self::from(proto_value))
+    }
+}
+
+impl From<crate::cloud::v1alpha1::TableInsertMode> for TableInsertMode {
+    fn from(value: crate::cloud::v1alpha1::TableInsertMode) -> Self {
+        use crate::cloud::v1alpha1 as cloud;
+        match value {
+            cloud::TableInsertMode::Unspecified | cloud::TableInsertMode::Append => Self::Append,
+            cloud::TableInsertMode::Overwrite => Self::Overwrite,
+            cloud::TableInsertMode::Replace => Self::Replace,
+            cloud::TableInsertMode::Update => Self::Update,
+        }
+    }
+}
+
+impl From<TableInsertMode> for crate::cloud::v1alpha1::TableInsertMode {
+    fn from(value: TableInsertMode) -> Self {
+        match value {
+            TableInsertMode::Append => Self::Append,
+            TableInsertMode::Overwrite => Self::Overwrite,
+            TableInsertMode::Replace => Self::Replace,
+            TableInsertMode::Update => Self::Update,
+        }
+    }
+}
+
+/// Fixed fragments of the Lance messages that `WriteTable` reports when the caller's batch
+/// does not fit the table. `re_redap_tests::write_table_rejects_bad_batches` triggers each
+/// one, so a Lance upgrade that rewords them fails CI.
+const BAD_WRITE_TABLE_INPUT_MESSAGES: &[&str] = &[
+    "Append with different schema",
+    "contained null values even though the field is marked non-null",
+    "Cannot insert rows with a partial-schema source",
+    "Ambiguous merge inserts are prohibited",
+    "Failed to encode JSON",
+];
+
+/// Whether a failed table write was caused by the caller's batch, judged by the message of
+/// any error in the `source` chain.
+pub fn is_bad_write_table_input(err: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(err), |err| err.source()).any(|err| {
+        let message = err.to_string();
+        BAD_WRITE_TABLE_INPUT_MESSAGES
+            .iter()
+            .any(|fragment| message.contains(fragment))
+    })
+}
+
+// ---
+
+/// Ergonomic counterpart to the codegen'd [`crate::cloud::v1alpha1::VersionResponse`].
+pub struct VersionResponse {
+    pub build_info: Option<re_build_info::BuildInfo>,
+    pub version: String,
+    pub cloud_provider: Option<String>,
+    pub cloud_region: Option<String>,
+
+    /// Server-supported feature flags. See `crate::cloud::v1alpha1::features`
+    /// for known feature names. An empty list means the server is older than
+    /// the client and feature-gated paths must fall back.
+    pub features: Vec<String>,
+}
+
+impl VersionResponse {
+    /// Whether the server advertises a given feature flag. Empty `features`
+    /// (old server) returns false — callers must treat that as "fall back".
+    pub fn has_feature(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+}
+
+impl From<crate::cloud::v1alpha1::VersionResponse> for VersionResponse {
+    fn from(value: crate::cloud::v1alpha1::VersionResponse) -> Self {
+        Self {
+            build_info: value.build_info.map(Into::into),
+            version: value.version,
+            cloud_provider: value.cloud_provider,
+            cloud_region: value.cloud_region,
+            features: value.features,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud::v1alpha1::ext::{
+        ChunkCandidatesDataframe, QueryDatasetDataframe, QueryTasksDataframe,
+        RegisterWithDatasetDataframe, ScanDatasetManifestDataframe,
+    };
+
+    #[test]
+    fn storage_location_alias_validation() {
+        for input in ["a", "0", "robot-storage.json", "a--b.0-1", &"a".repeat(253)] {
+            let alias = StorageLocationAlias::try_new(input).unwrap();
+            assert_eq!(String::from(alias), input);
+        }
+
+        for input in [
+            "",
+            ".",
+            ".a",
+            "a.",
+            "-a",
+            "a-",
+            "a..b",
+            "a.-b",
+            "a-.b",
+            "A",
+            "a_b",
+            "a/b",
+            "a b",
+            "é",
+            &"a".repeat(254),
+        ] {
+            assert!(StorageLocationAlias::try_new(input).is_err(), "{input:?}");
+            assert!(
+                serde_json::from_value::<StorageLocationAlias>(serde_json::json!(input)).is_err(),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn datasource_serde_keeps_legacy_location_key() {
+        let storage_location = StorageLocationAlias::try_new("robot-storage.json").unwrap();
+        let source =
+            DataSource::new_rrd("s3://bucket/file.rrd", Some(storage_location.clone())).unwrap();
+
+        let json = serde_json::to_value(&source).unwrap();
+        assert_eq!(json["object_store_config"], "robot-storage.json");
+
+        let decoded: DataSource = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.storage_location, Some(storage_location));
+    }
+
+    #[test]
+    #[expect(deprecated, reason = "Exercise both wire selector fields")]
+    fn datasource_storage_location_fields() {
+        let proto =
+            |location: Option<&str>, legacy: Option<&str>| crate::cloud::v1alpha1::DataSource {
+                storage_url: Some("s3://bucket/file.rrd".to_owned()),
+                typ: crate::cloud::v1alpha1::DataSourceKind::Rrd as i32,
+                storage_location: location.map(str::to_owned),
+                object_store_config: legacy.map(str::to_owned),
+                ..Default::default()
+            };
+        for (location, legacy, expected) in [
+            (None, None, None),
+            (Some("robot-storage.json"), None, Some("robot-storage.json")),
+            (None, Some("robot-storage.json"), Some("robot-storage.json")),
+            (Some("a"), Some("a"), Some("a")),
+        ] {
+            let source = DataSource::try_from(proto(location, legacy)).unwrap();
+            assert_eq!(
+                source
+                    .storage_location
+                    .as_ref()
+                    .map(StorageLocationAlias::as_str),
+                expected
+            );
+            let encoded: crate::cloud::v1alpha1::DataSource = source.into();
+            assert_eq!(encoded.storage_location.as_deref(), expected);
+            assert_eq!(encoded.object_store_config.as_deref(), expected);
+        }
+        for (location, legacy) in [
+            (Some("a"), Some("b")),
+            (Some(""), None),
+            (None, Some("")),
+            (Some("My_Store.json"), None),
+            (None, Some("My_Store.json")),
+        ] {
+            let err = DataSource::try_from(proto(location, legacy)).unwrap_err();
+            assert_eq!(
+                tonic::Status::from(err).code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_segment_table_response_create_dataframe() {
+        let segment_ids = vec![SegmentId::from("1"), SegmentId::from("2")];
+        let layer_names = vec![
+            vec![LayerName::from("a"), LayerName::from("b")],
+            vec![LayerName::from("c")],
+        ];
+        let storage_urls = vec![vec!["d".to_owned(), "e".to_owned()], vec!["f".to_owned()]];
+        let last_updated_at = vec![1, 2];
+        let num_chunks = vec![1, 2];
+        let size_bytes = vec![1, 2];
+
+        let batch = ScanSegmentTableResponse::create_dataframe(
+            segment_ids,
+            layer_names,
+            storage_urls,
+            last_updated_at,
+            num_chunks,
+            size_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ScanSegmentTableDataframe::max_schema(),
+            "the builder must produce exactly the declared columns (no stray extra columns)"
+        );
+    }
+
+    #[test]
+    fn test_version_response_has_feature() {
+        let resp = VersionResponse {
+            build_info: None,
+            version: "1.2.3".to_owned(),
+            cloud_provider: None,
+            cloud_region: None,
+            features: vec!["per_segment_index_values".to_owned(), "future_X".to_owned()],
+        };
+        assert!(resp.has_feature(crate::cloud::v1alpha1::features::PER_SEGMENT_INDEX_VALUES));
+        assert!(resp.has_feature("future_X"));
+        assert!(!resp.has_feature("nonexistent"));
+    }
+
+    #[test]
+    fn test_version_response_old_server_empty_features() {
+        // Old server returns features=vec![] (default for unknown field).
+        let resp = VersionResponse {
+            build_info: None,
+            version: "0.5.0".to_owned(),
+            cloud_provider: None,
+            cloud_region: None,
+            features: vec![],
+        };
+        assert!(!resp.has_feature(crate::cloud::v1alpha1::features::PER_SEGMENT_INDEX_VALUES));
+    }
+
+    #[test]
+    fn test_features_constants_self_consistent() {
+        // The advertise list must contain every constant we publish, and only those.
+        let advertised = crate::cloud::v1alpha1::features::all_supported_features();
+        assert!(
+            advertised
+                .contains(&crate::cloud::v1alpha1::features::PER_SEGMENT_INDEX_VALUES.to_owned())
+        );
+    }
+
+    #[test]
+    fn test_scan_dataset_manifest_dataframe() {
+        let layer_name = vec![LayerName::from("a")];
+        let segment_id = vec![SegmentId::from("1")];
+        let storage_url = vec!["d".to_owned()];
+        let layer_type = vec!["c".to_owned()];
+        let registration_time = vec![1];
+        let last_updated_at = vec![2];
+        let num_chunks = vec![1];
+        let size_bytes = vec![2];
+        let schema_sha256 = vec![SchemaId::from_sha256([1; 32])];
+        let registration_status = vec![LayerRegistrationStatus::Done.to_string()];
+
+        let batch = ScanDatasetManifestDataframe::new(
+            layer_name,
+            segment_id,
+            storage_url,
+            layer_type,
+            registration_time,
+            last_updated_at,
+            num_chunks,
+            size_bytes,
+            schema_sha256,
+            registration_status,
+        )
+        .into_record_batch()
+        .unwrap();
+
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ScanDatasetManifestDataframe::max_schema(),
+            "the builder must produce exactly the declared columns (no stray extra columns)"
+        );
+    }
+
+    /// Snapshot-friendly schema description, in declared column order.
+    fn format_schema(schema: &Schema) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for field in schema.fields() {
+            let nullability = if field.is_nullable() {
+                "nullable"
+            } else {
+                "non-null"
+            };
+            write!(
+                &mut out,
+                "{}: {nullability} {}",
+                field.name(),
+                field.data_type()
+            )
+            .expect("infallible");
+            let metadata = field.metadata().iter().sorted().collect_vec();
+            if metadata.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(" [\n");
+                for (key, value) in metadata {
+                    writeln!(&mut out, "    {key}: {value:?}").expect("infallible");
+                }
+                out.push_str("]\n");
+            }
+        }
+        out
+    }
+
+    /// Pin the wire schemas of all dataframe responses, including column order,
+    /// nullability, and field metadata.
+    ///
+    /// If one of these snapshots changes, you are changing the public wire format —
+    /// make sure all consumers can handle it.
+    #[test]
+    fn dataframe_schema_snapshots() {
+        insta::assert_snapshot!(
+            "query_dataset_dataframe_schema",
+            format_schema(&QueryDatasetDataframe::max_schema())
+        );
+        insta::assert_snapshot!(
+            "chunk_candidates_dataframe_schema",
+            format_schema(&ChunkCandidatesDataframe::max_schema())
+        );
+        insta::assert_snapshot!(
+            "query_tasks_dataframe_schema",
+            format_schema(&QueryTasksDataframe::max_schema())
+        );
+        insta::assert_snapshot!(
+            "register_with_dataset_dataframe_schema",
+            format_schema(&RegisterWithDatasetDataframe::max_schema())
+        );
+        insta::assert_snapshot!(
+            "scan_dataset_manifest_dataframe_schema",
+            format_schema(&ScanDatasetManifestDataframe::max_schema())
+        );
+        insta::assert_snapshot!(
+            "scan_segment_table_dataframe_schema",
+            format_schema(&ScanSegmentTableDataframe::max_schema())
+        );
+    }
+
+    #[test]
+    fn object_key_validation() {
+        let longest = "a".repeat(ObjectKey::MAX_LEN);
+        for valid in ["recording.rrd", "user/project-1/a.rrd", "a.b/c_d", &longest] {
+            assert_eq!(ObjectKey::try_new(valid).unwrap().to_string(), valid);
+        }
+
+        let too_long = "a".repeat(ObjectKey::MAX_LEN + 1);
+        for invalid in [
+            "",
+            "/a.rrd",
+            "a.rrd/",
+            "a//b",
+            ".",
+            "..",
+            "a b",
+            "a\\b",
+            "a/../b",
+            "a/.git/b",
+            "a./b",
+            "\u{e4}.rrd",
+            &too_long,
+        ] {
+            assert!(ObjectKey::try_new(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn write_access_grant_request_supported_upload_methods() {
+        use crate::cloud::v1alpha1::GetWriteAccessGrantRequest as Proto;
+        use crate::cloud::v1alpha1::UploadMethod::{Multipart, SingleRequest, Unspecified};
+
+        for (supported_upload_methods, expected) in [
+            (vec![], vec![SingleRequest]),
+            (vec![Unspecified.into()], vec![]),
+            (vec![Multipart.into()], vec![Multipart]),
+        ] {
+            let proto = Proto {
+                key: "recording.rrd".to_owned(),
+                supported_upload_methods,
+                ..Default::default()
+            };
+            let parsed = GetWriteAccessGrantRequest::try_from(proto.clone()).unwrap();
+            let roundtrip =
+                GetWriteAccessGrantRequest::try_from(Proto::from(parsed.clone())).unwrap();
+
+            for method in [SingleRequest, Multipart, Unspecified] {
+                assert_eq!(
+                    parsed.accepts(method),
+                    expected.contains(&method),
+                    "{method:?} with wire methods {:?}",
+                    proto.supported_upload_methods,
+                );
+                assert_eq!(
+                    roundtrip.accepts(method),
+                    expected.contains(&method),
+                    "{method:?} after roundtrip with wire methods {:?}",
+                    proto.supported_upload_methods,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_grant_roundtrip_and_validation() {
+        let grant = crate::cloud::v1alpha1::AccessGrant {
+            signing: UrlSigning::Signed.into(),
+            expires_at: Some(common_ext::timestamp_to_proto(
+                jiff::Timestamp::new(1_700_000_000, 0).unwrap(),
+            )),
+            redemption: Some(
+                crate::cloud::v1alpha1::access_grant::Redemption::MultipartSession(
+                    crate::cloud::v1alpha1::MultipartSession {
+                        upload_token: b"opaque-token".as_slice().into(),
+                        part_size_bytes: 8 * 1024 * 1024,
+                        part_requests: vec![],
+                        max_part_count: None,
+                    },
+                ),
+            ),
+        };
+        let parsed = AccessGrant::try_from(grant.clone()).unwrap();
+        assert!(matches!(parsed.redemption, Redemption::MultipartSession(_)));
+        assert_eq!(
+            crate::cloud::v1alpha1::AccessGrant::try_from(parsed).unwrap(),
+            grant
+        );
+
+        let Some(crate::cloud::v1alpha1::access_grant::Redemption::MultipartSession(mut request)) =
+            grant.redemption
+        else {
+            panic!("expected multipart session");
+        };
+        for max_part_count in [None, Some(1), Some(u32::MAX)] {
+            request.max_part_count = max_part_count;
+            let parsed = MultipartSession::try_from(request.clone())
+                .expect("valid multipart session should parse");
+            assert_eq!(parsed.max_part_count.map(NonZeroU32::get), max_part_count);
+            assert_eq!(
+                crate::cloud::v1alpha1::MultipartSession::try_from(parsed)
+                    .expect("valid multipart session should serialize"),
+                request
+            );
+        }
+        request.max_part_count = Some(0);
+        assert!(MultipartSession::try_from(request.clone()).is_err());
+        request.max_part_count = Some(1);
+        request.part_size_bytes = 0;
+        assert!(MultipartSession::try_from(request.clone()).is_err());
+        request.part_size_bytes = 1;
+        request.upload_token = prost::bytes::Bytes::new();
+        assert!(MultipartSession::try_from(request).is_err());
+    }
+
+    #[test]
+    fn http_request_conversion_validates_url_and_headers() {
+        let proto = crate::cloud::v1alpha1::HttpRequest {
+            method: "PUT".to_owned(),
+            url: "https://bucket.example/key?sig=1".to_owned(),
+            headers: vec![
+                crate::cloud::v1alpha1::HttpHeader {
+                    name: "Content-Type".to_owned(),
+                    value: "application/octet-stream".to_owned(),
+                },
+                crate::cloud::v1alpha1::HttpHeader {
+                    name: "x-amz-meta-a".to_owned(),
+                    value: "1".to_owned(),
+                },
+                crate::cloud::v1alpha1::HttpHeader {
+                    name: "x-amz-meta-a".to_owned(),
+                    value: "2".to_owned(),
+                },
+                crate::cloud::v1alpha1::HttpHeader {
+                    name: "x-amz-meta-source-name".to_owned(),
+                    value: "über.rrd".to_owned(),
+                },
+            ],
+            same_origin: false,
+        };
+
+        let request = HttpRequest::try_from(proto.clone()).unwrap();
+        let HttpRequest::External {
+            ref method,
+            ref headers,
+            ..
+        } = request
+        else {
+            panic!("expected external request");
+        };
+        assert_eq!(method, http::Method::PUT);
+        assert_eq!(headers.get_all("x-amz-meta-a").iter().count(), 2);
+        let round_tripped = crate::cloud::v1alpha1::HttpRequest::try_from(request).unwrap();
+        let expected = crate::cloud::v1alpha1::HttpRequest {
+            headers: proto
+                .headers
+                .iter()
+                .map(|header| crate::cloud::v1alpha1::HttpHeader {
+                    name: header.name.to_ascii_lowercase(),
+                    ..header.clone()
+                })
+                .collect(),
+            ..proto.clone()
+        };
+        assert_eq!(round_tripped, expected);
+
+        for bad_method in ["put", "POST", "QUERY", "PU T"] {
+            let proto = crate::cloud::v1alpha1::HttpRequest {
+                method: bad_method.to_owned(),
+                ..proto.clone()
+            };
+            assert!(HttpRequest::try_from(proto).is_err(), "{bad_method:?}");
+        }
+
+        for bad_url in ["file:///does/not/exist.rrd", "not a url", "mailto:a@b"] {
+            let proto = crate::cloud::v1alpha1::HttpRequest {
+                url: bad_url.to_owned(),
+                ..proto.clone()
+            };
+            assert!(HttpRequest::try_from(proto).is_err(), "{bad_url:?}");
+        }
+
+        let proto = crate::cloud::v1alpha1::HttpRequest {
+            headers: vec![crate::cloud::v1alpha1::HttpHeader {
+                name: "bad header".to_owned(),
+                value: "1".to_owned(),
+            }],
+            ..proto
+        };
+        assert!(HttpRequest::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn http_request_conversion_validates_same_origin_url() {
+        let proto = crate::cloud::v1alpha1::HttpRequest {
+            method: "PUT".to_owned(),
+            url: "/upload/grant?part=1".to_owned(),
+            headers: vec![],
+            same_origin: true,
+        };
+
+        let request = HttpRequest::try_from(proto.clone()).unwrap();
+        let HttpRequest::SameOrigin { path_and_query, .. } = request else {
+            panic!("expected same-origin request");
+        };
+        assert_eq!(path_and_query.as_str(), "/upload/grant?part=1");
+
+        for bad_url in ["upload/grant", "https://bucket.example/key"] {
+            let proto = crate::cloud::v1alpha1::HttpRequest {
+                url: bad_url.to_owned(),
+                ..proto.clone()
+            };
+            assert!(HttpRequest::try_from(proto).is_err(), "{bad_url:?}");
+        }
+    }
+
+    #[test]
+    fn http_request_conversion_rejects_too_many_headers() {
+        // `http::HeaderMap` caps the number of distinct names, not the number of values.
+        let proto = crate::cloud::v1alpha1::HttpRequest {
+            method: "PUT".to_owned(),
+            url: "https://bucket.example/key".to_owned(),
+            headers: (0..1 << 16)
+                .map(|i| crate::cloud::v1alpha1::HttpHeader {
+                    name: format!("x-amz-meta-{i}"),
+                    value: "1".to_owned(),
+                })
+                .collect(),
+            same_origin: false,
+        };
+        assert!(HttpRequest::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn http_request_conversion_rejects_a_non_utf8_header_value() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::HeaderName::from_static("x-amz-meta-a"),
+            http::HeaderValue::from_bytes(&[0xff]).expect("valid opaque header value"),
+        );
+        let request = HttpRequest::External {
+            method: http::Method::PUT,
+            url: "https://bucket.example/key".parse().expect("valid url"),
+            headers,
+        };
+
+        assert!(crate::cloud::v1alpha1::HttpRequest::try_from(request).is_err());
+    }
+
+    #[test]
+    fn name_selection_round_trips() {
+        let explicit = IndexingPolicySelection::Explicit(["b".to_owned(), "a".to_owned()].into());
+        for selection in [IndexingPolicySelection::All, explicit] {
+            let proto = crate::cloud::v1alpha1::IndexingPolicySelection::from(selection.clone());
+            let back =
+                IndexingPolicySelection::try_from(proto).expect("a set selection converts back");
+            assert_eq!(back, selection);
+        }
+
+        let proto = crate::cloud::v1alpha1::IndexingPolicySelection::from(
+            IndexingPolicySelection::Explicit(["b".to_owned(), "a".to_owned()].into()),
+        );
+        let Some(crate::cloud::v1alpha1::indexing_policy_selection::Selection::Explicit(list)) =
+            proto.selection
+        else {
+            panic!("expected an explicit selection");
+        };
+        assert_eq!(list.names, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn policy_conversion_reports_the_missing_field() {
+        let result =
+            IndexingPolicySelection::try_from(crate::cloud::v1alpha1::IndexingPolicySelection {
+                selection: None,
+            });
+        assert!(
+            matches!(
+                result,
+                Err(TypeConversionError::MissingField {
+                    field_name: "selection",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+
+        let result = ChunkIndexingPolicy::try_from(crate::cloud::v1alpha1::ChunkIndexingPolicy {
+            entity_paths: Some(IndexingPolicySelection::All.into()),
+            timelines: None,
+        });
+        assert!(
+            matches!(
+                result,
+                Err(TypeConversionError::MissingField {
+                    field_name: "timelines",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn chunk_indexing_policy_normalizes_entity_paths() {
+        let explicit = ChunkIndexingPolicy::explicit(["a/b"], ["a/b"]);
+        assert_eq!(
+            explicit.entity_paths,
+            IndexingPolicySelection::Explicit(["/a/b".to_owned()].into())
+        );
+        assert_eq!(
+            explicit.timelines,
+            IndexingPolicySelection::Explicit(["a/b".to_owned()].into()),
+            "timeline names are not paths"
+        );
+
+        let decoded = ChunkIndexingPolicy::try_from(crate::cloud::v1alpha1::ChunkIndexingPolicy {
+            entity_paths: Some(
+                IndexingPolicySelection::Explicit(["a/b".to_owned(), "/a/b".to_owned()].into())
+                    .into(),
+            ),
+            timelines: Some(IndexingPolicySelection::Explicit(["a/b".to_owned()].into()).into()),
+        })
+        .expect("a complete policy decodes");
+        assert_eq!(decoded, explicit);
+    }
+
+    #[test]
+    fn resolve_chunk_indexing_policy_fills_only_an_unset_policy() {
+        let mut details = DatasetDetails::default();
+        details.resolve_chunk_indexing_policy(ChunkIndexingPolicy::NOTHING);
+        assert_eq!(
+            details.policy,
+            Some(DatasetPolicy {
+                chunk_indexing_policy: Some(ChunkIndexingPolicy::NOTHING),
+            })
+        );
+
+        let mut details = DatasetDetails {
+            policy: Some(DatasetPolicy {
+                chunk_indexing_policy: Some(ChunkIndexingPolicy::ALL),
+            }),
+            ..Default::default()
+        };
+        details.resolve_chunk_indexing_policy(ChunkIndexingPolicy::NOTHING);
+        assert_eq!(
+            details.policy,
+            Some(DatasetPolicy {
+                chunk_indexing_policy: Some(ChunkIndexingPolicy::ALL),
+            })
+        );
+    }
+}

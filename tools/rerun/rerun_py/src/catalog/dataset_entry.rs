@@ -1,0 +1,1331 @@
+use std::num::NonZeroU64;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use arrow::array::RecordBatch;
+use arrow::datatypes::Schema as ArrowSchema;
+use arrow::pyarrow::PyArrowType;
+use parking_lot::Mutex;
+use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyValueError};
+use pyo3::types::{PyAnyMethods as _, PyTuple};
+use pyo3::{Bound, Py, PyAny, PyRef, PyRefMut, PyResult, Python, pyclass, pymethods};
+use re_catalog_client::{BlueprintName, DatasetSelection};
+use re_chunk_store::LazyStore;
+use re_datafusion::{DatasetManifestProvider, SegmentTableProvider};
+use re_log_types::EntryId;
+use re_protos::cloud::v1alpha1::DatasetQueryScope;
+use re_protos::cloud::v1alpha1::ext::{
+    DatasetDetails, DatasetEntry, EntryDetails, ObjectKey, StorageLocationAlias,
+};
+use re_protos::common::v1alpha1::ext::{DatasetHandle, IfDuplicateBehavior, SegmentId};
+use re_redap_client::{DatasetSchema, SegmentChunkProvider};
+use re_types_core::LayerName;
+
+use super::chunk_indexing_policy::{PyNameSelection, to_policy, to_py_tuple};
+use super::registration_handle::{DEFAULT_TIMEOUT_SECS, PyRegistrationHandleInternal};
+use super::write_operation::PyWriteOperationInternal;
+use super::{
+    BlueprintFields, PyCatalogClientInternal, PyDatasetInfoInternal, PyEntryDetails,
+    PyTableProviderAdapterInternal, blueprint_fields, parse_blueprint_kind, to_py_err,
+};
+use crate::catalog::PySchemaInternal;
+use crate::catalog::entry::set_entry_name;
+use crate::catalog::policy_handle::PyDatasetPolicyHandleInternal;
+use crate::catalog::unregistration_handle::PyUnregistrationHandleInternal;
+use crate::chunk_stream::lazy_store::PyLazyStoreInternal;
+use crate::trace_context::read_trace_context_from_python;
+use crate::utils::wait_for_future;
+
+/// A dataset entry in the catalog.
+#[pyclass(
+    name = "DatasetEntryInternal",
+    module = "rerun_bindings.rerun_bindings"
+)]
+pub struct PyDatasetEntryInternal {
+    client: Py<PyCatalogClientInternal>,
+    entry_details: EntryDetails,
+    dataset_details: DatasetDetails,
+    dataset_handle: DatasetHandle,
+
+    /// The schema last fetched, keyed on the dataset revision it describes.
+    dataset_schema: SchemaCache,
+}
+
+/// A dataset schema cached alongside the revision it describes.
+///
+/// Entries are only valid while the process-wide watermark in
+/// [`re_redap_client::dataset_revisions`] still equals the cached revision, so a schema whose
+/// revision the server did not report is never stored.
+struct SchemaCache(Mutex<Option<CachedSchema>>);
+
+impl SchemaCache {
+    fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// The cached schema, if it describes exactly `watermark`.
+    fn try_get(&self, watermark: NonZeroU64) -> Option<ArrowSchema> {
+        let guard = self.0.lock();
+        let cached = guard.as_ref()?;
+        if cached.revision == watermark {
+            Some(cached.schema.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Record a freshly fetched schema.
+    ///
+    /// Writes are monotonic in revision: concurrent fetches may complete out of order, and an
+    /// older response must not evict a newer one. A schema without a revision is not cached.
+    fn observe(&self, fetched: &DatasetSchema) {
+        let Some(fetched_revision) = fetched.revision else {
+            return;
+        };
+
+        let mut guard = self.0.lock();
+        if guard
+            .as_ref()
+            .is_some_and(|cached| fetched_revision <= cached.revision)
+        {
+            return;
+        }
+
+        *guard = Some(CachedSchema {
+            revision: fetched_revision,
+            schema: fetched.schema.clone(),
+        });
+    }
+}
+
+struct CachedSchema {
+    revision: NonZeroU64,
+    schema: ArrowSchema,
+}
+
+impl PyDatasetEntryInternal {
+    pub fn new(client: Py<PyCatalogClientInternal>, dataset_entry: DatasetEntry) -> Self {
+        Self {
+            client,
+            entry_details: dataset_entry.details,
+            dataset_details: dataset_entry.dataset_details,
+            dataset_handle: dataset_entry.handle,
+            dataset_schema: SchemaCache::new(),
+        }
+    }
+
+    pub fn client(&self) -> &Py<PyCatalogClientInternal> {
+        &self.client
+    }
+
+    pub fn entry_id(&self) -> EntryId {
+        self.entry_details.id
+    }
+
+    pub fn asset_dataset_id(&self) -> Option<EntryId> {
+        self.dataset_details.asset_dataset
+    }
+
+    /// An overview of what `selection`, a selection of this dataset, keeps.
+    pub fn selection_info(
+        &self,
+        py: Python<'_>,
+        selection: DatasetSelection,
+    ) -> PyResult<PyDatasetInfoInternal> {
+        re_log::debug_assert_eq!(selection.dataset_id(), self.entry_details.id);
+        let connection = self.client.borrow(py).connection().clone();
+        let info = wait_for_future(py, async {
+            connection
+                .inner()
+                .get_dataset_info(selection)
+                .await
+                .map_err(to_py_err)
+        })?;
+        Ok(PyDatasetInfoInternal::new(
+            self.entry_details.name.to_string(),
+            info,
+        ))
+    }
+}
+
+#[pymethods]
+impl PyDatasetEntryInternal {
+    //
+    // Entry methods
+    //
+
+    fn catalog(&self, py: Python<'_>) -> Py<PyCatalogClientInternal> {
+        self.client.clone_ref(py)
+    }
+
+    fn entry_details(&self, py: Python<'_>) -> PyResult<Py<PyEntryDetails>> {
+        Py::new(py, PyEntryDetails(self.entry_details.clone()))
+    }
+
+    /// Delete this entry from the catalog.
+    fn delete(&mut self, py: Python<'_>) -> PyResult<()> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.delete").entered();
+        let connection = self.client.borrow_mut(py).connection().clone();
+        connection.delete_entry(py, self.entry_details.id)
+    }
+
+    fn set_name(&mut self, py: Python<'_>, name: String) -> PyResult<()> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.set_name").entered();
+        set_entry_name(py, name, &mut self.entry_details, &self.client)
+    }
+
+    //
+    // Dataset entry methods
+    //
+
+    /// The stored policy as `(entity_paths, timelines)`, each a sorted list or `"all"`.
+    ///
+    /// `None` if the server reported no policy.
+    fn chunk_indexing_policy(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Option<Py<PyTuple>>> {
+        self_
+            .dataset_details
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.chunk_indexing_policy.as_ref())
+            .map(|policy| to_py_tuple(py, policy))
+            .transpose()
+    }
+
+    /// Applies the policy to the dataset. `None` resets the dataset to index everything.
+    #[pyo3(signature = (policy))]
+    fn set_chunk_indexing_policy(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'_>,
+        policy: Option<(PyNameSelection, PyNameSelection)>,
+    ) -> PyResult<PyDatasetPolicyHandleInternal> {
+        let _span =
+            read_trace_context_from_python(py, "DatasetEntry.set_chunk_indexing_policy").entered();
+        let chunk_indexing_policy = policy
+            .map(|(entity_paths, timelines)| to_policy(entity_paths, timelines))
+            .transpose()?;
+        let policy = re_protos::cloud::v1alpha1::ext::DatasetPolicy {
+            chunk_indexing_policy,
+        };
+        let connection = self_.client.borrow(py).connection().clone();
+        let result = connection.apply_dataset_policy(py, self_.entry_details.id, policy)?;
+        self_.dataset_details = result.dataset_entry.dataset_details;
+        Ok(PyDatasetPolicyHandleInternal::new(
+            self_.client.clone_ref(py),
+            result.task_ids,
+        ))
+    }
+
+    fn segment(self_: PyRef<'_, Self>, segment_id: String) -> PyResult<super::PySegmentInternal> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.segment").entered();
+        super::PySegmentInternal::new(py, Py::from(self_), SegmentId::new(segment_id))
+    }
+
+    fn layer(self_: PyRef<'_, Self>, name: String) -> PyResult<super::PyLayerInternal> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.layer").entered();
+        let name = LayerName::try_new(name).map_err(to_py_err)?;
+        let connection = self_.client.borrow(py).connection().clone();
+        let dataset_id = self_.entry_id();
+        let layers = wait_for_future(py, async {
+            connection
+                .inner()
+                .get_dataset_layers(dataset_id)
+                .await
+                .map_err(to_py_err)
+        })?;
+        if !layers.contains(&name) {
+            let mut available: Vec<_> = layers.into_iter().map(LayerName::into_string).collect();
+            available.sort();
+            return Err(PyValueError::new_err(format!(
+                "Layer {name:?} not found in dataset {dataset_id}. Available layers: {available:?}"
+            )));
+        }
+        Ok(super::PyLayerInternal::new(Py::from(self_), name))
+    }
+
+    /// Return the dataset manifest URL.
+    //TODO(ab): not sure we want this to be public
+    #[getter]
+    fn manifest_url(&self) -> String {
+        self.dataset_handle.url.to_string()
+    }
+
+    /// The newest dataset revision this process has observed, or `None` if the server reports none.
+    ///
+    /// Any reader built while this value is unchanged reuses the cached schema.
+    fn _dataset_revision(&self) -> Option<u64> {
+        re_redap_client::dataset_revisions()
+            .get(self.entry_details.id)
+            .map(NonZeroU64::get)
+    }
+
+    /// The associated blueprint dataset, if any.
+    fn blueprint_dataset(self_: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<Self>>> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.blueprint_dataset").entered();
+        let Some(blueprint_dataset_entry_id) = self_.dataset_details.blueprint_dataset else {
+            return Ok(None);
+        };
+
+        let client = self_.client.clone_ref(py);
+        let connection = self_.client.borrow(py).connection().clone();
+
+        let dataset_entry = connection.read_dataset(py, blueprint_dataset_entry_id)?;
+
+        Some(Py::new(py, Self::new(client, dataset_entry))).transpose()
+    }
+
+    /// The associated asset dataset, if any.
+    fn asset_dataset(self_: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<Self>>> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.asset_dataset").entered();
+        let Some(asset_dataset_entry_id) = self_.dataset_details.asset_dataset else {
+            return Ok(None);
+        };
+
+        let client = self_.client.clone_ref(py);
+        let connection = self_.client.borrow(py).connection().clone();
+
+        let dataset_entry = connection.read_dataset(py, asset_dataset_entry_id)?;
+
+        Some(Py::new(py, Self::new(client, dataset_entry))).transpose()
+    }
+
+    /// Ask the server to create a missing asset dataset.
+    ///
+    /// Datasets created before asset datasets were introduced don't have one until their entry
+    /// is next updated, so send the server an update carrying the current details.
+    fn _ensure_asset_dataset(mut self_: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        let _span =
+            read_trace_context_from_python(py, "DatasetEntry._ensure_asset_dataset").entered();
+        if self_.dataset_details.asset_dataset.is_some() {
+            return Ok(());
+        }
+
+        let connection = self_.client.borrow(py).connection().clone();
+
+        let result =
+            connection.update_dataset(py, self_.entry_details.id, self_.dataset_details.clone())?;
+
+        self_.dataset_details = result.dataset_details;
+
+        Ok(())
+    }
+
+    /// The asset segments that apply to `segment_id`, from this dataset's asset dataset.
+    fn assets_for_segment(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        segment_id: String,
+    ) -> PyResult<Vec<String>> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.assets_for_segment").entered();
+        let Some(asset_dataset) = self_.dataset_details.asset_dataset else {
+            // Any dataset that holds assets is guaranteed to have an associated asset_dataset
+            return Ok(Vec::new());
+        };
+        let connection = self_.client.borrow(py).connection().clone();
+
+        connection.get_assets_for_segment(py, asset_dataset, segment_id)
+    }
+
+    /// One segment's mutable properties as a single-row `RecordBatch`, plus its revision.
+    ///
+    /// `None` means the segment has no properties.
+    fn get_segment_properties(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        segment_id: String,
+    ) -> PyResult<Option<(PyArrowType<RecordBatch>, u64)>> {
+        let _span =
+            read_trace_context_from_python(py, "DatasetEntry.get_segment_properties").entered();
+        let connection = self_.client.borrow(py).connection().clone();
+
+        Ok(connection
+            .get_segment_properties(py, self_.entry_details.id, segment_id)?
+            .map(|(batch, revision)| (PyArrowType(batch), revision)))
+    }
+
+    /// Replace one segment's mutable properties, returning the new revision.
+    ///
+    /// With `expected_revision` set the write only lands if the stored revision matches, and raises
+    /// otherwise. `0` means "only if the segment has no properties yet".
+    #[pyo3(signature = (segment_id, properties, expected_revision = None))]
+    fn set_segment_properties(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        segment_id: String,
+        properties: PyArrowType<RecordBatch>,
+        expected_revision: Option<u64>,
+    ) -> PyResult<u64> {
+        let _span =
+            read_trace_context_from_python(py, "DatasetEntry.set_segment_properties").entered();
+        let connection = self_.client.borrow(py).connection().clone();
+
+        connection.set_segment_properties(
+            py,
+            self_.entry_details.id,
+            segment_id,
+            &properties.0,
+            expected_revision,
+        )
+    }
+
+    /// Delete the mutable properties of the given segments.
+    fn delete_segment_properties(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        segment_ids: Vec<String>,
+    ) -> PyResult<()> {
+        let _span =
+            read_trace_context_from_python(py, "DatasetEntry.delete_segment_properties").entered();
+        let connection = self_.client.borrow(py).connection().clone();
+
+        connection.delete_segment_properties(py, self_.entry_details.id, segment_ids)
+    }
+
+    /// Each blueprint, with this dataset as the blueprint dataset.
+    fn blueprints(self_: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Vec<BlueprintFields>> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.blueprints").entered();
+        let connection = self_.client.borrow(py).connection().clone();
+        let blueprint_dataset = self_.entry_details.id;
+
+        let blueprints = wait_for_future(py, async {
+            connection
+                .inner()
+                .get_blueprints(blueprint_dataset)
+                .await
+                .map_err(to_py_err)
+        })?;
+        Ok(blueprints.into_iter().map(blueprint_fields).collect())
+    }
+
+    /// The blueprint with this name, if any, with this dataset as the blueprint dataset.
+    ///
+    /// Raises `ValueError` if `name` is empty.
+    fn blueprint_by_name(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        name: String,
+    ) -> PyResult<Option<BlueprintFields>> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.blueprint_by_name").entered();
+        let name = BlueprintName::try_new(name).map_err(to_py_err)?;
+        let connection = self_.client.borrow(py).connection().clone();
+        let blueprint_dataset = self_.entry_details.id;
+
+        let blueprint = wait_for_future(py, async {
+            connection
+                .inner()
+                .get_blueprint_by_name(blueprint_dataset, &name)
+                .await
+                .map_err(to_py_err)
+        })?;
+        Ok(blueprint.map(blueprint_fields))
+    }
+
+    /// Name a blueprint, with this dataset as the blueprint dataset, and return the renamed
+    /// blueprint.
+    ///
+    /// Raises `ValueError` if `name` is empty, and `AlreadyExistsError` if another blueprint has
+    /// this name.
+    fn set_blueprint_name(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        segment_id: String,
+        name: String,
+    ) -> PyResult<BlueprintFields> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.set_blueprint_name").entered();
+        let name = BlueprintName::try_new(name).map_err(to_py_err)?;
+        let connection = self_.client.borrow(py).connection().clone();
+        let blueprint_dataset = self_.entry_details.id;
+
+        let blueprint = wait_for_future(py, async {
+            connection
+                .inner()
+                .set_blueprint_name(blueprint_dataset, SegmentId::from(segment_id), &name)
+                .await
+                .map_err(to_py_err)
+        })?;
+        Ok(blueprint_fields(blueprint))
+    }
+
+    /// Register a blueprint, with this dataset as the blueprint dataset, and return the
+    /// registered blueprint.
+    ///
+    /// With a `name`, the blueprint is registered under that name. With `None`, a new blueprint
+    /// has no name, and a blueprint that is already registered keeps its name.
+    ///
+    /// `kind` is `"recording"` or `"table"`.
+    ///
+    /// Raises `ValueError` if `name` is empty or `kind` is unknown, and `AlreadyExistsError` if a
+    /// blueprint with another segment ID has this name.
+    #[pyo3(signature = (uri, name, storage_location, *, kind))]
+    fn register_blueprint(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        uri: String,
+        name: Option<String>,
+        storage_location: Option<String>,
+        kind: &str,
+    ) -> PyResult<BlueprintFields> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.register_blueprint").entered();
+        let name = name
+            .map(BlueprintName::try_new)
+            .transpose()
+            .map_err(to_py_err)?;
+        let storage_location = parse_storage_location(storage_location)?;
+        let kind = parse_blueprint_kind(kind)?;
+        let connection = self_.client.borrow(py).connection().clone();
+        let blueprint_dataset = self_.entry_details.id;
+
+        let blueprint = wait_for_future(py, async {
+            connection
+                .inner()
+                .register_blueprint(
+                    blueprint_dataset,
+                    uri,
+                    name.as_ref(),
+                    kind,
+                    storage_location,
+                    std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+                )
+                .await
+                .map_err(to_py_err)
+        })?;
+        Ok(blueprint_fields(blueprint))
+    }
+
+    /// The default `kind` blueprint of this dataset, if any. `kind` is `"recording"` or `"table"`.
+    #[pyo3(signature = (*, kind))]
+    fn default_blueprint(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        kind: &str,
+    ) -> PyResult<Option<BlueprintFields>> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.default_blueprint").entered();
+        let kind = parse_blueprint_kind(kind)?;
+        let connection = self_.client.borrow(py).connection().clone();
+        let dataset_id = self_.entry_details.id;
+
+        let blueprint = wait_for_future(py, async {
+            connection
+                .inner()
+                .get_dataset_default_blueprint(dataset_id, kind)
+                .await
+                .map_err(to_py_err)
+        })?;
+        Ok(blueprint.map(blueprint_fields))
+    }
+
+    /// Set the default `kind` blueprint of this dataset to the blueprint with this segment ID, or
+    /// clear it with `None`. `kind` is `"recording"` or `"table"`.
+    #[pyo3(signature = (segment_id, *, kind))]
+    fn set_default_blueprint(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'_>,
+        segment_id: Option<String>,
+        kind: &str,
+    ) -> PyResult<()> {
+        let _span =
+            read_trace_context_from_python(py, "DatasetEntry.set_default_blueprint").entered();
+        let kind = parse_blueprint_kind(kind)?;
+        let connection = self_.client.borrow(py).connection().clone();
+        let dataset_id = self_.entry_details.id;
+
+        let dataset_entry = wait_for_future(py, async {
+            connection
+                .inner()
+                .set_dataset_default_blueprint(dataset_id, kind, segment_id.map(SegmentId::from))
+                .await
+                .map_err(to_py_err)
+        })?;
+        self_.dataset_details = dataset_entry.dataset_details;
+
+        Ok(())
+    }
+
+    /// Return the schema of the data contained in the dataset.
+    #[pyo3(signature = (*, scope = "full"))]
+    fn schema(self_: PyRef<'_, Self>, scope: &str) -> PyResult<PySchemaInternal> {
+        let _span = read_trace_context_from_python(self_.py(), "DatasetEntry.schema").entered();
+        PySchemaInternal::from_arrow_schema(Self::fetch_arrow_schema(
+            &self_,
+            parse_dataset_scope(scope)?,
+        )?)
+    }
+
+    /// Returns a list of segment IDs for the dataset.
+    pub fn segment_ids(self_: PyRef<'_, Self>) -> PyResult<Vec<String>> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.segment_ids").entered();
+        let connection = self_.client.borrow(py).connection().clone();
+
+        connection.get_dataset_segment_ids(py, self_.entry_details.id)
+    }
+
+    /// Return an overview of the dataset.
+    fn info(self_: PyRef<'_, Self>) -> PyResult<PyDatasetInfoInternal> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.info").entered();
+        self_.selection_info(py, DatasetSelection::new(self_.entry_details.id))
+    }
+
+    /// Return the segment table as a DataFusion DataFrame.
+    fn segment_table(self_: PyRef<'_, Self>) -> PyResult<Bound<'_, PyAny>> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.segment_table").entered();
+        let connection = self_.client.borrow(py).connection().clone();
+        let dataset_id = self_.entry_details.id;
+
+        let provider = wait_for_future(py, async move {
+            SegmentTableProvider::new(connection.client().await?, dataset_id)
+                .into_provider()
+                .await
+                .map_err(to_py_err)
+        })?;
+
+        let table = PyTableProviderAdapterInternal::new(provider);
+
+        let client = self_.client.borrow(py);
+        let ctx = client.ctx(py)?;
+        let ctx = ctx.bind(py);
+        drop(client);
+
+        ctx.call_method1("read_table", (table,))
+    }
+
+    /// Return the dataset manifest as a DataFusion DataFrame.
+    fn manifest(self_: PyRef<'_, Self>) -> PyResult<Bound<'_, PyAny>> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.manifest").entered();
+        let connection = self_.client.borrow(py).connection().clone();
+        let dataset_id = self_.entry_details.id;
+
+        let provider = wait_for_future(py, async move {
+            DatasetManifestProvider::new(connection.client().await?, dataset_id)
+                .into_provider()
+                .await
+                .map_err(to_py_err)
+        })?;
+
+        let table = PyTableProviderAdapterInternal::new(provider);
+
+        let client = self_.client.borrow(py);
+        let ctx = client.ctx(py)?;
+        let ctx = ctx.bind(py);
+        drop(client);
+
+        ctx.call_method1("read_table", (table,))
+    }
+
+    /// Return the URL for the given segment.
+    ///
+    /// Parameters
+    /// ----------
+    /// segment_id: str
+    ///     The ID of the segment to get the URL for.
+    ///
+    /// timeline: str | None
+    ///     The name of the timeline to display.
+    ///
+    /// start: int | datetime | timedelta | None
+    ///     The start selected time for the segment.
+    ///     Integer for ticks, datetime/nanoseconds for timestamps, or timedelta for durations.
+    ///
+    /// end: int | datetime | timedelta | None
+    ///     The end selected time for the segment.
+    ///     Integer for ticks, datetime/nanoseconds for timestamps, or timedelta for durations.
+    ///     If omitted, no time range selection is emitted (only the `#when` cursor).
+    ///
+    /// Examples
+    /// --------
+    /// # With ticks
+    /// >>> start_tick, end_time = 0, 10
+    /// >>> dataset.segment_url("some_id", "log_tick", start_tick, end_time)
+    ///
+    /// # With timestamps
+    /// >>> start_time, end_time = datetime.now() - timedelta(seconds=4), datetime.now()
+    /// >>> dataset.segment_url("some_id", "real_time", start_time, end_time)
+    ///
+    /// Returns
+    /// -------
+    /// str
+    ///     The URL for the given segment.
+    ///
+    #[pyo3(signature = (segment_id, timeline=None, start=None, end=None))]
+    fn segment_url(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        segment_id: String,
+        timeline: Option<&str>,
+        start: Option<Bound<'_, PyAny>>,
+        end: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<String> {
+        let connection = self_.client.borrow(self_.py()).connection().clone();
+
+        // Timeline with default name and no limits overrides blueprint timeline settings
+        // only override if timeline is selected
+        if timeline.is_none() && (start.is_some() || end.is_some()) {
+            return Err(PyValueError::new_err(
+                "If `start` or `end` is specified, `timeline` must also be specified.",
+            ));
+        }
+
+        // Convert Python objects to typed time cells (int → sequence, datetime → timestamp)
+        let start_cell = start
+            .as_ref()
+            .map(|s| py_object_to_time_cell(py, s))
+            .transpose()?;
+        let end_cell = end
+            .as_ref()
+            .map(|e| py_object_to_time_cell(py, e))
+            .transpose()?;
+
+        let timeline = timeline
+            .map(|timeline| {
+                re_chunk::TimelineName::try_new(timeline)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))
+            })
+            .transpose()?;
+
+        Ok(re_uri::DatasetUri {
+            origin: connection.origin().clone(),
+            dataset_id: self_.entry_details.id.id,
+            resource: re_uri::DatasetResource::Segments,
+            segment_id: Some(SegmentId::from(segment_id)),
+            fragment: re_uri::Fragment {
+                selection: None,
+                when: timeline.map(|timeline| {
+                    (
+                        timeline,
+                        start_cell.unwrap_or_else(|| {
+                            re_sdk::TimeCell::new(
+                                re_log_types::TimeType::TimestampNs,
+                                re_log_types::NonMinI64::MIN,
+                            )
+                        }),
+                    )
+                }),
+                time_selection: Option::zip(end_cell, timeline).map(|(end, timeline)| {
+                    let start = start_cell.unwrap_or(end);
+                    re_uri::TimeSelection {
+                        timeline: re_chunk::Timeline::new(timeline, start.typ()),
+                        range: re_log_types::AbsoluteTimeRange::new(start.value, end.value),
+                    }
+                }),
+            },
+        }
+        .to_string())
+    }
+
+    /// Register RRD URIs to the dataset and return a handle to track progress.
+    ///
+    /// This method initiates the registration of recordings to the dataset, and returns
+    /// a handle that can be used to wait for completion or iterate over results.
+    ///
+    /// Parameters
+    /// ----------
+    /// recording_uris: list[str]
+    ///     The URIs of the RRDs to register.
+    ///
+    /// recording_layers: list[str]
+    ///     The layers to which the recordings will be registered to.
+    ///     Must be the same length as `recording_uris`.
+    ///
+    /// on_duplicate: str
+    ///     How to handle duplicate segment layers. One of "error", "ignore", or "replace".
+    ///
+    /// segment_ids: list[str] | None
+    ///     The segment each recording is registered as, instead of its recording id.
+    ///     Must be the same length as `recording_uris`.
+    ///
+    /// storage_location: str | None
+    ///     The alias of the storage location that holds the data, as configured in the catalog.
+    ///     If `None`, the server infers the object store from the URL.
+    #[pyo3(signature = (recording_uris, recording_layers, on_duplicate, *, segment_ids = None, storage_location = None))]
+    #[pyo3(
+        text_signature = "(self, /, recording_uris, recording_layers, on_duplicate, *, segment_ids=None, storage_location=None)"
+    )]
+    fn register(
+        self_: PyRef<'_, Self>,
+        recording_uris: Vec<String>,
+        recording_layers: Vec<String>,
+        on_duplicate: &str,
+        segment_ids: Option<Vec<String>>,
+        storage_location: Option<String>,
+    ) -> PyResult<PyRegistrationHandleInternal> {
+        let py = self_.py();
+        let connection = self_.client.borrow(py).connection().clone();
+        let on_duplicate = parse_on_duplicate(on_duplicate)?;
+        let _span = read_trace_context_from_python(py, "DatasetEntry.register").entered();
+
+        let recording_layers = recording_layers
+            .into_iter()
+            .map(LayerName::try_new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_py_err)?;
+        let segment_ids = segment_ids.map(|ids| ids.into_iter().map(SegmentId::new).collect());
+        let registration = connection.register_with_dataset(
+            py,
+            self_.entry_details.id,
+            recording_uris,
+            recording_layers,
+            segment_ids,
+            on_duplicate,
+            parse_storage_location(storage_location)?,
+        )?;
+
+        Ok(PyRegistrationHandleInternal::new(registration))
+    }
+
+    #[pyo3(signature = (data, storage_prefix, kind, layer, on_duplicate, segment_id = None))]
+    fn write_bytes(
+        self_: PyRef<'_, Self>,
+        data: Vec<u8>,
+        storage_prefix: Option<&str>,
+        kind: &str,
+        layer: String,
+        on_duplicate: &str,
+        segment_id: Option<String>,
+    ) -> PyResult<PyWriteOperationInternal> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.write_bytes").entered();
+        let kind = WriteKind::parse(kind)?;
+        let segment_id = kind.segment_id(segment_id)?;
+        let layer = LayerName::try_new(layer).map_err(to_py_err)?;
+        let on_duplicate = parse_on_duplicate(on_duplicate)?;
+        let connection = self_.client.borrow(py).connection().clone();
+        let dataset_id = self_.entry_id();
+        let storage_prefix = storage_prefix.map(parse_storage_prefix).transpose()?;
+        let operation = connection.inner().start_write(async move |client| {
+            let storage_prefix = storage_prefix.as_ref();
+            let data = bytes::Bytes::from(data);
+            match kind {
+                WriteKind::Asset => {
+                    client
+                        .write_asset_bytes(
+                            dataset_id,
+                            data,
+                            storage_prefix,
+                            layer,
+                            None,
+                            on_duplicate,
+                        )
+                        .await
+                }
+                WriteKind::Blueprint => {
+                    client
+                        .write_blueprint_bytes(
+                            dataset_id,
+                            data,
+                            storage_prefix,
+                            layer,
+                            None,
+                            on_duplicate,
+                        )
+                        .await
+                }
+                WriteKind::Segment => {
+                    client
+                        .write_segment_bytes(
+                            dataset_id,
+                            data,
+                            storage_prefix,
+                            layer,
+                            segment_id,
+                            on_duplicate,
+                        )
+                        .await
+                }
+            }
+        });
+        Ok(PyWriteOperationInternal::new(operation))
+    }
+
+    #[pyo3(signature = (path, storage_prefix, kind, layer, on_duplicate, segment_id = None))]
+    fn write_path(
+        self_: PyRef<'_, Self>,
+        path: PathBuf,
+        storage_prefix: Option<&str>,
+        kind: &str,
+        layer: String,
+        on_duplicate: &str,
+        segment_id: Option<String>,
+    ) -> PyResult<PyWriteOperationInternal> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.write_path").entered();
+        let kind = WriteKind::parse(kind)?;
+        let segment_id = kind.segment_id(segment_id)?;
+        let layer = LayerName::try_new(layer).map_err(to_py_err)?;
+        let on_duplicate = parse_on_duplicate(on_duplicate)?;
+        let connection = self_.client.borrow(py).connection().clone();
+        let dataset_id = self_.entry_id();
+        let storage_prefix = storage_prefix.map(parse_storage_prefix).transpose()?;
+        let operation = connection.inner().start_write(async move |client| {
+            let storage_prefix = storage_prefix.as_ref();
+            match kind {
+                WriteKind::Asset => {
+                    client
+                        .write_asset_path(
+                            dataset_id,
+                            path,
+                            storage_prefix,
+                            layer,
+                            None,
+                            on_duplicate,
+                        )
+                        .await
+                }
+                WriteKind::Blueprint => {
+                    client
+                        .write_blueprint_path(
+                            dataset_id,
+                            path,
+                            storage_prefix,
+                            layer,
+                            None,
+                            on_duplicate,
+                        )
+                        .await
+                }
+                WriteKind::Segment => {
+                    client
+                        .write_segment_path(
+                            dataset_id,
+                            path,
+                            storage_prefix,
+                            layer,
+                            segment_id,
+                            on_duplicate,
+                        )
+                        .await
+                }
+            }
+        });
+        Ok(PyWriteOperationInternal::new(operation))
+    }
+
+    /// Unregisters segments and layers from the dataset.
+    ///
+    /// Excluding IO errors, this will always succeed as long the target dataset exists.
+    /// Corollary: unregistering data that doesn't exist is a no-op.
+    ///
+    /// This method acts as a *product* filter:
+    /// * empty `segments_to_drop` + empty `layers_to_drop`: invalid argument error
+    /// * empty `segments_to_drop` + non-empty `layers_to_drop`: remove specified layers for *all* segments
+    /// * non-empty `segments_to_drop` + empty `layers_to_drop`: remove *all* layers for specified segments
+    /// * non-empty `segments_to_drop` + non-empty `layers_to_drop`: delete *all* specified layers for *all* specified segments
+    ///
+    /// Parameters
+    /// ----------
+    /// segments_to_drop: list[str]
+    ///     The segment IDs to drop. All of them if empty.
+    ///     The final filter will be the *outer product* of this and `layers_to_drop`.
+    ///
+    /// layers_to_drop: list[str]
+    ///     The layer names to drop. All of them if empty.
+    ///     The final filter will be the *outer product* of this and `segments_to_drop`.
+    ///
+    /// force: bool
+    ///     If true, deletion will go through regardless of the segments/layers' current statuses.
+    ///     This is only useful in the very specific, catatrophic scenario where the contents of the
+    ///     task queue were lost and some tasks are now stuck in `status=pending` forever.
+    ///     Do not use this unless you know exactly what you're doing.
+    //
+    // NOTE: I'm purposefully making both parameters explicit and without default values. Deletion
+    // is a scary thing, end users should have to type every character of it.
+    #[pyo3(signature = (*, segments_to_drop, layers_to_drop, force=false))]
+    fn unregister(
+        self_: PyRef<'_, Self>,
+        segments_to_drop: Vec<String>,
+        layers_to_drop: Vec<String>,
+        force: bool,
+    ) -> PyResult<PyUnregistrationHandleInternal> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.unregister").entered();
+        let connection = self_.client.borrow(py).connection().clone();
+
+        let segments_to_drop = segments_to_drop.into_iter().map(SegmentId::new).collect();
+        let layers_to_drop = layers_to_drop
+            .into_iter()
+            .map(LayerName::try_new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_py_err)?;
+        let (request_trace_id, task_ids) = connection.unregister_from_dataset(
+            py,
+            self_.entry_details.id,
+            segments_to_drop,
+            layers_to_drop,
+            force,
+        )?;
+
+        Ok(PyUnregistrationHandleInternal::new(
+            self_.client.clone_ref(py),
+            task_ids,
+            request_trace_id,
+        ))
+    }
+
+    /// Register all RRDs under a given prefix to the dataset and return a handle to the tasks.
+    ///
+    /// A prefix is a directory-like path in an object store (e.g. an S3 bucket or ABS container).
+    /// All RRDs that are recursively found under the given prefix will be registered to the dataset.
+    ///
+    /// This method initiates the registration of the recordings to the dataset, and returns
+    /// a handle that can be used to wait for completion or iterate over results.
+    ///
+    /// Parameters
+    /// ----------
+    /// recordings_prefix: str
+    ///     The prefix under which to register all RRDs.
+    ///
+    /// layer_name: str
+    ///     The layer to which the recordings will be registered to.
+    ///
+    /// on_duplicate: str
+    ///     How to handle duplicate segment layers. One of "error", "ignore", or "replace".
+    ///
+    /// storage_location: str | None
+    ///     The alias of the storage location that holds the data, as configured in the catalog.
+    ///     If `None`, the server infers the object store from the URL.
+    #[pyo3(signature = (recordings_prefix, layer_name, on_duplicate, *, storage_location = None))]
+    #[pyo3(
+        text_signature = "(self, /, recordings_prefix, layer_name, on_duplicate, *, storage_location=None)"
+    )]
+    fn register_prefix(
+        self_: PyRef<'_, Self>,
+        recordings_prefix: String,
+        layer_name: String,
+        on_duplicate: &str,
+        storage_location: Option<String>,
+    ) -> PyResult<PyRegistrationHandleInternal> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.register_prefix").entered();
+
+        let connection = self_.client.borrow(py).connection().clone();
+        let on_duplicate = parse_on_duplicate(on_duplicate)?;
+
+        let registration = connection.register_with_dataset_prefix(
+            py,
+            self_.entry_details.id,
+            recordings_prefix,
+            LayerName::try_new(layer_name).map_err(to_py_err)?,
+            on_duplicate,
+            parse_storage_location(storage_location)?,
+        )?;
+
+        Ok(PyRegistrationHandleInternal::new(registration))
+    }
+
+    /// Open a remote segment as a [`LazyStore`][rerun.chunk.LazyStore].
+    ///
+    /// One round-trip on construction for the manifest. With `include_assets`, one more to list
+    /// the assets and one for each of their manifests. Chunks are fetched on demand.
+    #[pyo3(signature = (segment_id, *, include_assets = true))]
+    fn segment_store(
+        self_: PyRef<'_, Self>,
+        segment_id: String,
+        include_assets: bool,
+    ) -> PyResult<PyLazyStoreInternal> {
+        let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetEntry.segment_store").entered();
+        let connection = self_.client.borrow(py).connection().clone();
+        let dataset_id = self_.entry_details.id;
+        let segment_id = SegmentId::from(segment_id);
+
+        let asset_dataset_id = if include_assets {
+            self_.dataset_details.asset_dataset
+        } else {
+            None
+        };
+
+        let provider = wait_for_future(py, async {
+            SegmentChunkProvider::try_new(
+                connection.inner().connection().clone(),
+                dataset_id,
+                segment_id,
+                asset_dataset_id,
+            )
+            .await
+            .map_err(to_py_err)
+        })?;
+
+        Ok(PyLazyStoreInternal::new(LazyStore::new(Arc::new(provider))))
+    }
+
+    /// Perform maintenance tasks on the datasets.
+    #[pyo3(signature = (
+            optimize_indexes = false,
+            retrain_indexes = false,
+            compact_fragments = false,
+            cleanup_before = None,
+            unsafe_allow_recent_cleanup = false,
+    ))]
+    #[expect(clippy::fn_params_excessive_bools)]
+    fn do_maintenance(
+        self_: PyRef<'_, Self>,
+        py: Python<'_>,
+        optimize_indexes: bool,
+        retrain_indexes: bool,
+        compact_fragments: bool,
+        cleanup_before: Option<Bound<'_, PyAny>>,
+        unsafe_allow_recent_cleanup: bool,
+    ) -> PyResult<()> {
+        let _span = read_trace_context_from_python(py, "DatasetEntry.do_maintenance").entered();
+        let connection = self_.client.borrow(self_.py()).connection().clone();
+
+        let cleanup_before_nanos = cleanup_before
+            .as_ref()
+            .map(|s| py_object_to_i64(py, s))
+            .transpose()?;
+
+        let cleanup_before = cleanup_before_nanos
+            .map(|ts_nanos| {
+                jiff::Timestamp::from_nanosecond(ts_nanos as i128).map_err(|err| {
+                    PyRuntimeError::new_err(format!(
+                        "failed converting cleanup_before timestamp: {err}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let dataset_id = self_.entry_details.id;
+        wait_for_future(py, async {
+            connection
+                .client()
+                .await?
+                .do_maintenance(
+                    dataset_id,
+                    optimize_indexes,
+                    retrain_indexes,
+                    compact_fragments,
+                    cleanup_before,
+                    unsafe_allow_recent_cleanup,
+                )
+                .await
+                .map_err(to_py_err)
+        })
+    }
+
+    /// Returns a new `DatasetSelection` filtered to the given segment IDs.
+    ///
+    /// Parameters
+    /// ----------
+    /// segment_ids : list[str]
+    ///     A list of segment ID strings to filter to.
+    ///
+    /// Returns
+    /// -------
+    /// DatasetSelectionInternal
+    ///     A new selection filtered to the given segments.
+    fn filter_segments(
+        self_: PyRef<'_, Self>,
+        segment_ids: Vec<String>,
+    ) -> super::PyDatasetSelectionInternal {
+        let selection = re_catalog_client::DatasetSelection::new(self_.entry_details.id)
+            .filter_segments(segment_ids.into_iter().map(SegmentId::from));
+        super::PyDatasetSelectionInternal::new(Py::from(self_), selection)
+    }
+
+    /// Returns a new `DatasetSelection` filtered to the given entity paths.
+    ///
+    /// Parameters
+    /// ----------
+    /// exprs : list[str]
+    ///     Entity path expressions like `"/points/**"`, `"-/text/**"`.
+    ///
+    /// Returns
+    /// -------
+    /// DatasetSelectionInternal
+    ///     A new selection filtered to the given entity paths.
+    fn filter_contents(
+        self_: PyRef<'_, Self>,
+        exprs: Vec<String>,
+    ) -> super::PyDatasetSelectionInternal {
+        let selection = re_catalog_client::DatasetSelection::new(self_.entry_details.id)
+            .filter_contents(super::parse_content_filter(&exprs));
+        super::PyDatasetSelectionInternal::new(Py::from(self_), selection)
+    }
+
+    pub fn __str__(self_: PyRef<'_, Self>) -> String {
+        format!(
+            "DatasetEntry(name='{}', id='{}')",
+            self_.entry_details.name, self_.entry_details.id,
+        )
+    }
+}
+
+impl PyDatasetEntryInternal {
+    /// The dataset's schema for `scope`, reused while this process has seen no newer dataset
+    /// revision.
+    ///
+    /// Only the full scope is cached. Other scopes always fetch from the server.
+    ///
+    /// A change made by another client is not seen until some response for this dataset advances
+    /// the watermark, e.g. the first response of a query.
+    #[tracing::instrument(level = "info", skip_all)]
+    pub fn cached_arrow_schema(
+        self_: &PyRef<'_, Self>,
+        scope: DatasetQueryScope,
+    ) -> PyResult<ArrowSchema> {
+        let revision = re_redap_client::dataset_revisions().get(self_.entry_details.id);
+
+        if scope == DatasetQueryScope::Full
+            && let Some(revision) = revision
+            && let Some(cached) = self_.dataset_schema.try_get(revision)
+        {
+            return Ok(cached);
+        }
+
+        Self::fetch_arrow_schema(self_, scope)
+    }
+
+    /// The dataset's current schema for `scope`, fetched from the server.
+    ///
+    /// A full-scope fetch refreshes the schema served by [`Self::cached_arrow_schema`].
+    #[tracing::instrument(level = "info", skip_all)]
+    pub fn fetch_arrow_schema(
+        self_: &PyRef<'_, Self>,
+        scope: DatasetQueryScope,
+    ) -> PyResult<ArrowSchema> {
+        let connection = self_.client.borrow(self_.py()).connection().clone();
+        let ds_schema = connection.get_dataset_schema(self_.py(), self_.entry_details.id, scope)?;
+
+        if scope == DatasetQueryScope::Full {
+            self_.dataset_schema.observe(&ds_schema);
+        }
+
+        Ok(ds_schema.schema)
+    }
+}
+
+enum WriteKind {
+    Asset,
+    Blueprint,
+    Segment,
+}
+
+impl WriteKind {
+    fn parse(kind: &str) -> PyResult<Self> {
+        match kind {
+            "asset" => Ok(Self::Asset),
+            "blueprint" => Ok(Self::Blueprint),
+            "segment" => Ok(Self::Segment),
+            _ => Err(PyValueError::new_err(format!(
+                "invalid write kind: {kind:?}. Expected 'asset', 'blueprint', or 'segment'"
+            ))),
+        }
+    }
+
+    /// Only segment writes take a segment id.
+    fn segment_id(&self, segment_id: Option<String>) -> PyResult<Option<SegmentId>> {
+        match (self, segment_id) {
+            (_, None) => Ok(None),
+            (Self::Segment, Some(segment_id)) => Ok(Some(SegmentId::new(segment_id))),
+            (Self::Asset | Self::Blueprint, Some(_)) => Err(PyValueError::new_err(
+                "a segment id can only be set when writing a segment",
+            )),
+        }
+    }
+}
+
+/// Parse the Python `scope` string into the corresponding `DatasetQueryScope`.
+pub fn parse_dataset_scope(scope: &str) -> PyResult<DatasetQueryScope> {
+    match scope {
+        "full" => Ok(DatasetQueryScope::Full),
+        "indexed" => Ok(DatasetQueryScope::Indexed),
+        _ => Err(PyValueError::new_err(format!(
+            "invalid scope value: '{scope}'. Expected 'full' or 'indexed'"
+        ))),
+    }
+}
+
+/// Parse the Python `on_duplicate` string into the corresponding `IfDuplicateBehavior` enum.
+fn parse_on_duplicate(on_duplicate: &str) -> PyResult<IfDuplicateBehavior> {
+    match on_duplicate {
+        "error" => Ok(IfDuplicateBehavior::Error),
+        "skip" => Ok(IfDuplicateBehavior::Skip),
+        "replace" => Ok(IfDuplicateBehavior::Overwrite),
+        _ => Err(PyValueError::new_err(format!(
+            "invalid on_duplicate value: '{on_duplicate}'. Expected 'error', 'skip', or 'replace'"
+        ))),
+    }
+}
+
+fn parse_storage_prefix(storage_prefix: &str) -> PyResult<ObjectKey> {
+    ObjectKey::try_new(storage_prefix)
+        .map_err(|err| PyValueError::new_err(format!("invalid storage_prefix: {err}")))
+}
+
+/// Helper function to convert a Python object to i64.
+///
+/// This function attempts to convert various Python types to i64, including:
+/// - Python int
+/// - numpy datetime64 (via timestamp conversion)
+/// - Any object with an `__int__` method
+/// - Any object that can be converted to int via Python's `int()` function
+fn py_object_to_i64(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<i64> {
+    // First try direct extraction as i64
+    if let Ok(value) = obj.extract::<i64>() {
+        return Ok(value);
+    }
+
+    // Try to extract as Python int first
+    if let Ok(value) = obj.extract::<i32>() {
+        return Ok(value as i64);
+    }
+
+    // Check if it's a numpy datetime64 and try to get timestamp
+    if obj.hasattr("timestamp")? {
+        let timestamp = obj.call_method0("timestamp")?;
+        if let Ok(ts_float) = timestamp.extract::<f64>() {
+            // Convert seconds to nanoseconds (assuming timestamp is in seconds)
+            return Ok((ts_float * 1_000_000_000.0) as i64);
+        }
+    }
+
+    // Try calling __int__ method if it exists
+    if obj.hasattr("__int__")? {
+        let int_result = obj.call_method0("__int__")?;
+        return int_result.extract::<i64>();
+    }
+
+    // As a last resort, try to convert via Python's int() function
+    let int_builtin = py.import("builtins")?.getattr("int")?;
+    let converted = int_builtin.call1((obj,))?;
+    converted.extract::<i64>()
+}
+
+/// Convert a Python object to a [`re_sdk::TimeCell`], inferring the time type from the Python type.
+///
+/// Plain `int` → [`TimeType::Sequence`]; `datetime.timedelta` → [`TimeType::DurationNs`];
+/// anything else (datetime, `numpy.datetime64`, …) → [`TimeType::TimestampNs`] via
+/// [`py_object_to_i64`].
+fn py_object_to_time_cell(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<re_sdk::TimeCell> {
+    use re_log_types::TimeType;
+
+    if let Ok(value) = obj.extract::<i64>() {
+        return Ok(re_sdk::TimeCell::new(TimeType::Sequence, value));
+    }
+
+    if let Ok(duration) = obj.extract::<jiff::SignedDuration>() {
+        let nanos = i64::try_from(duration.as_nanos()).map_err(|_err| {
+            PyOverflowError::new_err("datetime.timedelta is out of nanosecond range")
+        })?;
+
+        return Ok(re_sdk::TimeCell::new(TimeType::DurationNs, nanos));
+    }
+
+    let nanos = py_object_to_i64(py, obj)?;
+    Ok(re_sdk::TimeCell::new(TimeType::TimestampNs, nanos))
+}
+
+fn parse_storage_location(
+    storage_location: Option<String>,
+) -> PyResult<Option<StorageLocationAlias>> {
+    storage_location
+        .map(StorageLocationAlias::try_new)
+        .transpose()
+        .map_err(|err| PyValueError::new_err(err.to_string()))
+}

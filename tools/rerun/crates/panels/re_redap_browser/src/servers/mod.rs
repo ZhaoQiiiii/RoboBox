@@ -1,0 +1,1974 @@
+use re_ui::ButtonExt as _;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::task::Poll;
+
+use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
+use datafusion::sql::TableReference;
+use egui::{Frame, Margin, RichText};
+use re_async::{AsyncRuntimeHandle, UiWaker};
+use re_catalog_client::{AssetRegistrationError, CatalogClient, ManifestLayer};
+use re_log_types::EntryId;
+use re_log_types::external::re_types_core::SegmentId;
+use re_protos::cloud::v1alpha1::EntryKind;
+use re_quota_channel::send_crossbeam;
+use re_redap_client::{
+    ClientCredentialsError, ConnectionHandle, ConnectionRegistryHandle, CredentialSource,
+    Credentials,
+};
+use re_ui::alert::Alert;
+use re_ui::{ContextExt as _, UiExt as _, icons};
+use re_viewer_context::{
+    AppContext, CommandSender as ViewerCommandSender, EditRedapServerModalCommand, SystemCommand,
+    SystemCommandSender as _, TableReference as ViewerTableReference, ViewStates,
+};
+
+use crate::asset_coverage_modal::{AssetCoverageModal, AssetTarget};
+use crate::asset_registration::{AssetRegistrations, AssetUnregistrations};
+use crate::asset_source_modal::AssetSourceModal;
+use crate::context::Context;
+use crate::entries::{Entries, Entry, Table};
+use crate::entry_meta::{DatasetSegments, EntryMetaQuery};
+use crate::register_asset_modal::RegisterAssetModal;
+use crate::server_modal::{LoginFlow, LoginFlowResult, ServerModal, ServerModalMode};
+use crate::unregister_asset_modal::UnregisterAssetModal;
+
+mod dataset;
+
+pub use dataset::PILL_MARGIN;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServerKind {
+    Remote,
+    Internal,
+}
+
+pub struct Server {
+    client: CatalogClient,
+    entries: Entries,
+
+    /// The pending and failed asset registrations of this server's datasets.
+    asset_registrations: AssetRegistrations,
+
+    /// The assets of this server's datasets that were asked to be dropped.
+    asset_unregistrations: AssetUnregistrations,
+
+    /// Session context wrapper which holds all the table-like entries of the server.
+    tables_session_ctx: Arc<SessionContext>,
+
+    kind: ServerKind,
+
+    /// Dropping this cancels the background task that listens for catalog events.
+    _watch_events_guard: futures::channel::oneshot::Sender<()>,
+}
+
+impl Server {
+    fn new_remote(
+        connection: ConnectionHandle,
+        runtime: AsyncRuntimeHandle,
+        waker: UiWaker,
+        command_sender: crossbeam::channel::Sender<Command>,
+    ) -> Self {
+        Self::new(
+            connection,
+            ServerKind::Remote,
+            runtime,
+            waker,
+            command_sender,
+        )
+    }
+
+    fn new_internal(
+        connection: ConnectionHandle,
+        runtime: AsyncRuntimeHandle,
+        waker: UiWaker,
+        command_sender: crossbeam::channel::Sender<Command>,
+    ) -> Self {
+        Self::new(
+            connection,
+            ServerKind::Internal,
+            runtime,
+            waker,
+            command_sender,
+        )
+    }
+
+    fn new(
+        connection: ConnectionHandle,
+        kind: ServerKind,
+        runtime: AsyncRuntimeHandle,
+        waker: UiWaker,
+        command_sender: crossbeam::channel::Sender<Command>,
+    ) -> Self {
+        let tables_session_ctx = Self::session_context();
+
+        let entries = Entries::default();
+
+        let (cancel_tx, cancel_rx) = futures::channel::oneshot::channel();
+        let listener = watch_events_loop(connection.clone(), command_sender, waker);
+        runtime.spawn_future(async move {
+            futures::pin_mut!(listener);
+            futures::future::select(listener, cancel_rx).await;
+        });
+
+        Self {
+            client: CatalogClient::new(connection, runtime),
+            entries,
+            asset_registrations: Default::default(),
+            asset_unregistrations: Default::default(),
+            tables_session_ctx,
+            kind,
+            _watch_events_guard: cancel_tx,
+        }
+    }
+
+    fn session_context() -> Arc<SessionContext> {
+        let session_ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                // In order to quickly show results when filtering a table, we disable batch coalescing.
+                // This may be slightly inefficient, but is worth it if the user sees immediate
+                // results.
+                .with_coalesce_batches(false),
+        );
+        Arc::new(session_ctx)
+    }
+
+    fn refresh_entries(&mut self) {
+        // TODO(RR-4874): this replaces the whole session context, dropping the DataFusionTableWidget
+        // caches. As a result, a currently-displayed table reverts to "Loading…" on any catalog
+        // refresh, even when that table itself is unchanged.
+        self.tables_session_ctx = Self::session_context();
+
+        self.entries.refresh();
+    }
+
+    #[inline]
+    pub fn origin(&self) -> &re_uri::Origin {
+        self.client.origin()
+    }
+
+    #[inline]
+    pub fn entries(&self) -> &Entries {
+        &self.entries
+    }
+
+    #[inline]
+    pub fn is_internal(&self) -> bool {
+        self.kind == ServerKind::Internal
+    }
+
+    #[inline]
+    fn is_remote(&self) -> bool {
+        self.kind == ServerKind::Remote
+    }
+
+    fn on_frame_start(
+        &mut self,
+        egui_ctx: &egui::Context,
+        viewer_command_sender: &ViewerCommandSender,
+    ) {
+        self.entries.on_frame_start(
+            self.client.connection(),
+            &self.tables_session_ctx,
+            self.client.runtime(),
+            egui_ctx,
+            viewer_command_sender,
+        );
+
+        // A registration or unregistration the server answered is listed until the dataset's asset
+        // list has caught up with it, so the asset is never missing from both.
+        let Self {
+            client,
+            entries,
+            asset_registrations,
+            asset_unregistrations,
+            ..
+        } = self;
+
+        // Datasets waiting for their asset list fetch it here, so the list is updated no matter
+        // which tab is on screen.
+        let waiting_datasets = std::iter::chain(
+            asset_registrations.datasets_waiting_for_list(),
+            asset_unregistrations.datasets_waiting_for_list(),
+        );
+
+        for dataset_id in waiting_datasets {
+            entries.request_entry_assets(EntryMetaQuery {
+                client,
+                egui_ctx,
+                dataset_id,
+            });
+        }
+
+        let list_caught_up = |entry_id| !entries.entry_assets_pending(entry_id);
+        asset_registrations.clear_registered(list_caught_up);
+        asset_unregistrations.clear_unregistered(list_caught_up);
+    }
+
+    fn find_entry(&self, entry_id: EntryId) -> Option<&Entry> {
+        self.entries.find_entry(entry_id)
+    }
+
+    fn title_ui(
+        &self,
+        title: String,
+        ctx: &Context<'_>,
+        ui: &mut egui::Ui,
+        content: impl FnOnce(&mut egui::Ui),
+    ) {
+        Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(RichText::new(title).strong());
+                if ui
+                    .small_icon_button(&icons::RESET, "Refresh collection")
+                    .clicked()
+                {
+                    send_crossbeam(
+                        ctx.command_sender,
+                        Command::RefreshCollection(self.origin().clone()),
+                    )
+                    .ok();
+                }
+            });
+
+            ui.add_space(12.0);
+
+            content(ui);
+        });
+    }
+
+    /// Central panel UI for when a server is selected.
+    fn server_ui(
+        &self,
+        app_ctx: &AppContext<'_>,
+        ctx: &Context<'_>,
+        ui: &mut egui::Ui,
+        inline_login_flow: &mut Option<(re_uri::Origin, Box<LoginFlow>)>,
+        table_blueprints: &re_dataframe_ui::TableBlueprints,
+        view_states: &mut ViewStates,
+    ) {
+        if let Poll::Ready(Err(err)) = self.entries.state() {
+            self.title_ui(self.origin().host.to_string(), ctx, ui, |ui| {
+                error_ui(app_ctx, ctx, ui, self.origin(), err, inline_login_flow);
+            });
+            return;
+        }
+
+        const ENTRY_LINK_COLUMN_NAME: &str = "link";
+
+        re_dataframe_ui::DataFusionTableWidget::new(
+            self.tables_session_ctx.clone(),
+            "__entries",
+            ViewerTableReference::RedapServerEntries {
+                origin: self.origin().clone(),
+            },
+        )
+        .title(self.origin().host.to_string())
+        .additional_column_heuristics(|_layout, desc, mut column| {
+            // TODO(andreas): we should not operate on display name as much since this can be very brittle.
+            // TODO(andreas): Most of these heuristics could just be always applied so all tables profit from then.
+
+            // The link column renders a button with the resolved entry name, so the raw
+            // `name` column is redundant — hide it by default.
+            if desc.display_name().as_str() == "name" {
+                column = column.with_default_visibility(false);
+            }
+
+            column
+        })
+        .generate_entry_links(
+            ENTRY_LINK_COLUMN_NAME.into(),
+            "id".into(),
+            self.origin().clone(),
+        )
+        .prefilter(
+            col("entry_kind")
+                .in_list(
+                    vec![lit(EntryKind::Table as i32), lit(EntryKind::Dataset as i32)],
+                    false,
+                )
+                .and(col("name").not_eq(lit("__entries"))),
+        )
+        .show(
+            app_ctx,
+            self.client.runtime(),
+            ui,
+            table_blueprints,
+            view_states,
+        );
+    }
+
+    fn folder_ui(
+        &self,
+        app_ctx: &AppContext<'_>,
+        ui: &mut egui::Ui,
+        origin: &re_uri::Origin,
+        path_prefix: &str,
+    ) {
+        let command_sender = app_ctx.command_sender();
+
+        Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| {
+            crate::breadcrumbs::hierarchy_breadcrumbs_ui(ui, origin, path_prefix, command_sender);
+            ui.heading(RichText::new(re_uri::dataset_hierarchy_leaf_name(path_prefix)).strong());
+
+            ui.add_space(12.0);
+
+            match self.entries.state() {
+                Poll::Pending => {
+                    ui.loading_indicator("Loading entries…");
+                }
+                Poll::Ready(Err(err)) => {
+                    Alert::error().show_text(
+                        ui,
+                        format!("Error loading entries for folder {path_prefix:?}"),
+                        Some(err.to_string()),
+                    );
+                }
+                Poll::Ready(Ok(entries)) => {
+                    crate::folder_card_ui::folder_cards_ui(
+                        ui,
+                        origin,
+                        entries,
+                        path_prefix,
+                        command_sender,
+                    );
+                }
+            }
+        });
+    }
+
+    fn table_entry_ui(
+        &self,
+        app_ctx: &AppContext<'_>,
+        ui: &mut egui::Ui,
+        table: &Table,
+        table_blueprints: &re_dataframe_ui::TableBlueprints,
+        view_states: &mut ViewStates,
+    ) {
+        re_dataframe_ui::DataFusionTableWidget::new(
+            self.tables_session_ctx.clone(),
+            TableReference::bare(table.name().to_string()),
+            ViewerTableReference::RedapEntry {
+                origin: table.origin.clone(),
+                entry_id: table.id(),
+            },
+        )
+        .title(table.name().to_string())
+        .show(
+            app_ctx,
+            self.client.runtime(),
+            ui,
+            table_blueprints,
+            view_states,
+        );
+    }
+}
+
+fn alert_with_action_ui(
+    ui: &mut egui::Ui,
+    alert: Alert,
+    title: &str,
+    details_ui: impl FnOnce(&mut egui::Ui),
+    action_label: &str,
+) -> egui::Response {
+    alert
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.strong(title);
+                details_ui(ui);
+                ui.add_space(8.0);
+                ui.add(egui::Button::new(action_label).size_small())
+            })
+            .inner
+        })
+        .inner
+}
+
+fn entry_error_ui(
+    ctx: &AppContext<'_>,
+    ui: &mut egui::Ui,
+    origin: &re_uri::Origin,
+    title: &str,
+    details: egui::WidgetText,
+) {
+    Frame::new().inner_margin(16.0).show(ui, |ui| {
+        if alert_with_action_ui(
+            ui,
+            Alert::error(),
+            title,
+            |ui| {
+                ui.add(egui::Label::new(details).wrap());
+            },
+            "Back to server",
+        )
+        .clicked()
+        {
+            let route = re_viewer_context::Route::RedapServer(origin.clone());
+            if let Some(item) = route.item() {
+                ctx.command_sender()
+                    .send_system(SystemCommand::set_selection(item));
+            }
+            ctx.command_sender()
+                .send_system(SystemCommand::SetRoute(route));
+        }
+    });
+}
+
+fn error_ui(
+    app_ctx: &AppContext<'_>,
+    ctx: &Context<'_>,
+    ui: &mut egui::Ui,
+    origin: &re_uri::Origin,
+    err: &re_redap_client::ApiError,
+    inline_login_flow: &mut Option<(re_uri::Origin, Box<LoginFlow>)>,
+) {
+    if let Some(conn_err) = err.as_client_credentials_error() {
+        let message = match conn_err {
+            ClientCredentialsError::RefreshError { .. }
+            | ClientCredentialsError::UnauthenticatedMissingToken { .. } => {
+                "There was an error refreshing your credentials"
+            }
+
+            ClientCredentialsError::SessionExpired => "Your session has expired",
+
+            ClientCredentialsError::UnauthenticatedBadToken { credentials, .. } => {
+                match credentials.source {
+                    CredentialSource::PerOrigin => "The credentials for this origin are invalid",
+                    CredentialSource::Fallback => "The fallback credentials are invalid",
+                    CredentialSource::EnvVar => {
+                        "The credentials provided via environment variable REDAP_TOKEN are invalid"
+                    }
+                }
+            }
+
+            ClientCredentialsError::HostMismatch(_) => "The token is not allowed for this server",
+
+            ClientCredentialsError::NotAuthorized => {
+                "This server requires authentication to access its data."
+            }
+        };
+
+        let show_login = match conn_err {
+            ClientCredentialsError::RefreshError(_)
+            | ClientCredentialsError::SessionExpired
+            | ClientCredentialsError::UnauthenticatedMissingToken(_)
+            | ClientCredentialsError::UnauthenticatedBadToken { .. }
+            | ClientCredentialsError::NotAuthorized => true,
+            ClientCredentialsError::HostMismatch(_) => false,
+        };
+
+        let has_active_login_flow = inline_login_flow.as_ref().is_some_and(|(o, _)| o == origin);
+
+        if show_login {
+            Alert::info().show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.strong(message);
+
+                    if let Some(auth) = app_ctx.auth_context {
+                        let identity = if let Some(org) = &auth.org_name {
+                            format!("Logged in as {} ({})", auth.email, org)
+                        } else {
+                            format!("Logged in as {}", auth.email)
+                        };
+                        ui.weak(identity);
+                    }
+
+                    ui.add_space(8.0);
+                    if has_active_login_flow {
+                        ui.horizontal_centered(|ui| {
+                            // 4.0 = Size::Small vertical padding
+                            let cancel_button_height =
+                                ui.text_style_height(&egui::TextStyle::Button) + 2.0 * 4.0;
+                            ui.set_min_height(cancel_button_height);
+                            ui.loading_indicator("Waiting for login");
+                            ui.label("Waiting for login…");
+                            ui.add_space(8.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(("Cancel", &icons::CLOSE))
+                                        .size_small()
+                                        .primary(),
+                                )
+                                .clicked()
+                            {
+                                *inline_login_flow = None;
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            if let Some(auth) = app_ctx.auth_context {
+                                // User is already logged in — offer to use stored credentials
+                                if ui
+                                    .add(
+                                        egui::Button::new(format!("Continue as {}", auth.email))
+                                            .primary()
+                                            .size_small(),
+                                    )
+                                    .clicked()
+                                {
+                                    send_crossbeam(
+                                        ctx.command_sender,
+                                        Command::UseStoredCredentials(origin.clone()),
+                                    )
+                                    .ok();
+                                }
+                            } else if app_ctx.login_enabled {
+                                // User is not logged in — start login flow
+                                // Opening the popup synchronously in the click handler is
+                                // required for Safari, which blocks popups not initiated
+                                // by a direct user gesture.
+                                if ui
+                                    .add(egui::Button::new("Log in").primary().size_small())
+                                    .clicked()
+                                {
+                                    match LoginFlow::open_and_start(
+                                        ui.ctx(),
+                                        app_ctx.login_signed_in_url,
+                                    ) {
+                                        Ok(flow) => {
+                                            *inline_login_flow =
+                                                Some((origin.clone(), Box::new(flow)));
+                                        }
+                                        Err(err) => {
+                                            re_log::error!("Failed to start login: {err}");
+                                        }
+                                    }
+                                }
+                            }
+                            if ui
+                                .add(egui::Button::new("Edit connection").size_small())
+                                .clicked()
+                            {
+                                send_crossbeam(
+                                    ctx.command_sender,
+                                    Command::OpenEditServerModal(EditRedapServerModalCommand {
+                                        origin: origin.clone(),
+                                        open_on_success: None,
+                                        title: None,
+                                    }),
+                                )
+                                .ok();
+                            }
+                        });
+                    }
+                });
+            });
+        } else {
+            warning_with_edit_button(ctx, ui, origin, message, app_ctx.auth_context);
+        }
+    } else if matches!(
+        &err.kind,
+        re_redap_client::ApiErrorKind::InvalidServer | re_redap_client::ApiErrorKind::Connection
+    ) {
+        warning_with_edit_button(ctx, ui, origin, &err.to_string(), None);
+    } else {
+        ui.error_label(err.to_string());
+    }
+}
+
+fn warning_with_edit_button(
+    ctx: &Context<'_>,
+    ui: &mut egui::Ui,
+    origin: &re_uri::Origin,
+    message: &str,
+    auth_context: Option<&re_viewer_context::AuthContext>,
+) {
+    if alert_with_action_ui(
+        ui,
+        Alert::warning(),
+        message,
+        |ui| {
+            if let Some(auth) = auth_context {
+                let identity = if let Some(org) = &auth.org_name {
+                    format!("Logged in as {} ({})", auth.email, org)
+                } else {
+                    format!("Logged in as {}", auth.email)
+                };
+                ui.weak(identity);
+            }
+        },
+        "Edit connection",
+    )
+    .clicked()
+    {
+        send_crossbeam(
+            ctx.command_sender,
+            Command::OpenEditServerModal(EditRedapServerModalCommand {
+                origin: origin.clone(),
+                open_on_success: None,
+                title: None,
+            }),
+        )
+        .ok();
+    }
+}
+
+/// All servers known to the viewer, and their catalog data.
+pub struct RedapServers {
+    servers: BTreeMap<re_uri::Origin, Server>,
+
+    /// Whether the built-in internal catalog server is shown in the UI.
+    ///
+    /// It starts hidden and is revealed for the rest of the session once the user enables the
+    /// internal catalog or a catalog event arrives. Remote servers are always shown.
+    internal_catalog_revealed: bool,
+
+    /// Servers to show that we can't construct a [`Server`] for yet, e.g. right after
+    /// deserializing, so they get queued here.
+    pending_servers: Vec<re_uri::Origin>,
+
+    /// The servers the user added, shared with the `rerun` CLI and `rerun mcp`, once
+    /// [`Self::set_known_servers`] set it. While set, remote servers are remembered there rather
+    /// than in the viewer's own persisted state.
+    #[cfg(not(target_arch = "wasm32"))]
+    known_servers: Option<re_redap_client::KnownServers>,
+
+    // message queue for commands
+    command_sender: crossbeam::channel::Sender<Command>,
+    command_receiver: crossbeam::channel::Receiver<Command>,
+
+    server_modal_ui: ServerModal,
+
+    register_asset_modal_ui: RegisterAssetModal,
+
+    asset_coverage_modal_ui: AssetCoverageModal,
+
+    asset_source_modal_ui: AssetSourceModal,
+
+    unregister_asset_modal_ui: UnregisterAssetModal,
+
+    /// Active inline login flow with the origin it was started for.
+    ///
+    /// That origin will get the token and be refreshed on login.
+    inline_login_flow: Option<(re_uri::Origin, Box<LoginFlow>)>,
+}
+
+impl serde::Serialize for RedapServers {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.known_servers.is_some() {
+            return Vec::<re_uri::Origin>::new().serialize(serializer);
+        }
+        self.servers
+            .values()
+            .filter(|server| server.is_remote())
+            .map(|server| server.origin())
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RedapServers {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let origins = Vec::<re_uri::Origin>::deserialize(deserializer)?;
+
+        let mut servers = Self::default();
+
+        // We cannot create `Server` right away, because we need an async handle and an
+        // `egui::Context` for that, so we just queue commands to be processed early next frame.
+        for origin in origins {
+            servers.pending_servers.push(origin);
+        }
+
+        Ok(servers)
+    }
+}
+
+impl Default for RedapServers {
+    fn default() -> Self {
+        let (command_sender, command_receiver) = re_quota_channel::create_crossbeam_channel(256);
+
+        Self {
+            servers: Default::default(),
+            internal_catalog_revealed: false,
+            pending_servers: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            known_servers: None,
+            command_sender,
+            command_receiver,
+            server_modal_ui: Default::default(),
+            register_asset_modal_ui: Default::default(),
+            asset_coverage_modal_ui: Default::default(),
+            asset_source_modal_ui: Default::default(),
+            unregister_asset_modal_ui: Default::default(),
+            inline_login_flow: None,
+        }
+    }
+}
+
+/// Whether a server outlives this run of the viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerLifetime {
+    /// Added by the user: remembered, and shared with the `rerun` CLI and `rerun mcp`.
+    Remembered,
+
+    /// Opened by a URL, or already remembered.
+    ThisSession,
+}
+
+/// Add a server with an optional JWT token.
+///
+/// If the token is None, this does *not* remove an existing token.
+pub struct AddServerCommand {
+    pub origin: re_uri::Origin,
+
+    pub credentials: Option<re_redap_client::Credentials>,
+
+    /// Whether to remember the server for later runs.
+    pub lifetime: ServerLifetime,
+
+    /// Ran after adding the server (useful since [`Command`]s are not ran in order with
+    /// [`re_viewer_context::SystemCommand`]s).
+    pub on_add: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for AddServerCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            origin,
+            credentials,
+            lifetime,
+            on_add,
+        } = self;
+        f.debug_struct("AddServerCommand")
+            .field("origin", origin)
+            .field("credentials", credentials)
+            .field("lifetime", lifetime)
+            .field("on_add", &on_add.as_ref().map(|_| "…"))
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum Command {
+    /// Open a modal to add a new server.
+    OpenAddServerModal,
+
+    /// Open a modal to edit an existing server.
+    OpenEditServerModal(EditRedapServerModalCommand),
+
+    /// Open a modal to register an asset with a dataset.
+    OpenRegisterAssetModal(AssetTarget),
+
+    /// Open a modal to pick which segments of a dataset load an asset.
+    OpenAssetCoverageModal {
+        target: AssetTarget,
+        asset_id: SegmentId,
+    },
+
+    /// Open a modal asking whether to unregister an asset.
+    OpenUnregisterAssetModal {
+        origin: re_uri::Origin,
+        entry_id: EntryId,
+        asset_id: SegmentId,
+    },
+
+    /// Unregister an asset without asking for confirmation.
+    ///
+    /// A registered asset is confirmed first, see [`Self::OpenUnregisterAssetModal`]. A failed
+    /// registration holds no data, so it is unregistered right away.
+    UnregisterAsset {
+        origin: re_uri::Origin,
+        entry_id: EntryId,
+        asset_id: SegmentId,
+
+        /// Whether the asset's registration failed, which is the only case where it is
+        /// unregistered by force.
+        has_failed: bool,
+    },
+
+    /// Open a modal showing where an asset was registered from.
+    OpenAssetSourceModal {
+        asset_id: SegmentId,
+
+        /// One per layer of the asset, sorted by layer name.
+        layers: Vec<ManifestLayer>,
+    },
+
+    /// The server was asked to register an asset with a dataset.
+    AssetRegistrationStarted {
+        origin: re_uri::Origin,
+        entry_id: EntryId,
+
+        /// Where the asset is read from, as typed by the user.
+        source_uri: String,
+    },
+
+    /// The server answered an asset registration.
+    AssetRegistrationFinished {
+        origin: re_uri::Origin,
+        entry_id: EntryId,
+        source_uri: String,
+        result: Result<(), AssetRegistrationError>,
+    },
+
+    /// Stop listing a registration the server refused.
+    DismissAssetRegistration {
+        origin: re_uri::Origin,
+        entry_id: EntryId,
+        source_uri: String,
+    },
+
+    /// The server was asked to drop an asset of a dataset.
+    AssetUnregistrationStarted {
+        origin: re_uri::Origin,
+        entry_id: EntryId,
+        asset_id: SegmentId,
+    },
+
+    /// The server answered an asset unregistration.
+    AssetUnregistrationFinished {
+        origin: re_uri::Origin,
+        entry_id: EntryId,
+        asset_id: SegmentId,
+
+        /// Whether the server dropped the asset.
+        unregistered: bool,
+    },
+
+    /// A dataset's assets changed on the server.
+    ///
+    /// Clears the dataset's assets so the next frame fetches them again, and refreshes the
+    /// collection if the dataset has no asset dataset yet.
+    AssetsChanged {
+        origin: re_uri::Origin,
+        entry_id: EntryId,
+
+        /// Whether to stream the segments the viewer already has again.
+        ///
+        /// Registering or unregistering an asset changes what those segments hold. A registration
+        /// that failed before the server wrote the asset's row does not.
+        reload_segments: bool,
+
+        /// The asset that was unregistered, whose own recording is closed.
+        unregistered_asset: Option<SegmentId>,
+    },
+
+    AddServer(AddServerCommand),
+
+    RefreshCollection(re_uri::Origin),
+
+    /// Use the stored account credentials for a server and refresh.
+    UseStoredCredentials(re_uri::Origin),
+}
+
+impl RedapServers {
+    pub fn is_empty(&self) -> bool {
+        self.iter_servers().next().is_none() && self.pending_servers.is_empty()
+    }
+
+    /// Whether we already know about a given server (or have it queued to be added).
+    pub fn has_server(&self, origin: &re_uri::Origin) -> bool {
+        self.servers.contains_key(origin) || self.pending_servers.contains(origin)
+    }
+
+    /// Is this the viewer's built-in catalog server?
+    pub fn is_internal_server(&self, origin: &re_uri::Origin) -> bool {
+        self.servers
+            .get(origin)
+            .is_some_and(|server| server.is_internal())
+    }
+
+    /// Remove a server and its credentials.
+    pub fn remove_server(
+        &mut self,
+        origin: &re_uri::Origin,
+        connection_registry: &re_redap_client::ConnectionRegistryHandle,
+    ) {
+        if self
+            .servers
+            .remove(origin)
+            .is_some_and(|server| server.is_remote())
+        {
+            connection_registry.remove_credentials(origin);
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(known) = &self.known_servers
+                && let Err(err) = known.remove(origin)
+            {
+                re_log::error!("Failed to forget the server {origin}: {err}");
+            }
+        }
+    }
+
+    /// Show a server for this run of the viewer, e.g. one a URL opened.
+    ///
+    /// Servers the user adds in the server modal are remembered instead.
+    pub fn add_server(&self, origin: re_uri::Origin) {
+        send_crossbeam(
+            &self.command_sender,
+            Command::AddServer(AddServerCommand {
+                origin,
+                credentials: None,
+                lifetime: ServerLifetime::ThisSession,
+                on_add: None,
+            }),
+        )
+        .ok();
+    }
+
+    /// Remember the servers the user adds in `known`, shared with the `rerun` CLI and
+    /// `rerun mcp`, and show the ones already there.
+    ///
+    /// The servers this viewer remembered in its own persisted state are moved to `known`, which
+    /// is the only place they are remembered from now on. Local servers are left out: older
+    /// viewers remembered every server they opened, and a local one is usually gone by now. If
+    /// moving fails, e.g. because the file is broken, the viewer keeps remembering servers in its
+    /// own state, so none are lost.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_known_servers(
+        &mut self,
+        known: re_redap_client::KnownServers,
+    ) -> Result<(), re_redap_client::KnownServersError> {
+        let remote: Vec<_> = self
+            .pending_servers
+            .iter()
+            .filter(|origin| !origin.is_localhost())
+            .cloned()
+            .collect();
+        known.add_all(&remote)?;
+        for origin in known.load()? {
+            if !self.pending_servers.contains(&origin) {
+                self.pending_servers.push(origin);
+            }
+        }
+        self.known_servers = Some(known);
+        Ok(())
+    }
+
+    /// Add `origin` to the shared list, if there is one.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remember(&self, origin: &re_uri::Origin) {
+        if let Some(known) = &self.known_servers
+            && let Err(err) = known.add(origin)
+        {
+            re_log::error!("Failed to remember the server {origin}: {err}");
+        }
+    }
+
+    /// The shared list set by [`Self::set_known_servers`], if any.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn known_servers(&self) -> Option<&re_redap_client::KnownServers> {
+        self.known_servers.as_ref()
+    }
+
+    pub fn add_internal_server(
+        &mut self,
+        origin: re_uri::Origin,
+        connection_registry: &ConnectionRegistryHandle,
+        runtime: &AsyncRuntimeHandle,
+        egui_ctx: &egui::Context,
+    ) {
+        if self
+            .servers
+            .get(&origin)
+            .is_some_and(|server| server.is_internal())
+        {
+            return;
+        }
+
+        self.servers.insert(
+            origin.clone(),
+            Server::new_internal(
+                connection_registry.connection_handle(origin),
+                runtime.clone(),
+                egui_ctx.ui_waker(),
+                self.command_sender.clone(),
+            ),
+        );
+    }
+
+    /// Reveal the internal catalog for the rest of the session.
+    pub fn reveal_internal_catalog(&mut self) {
+        self.internal_catalog_revealed = true;
+    }
+
+    pub fn iter_servers(&self) -> impl Iterator<Item = &Server> {
+        let revealed = self.internal_catalog_revealed;
+        self.servers
+            .values()
+            .filter(move |server| revealed || !server.is_internal())
+    }
+
+    /// Refresh the dataframe contents of a single entry (dataset or table).
+    ///
+    /// This clears the cached query results and the entry's metadata, so the next frame re-fetches
+    /// both from the server — the same effect as the "Refresh table" button in the entry view.
+    ///
+    /// A dataset's failed asset registrations go too, since asking the server again is how the user
+    /// gets rid of a stale answer. Pending ones stay: only the server can end those.
+    ///
+    /// An entry the listing does not hold makes the listing refetch instead, unless a fetch is
+    /// already pending.
+    pub fn refresh_entry(
+        &mut self,
+        origin: &re_uri::Origin,
+        entry_id: EntryId,
+        egui_ctx: &egui::Context,
+    ) {
+        let Some(server) = self.servers.get_mut(origin) else {
+            return;
+        };
+
+        server.asset_registrations.clear_failed(entry_id);
+
+        let Some(entry) = server.find_entry(entry_id) else {
+            server.refresh_entries();
+            return;
+        };
+
+        let table_session = if let Ok(crate::entries::EntryInner::Dataset(dataset)) = entry.inner()
+        {
+            dataset.requests().refresh();
+            let Some(session) = dataset.requests().loaded_table_session() else {
+                return;
+            };
+            session
+        } else {
+            server.tables_session_ctx.clone()
+        };
+
+        re_dataframe_ui::DataFusionTableWidget::refresh(
+            server.client.runtime(),
+            egui_ctx.clone(),
+            table_session,
+            TableReference::bare(entry.name().to_string()),
+        );
+    }
+
+    /// Fetch the entry's current default table blueprint.
+    ///
+    /// The new default only replaces the table's active blueprint if that has no edits.
+    pub fn refresh_entry_default_blueprint(
+        &self,
+        origin: &re_uri::Origin,
+        entry_id: EntryId,
+        command_sender: &re_viewer_context::CommandSender,
+    ) {
+        let Some(server) = self.servers.get(origin) else {
+            return;
+        };
+        let Some(entry) = server.find_entry(entry_id) else {
+            return;
+        };
+        crate::entries::refresh_default_table_blueprint(
+            server.client.connection().clone(),
+            entry,
+            server.client.runtime(),
+            command_sender,
+        );
+    }
+
+    /// What the catalog says an entry is, or `None` if it isn't loaded yet.
+    pub fn entry_kind(
+        &self,
+        origin: &re_uri::Origin,
+        entry_id: EntryId,
+    ) -> Option<re_viewer_context::EntryKind> {
+        self.servers.get(origin)?.find_entry(entry_id)?.route_kind()
+    }
+
+    /// The blueprints registered for a dataset, asking the server for them if nothing has yet.
+    ///
+    /// `None` if the dataset isn't loaded yet or has no blueprint dataset.
+    pub fn dataset_blueprints(
+        &self,
+        egui_ctx: &egui::Context,
+        origin: &re_uri::Origin,
+        dataset_id: EntryId,
+    ) -> Option<crate::DatasetBlueprints> {
+        let server = self.servers.get(origin)?;
+        let Ok(crate::entries::EntryInner::Dataset(dataset)) =
+            server.find_entry(dataset_id)?.inner()
+        else {
+            return None;
+        };
+        let query = EntryMetaQuery {
+            client: &server.client,
+            egui_ctx,
+            dataset_id,
+        };
+        let entry = dataset.requests().dataset_entry(query);
+        let details = &entry.get()?.dataset_details;
+        let blueprint_dataset = details.blueprint_dataset?;
+        let blueprints = dataset.requests().blueprints(query, blueprint_dataset);
+
+        Some(crate::DatasetBlueprints {
+            origin: origin.clone(),
+            blueprint_dataset,
+            blueprints,
+            default_segment: details.default_blueprint_segment.clone(),
+        })
+    }
+
+    /// Asks the server for the blueprints registered for a dataset again.
+    ///
+    /// [`Self::dataset_blueprints`] gives the blueprints it had until the new ones arrive.
+    pub fn refresh_dataset_blueprints(&self, origin: &re_uri::Origin, dataset_id: EntryId) {
+        if let Some(server) = self.servers.get(origin)
+            && let Some(entry) = server.find_entry(dataset_id)
+            && let Ok(crate::entries::EntryInner::Dataset(dataset)) = entry.inner()
+        {
+            dataset.requests().refresh_blueprints();
+        }
+    }
+
+    /// Whether the catalog of `origin` might still tell us what an entry is.
+    ///
+    /// A server we don't know about yet is pending too: adding one goes through the command queue,
+    /// so it only shows up here a frame after something asked for it, and its entries land later
+    /// still.
+    pub fn is_entry_kind_pending(&self, origin: &re_uri::Origin, entry_id: EntryId) -> bool {
+        self.servers
+            .get(origin)
+            .is_none_or(|server| server.entries().is_kind_pending(entry_id))
+    }
+
+    /// Snapshot of `(origin, entry_id) → name + icon` for all currently-loaded catalog entries.
+    ///
+    /// Used to resolve built-in Rerun URLs to rich `LinkButtons` (see
+    /// [`re_viewer_context::make_url_decorator`]). Entries that haven't finished loading yet are
+    /// simply absent, so callers fall back to a placeholder.
+    pub fn build_url_lookup(&self) -> re_viewer_context::UrlNameLookup {
+        let mut lookup = re_viewer_context::UrlNameLookup::default();
+        // Resolve names for every known server, including a hidden internal one: this is a
+        // reachability lookup, not a listing, so it must not use the visibility-filtered iterator.
+        for server in self.servers.values() {
+            for entry in server.entries().iter_loaded() {
+                lookup.insert(
+                    (server.origin().clone(), entry.id()),
+                    re_viewer_context::ResolvedEntry {
+                        name: entry.name().clone(),
+                        kind: entry.link_kind(),
+                    },
+                );
+            }
+        }
+        lookup
+    }
+
+    pub fn is_authenticated(&self, origin: &re_uri::Origin) -> bool {
+        self.servers
+            .get(origin)
+            .and_then(|server| {
+                server
+                    .client
+                    .connection()
+                    .connection_registry()
+                    .credentials(origin)
+            })
+            .is_some()
+    }
+
+    pub fn logout(&mut self) -> Vec<re_uri::Origin> {
+        self.inline_login_flow = None;
+        self.server_modal_ui.logout();
+        // Log out from the servers that used the accounts token.
+        let mut origins = Vec::new();
+        for server in self.servers.values() {
+            let registry = server.client.connection().connection_registry();
+            if matches!(
+                registry.credentials(server.origin()),
+                Some(Credentials::Stored)
+            ) {
+                origins.push(server.origin().clone());
+                registry.remove_credentials(server.origin());
+                send_crossbeam(
+                    &self.command_sender,
+                    Command::RefreshCollection(server.origin().clone()),
+                )
+                .ok();
+            }
+        }
+        origins
+    }
+
+    /// Per-frame housekeeping.
+    ///
+    /// - Process commands from the queue.
+    /// - Update all servers.
+    pub fn on_frame_start(
+        &mut self,
+        connection_registry: &ConnectionRegistryHandle,
+        runtime: &AsyncRuntimeHandle,
+        egui_ctx: &egui::Context,
+        login_enabled: bool,
+        viewer_command_sender: &ViewerCommandSender,
+    ) {
+        self.pending_servers.drain(..).for_each(|origin| {
+            send_crossbeam(
+                &self.command_sender,
+                Command::AddServer(AddServerCommand {
+                    origin,
+                    credentials: None,
+                    lifetime: ServerLifetime::ThisSession,
+                    on_add: None,
+                }),
+            )
+            .ok();
+        });
+        while let Ok(command) = self.command_receiver.try_recv() {
+            self.handle_command(
+                connection_registry,
+                runtime,
+                egui_ctx,
+                command,
+                login_enabled,
+                viewer_command_sender,
+            );
+        }
+
+        // Poll inline login flow
+        if let Some((origin, flow)) = &mut self.inline_login_flow
+            && let Some(result) = flow.poll()
+        {
+            let origin = origin.clone();
+            match result {
+                LoginFlowResult::Success => {
+                    send_crossbeam(&self.command_sender, Command::UseStoredCredentials(origin))
+                        .ok();
+                }
+                LoginFlowResult::Failure(err) => {
+                    re_log::warn!("Login failed: {err}");
+                }
+            }
+            self.inline_login_flow = None;
+        }
+
+        for server in self.servers.values_mut() {
+            server.on_frame_start(egui_ctx, viewer_command_sender);
+        }
+    }
+
+    fn handle_command(
+        &mut self,
+        connection_registry: &re_redap_client::ConnectionRegistryHandle,
+        runtime: &AsyncRuntimeHandle,
+        egui_ctx: &egui::Context,
+        command: Command,
+        login_enabled: bool,
+        viewer_command_sender: &ViewerCommandSender,
+    ) {
+        match command {
+            Command::OpenAddServerModal => {
+                self.server_modal_ui
+                    .open(ServerModalMode::Add, connection_registry, login_enabled);
+            }
+
+            Command::OpenEditServerModal(origin) => {
+                self.server_modal_ui.open(
+                    ServerModalMode::Edit(origin),
+                    connection_registry,
+                    login_enabled,
+                );
+            }
+
+            Command::OpenRegisterAssetModal(target) => {
+                self.register_asset_modal_ui
+                    .open(target, connection_registry, runtime.clone());
+            }
+
+            Command::OpenAssetCoverageModal { target, asset_id } => {
+                self.asset_coverage_modal_ui.open(
+                    target,
+                    asset_id,
+                    connection_registry,
+                    runtime.clone(),
+                );
+            }
+
+            Command::OpenAssetSourceModal { asset_id, layers } => {
+                self.asset_source_modal_ui.open(asset_id, layers);
+            }
+
+            Command::OpenUnregisterAssetModal {
+                origin,
+                entry_id,
+                asset_id,
+            } => {
+                self.unregister_asset_modal_ui
+                    .open(origin, entry_id, asset_id);
+            }
+
+            Command::UnregisterAsset {
+                origin,
+                entry_id,
+                asset_id,
+                has_failed,
+            } => {
+                let Some(server) = self.servers.get(&origin) else {
+                    return;
+                };
+
+                let client = server.client.clone();
+                let command_sender = self.command_sender.clone();
+                let waker = egui_ctx.ui_waker();
+
+                send_crossbeam(
+                    &command_sender,
+                    Command::AssetUnregistrationStarted {
+                        origin: origin.clone(),
+                        entry_id,
+                        asset_id: asset_id.clone(),
+                    },
+                )
+                .ok();
+
+                server.client.runtime().spawn_future(async move {
+                    let unregistered = crate::servers::dataset::unregister_asset(
+                        client,
+                        entry_id,
+                        asset_id.clone(),
+                        has_failed,
+                    )
+                    .await;
+
+                    send_crossbeam(
+                        &command_sender,
+                        Command::AssetUnregistrationFinished {
+                            origin,
+                            entry_id,
+                            asset_id,
+                            unregistered,
+                        },
+                    )
+                    .ok();
+                    waker.wake();
+                });
+            }
+
+            Command::AssetRegistrationStarted {
+                origin,
+                entry_id,
+                source_uri,
+            } => {
+                if let Some(server) = self.servers.get_mut(&origin) {
+                    server.asset_registrations.start(entry_id, source_uri);
+                }
+            }
+
+            Command::AssetRegistrationFinished {
+                origin,
+                entry_id,
+                source_uri,
+                result,
+            } => {
+                // A registration that failed before the server wrote the asset's row did not
+                // change the segments.
+                let reload_segments = match &result {
+                    Ok(()) => true,
+                    Err(err) => err.asset_id.is_some(),
+                };
+
+                if let Some(server) = self.servers.get_mut(&origin) {
+                    server
+                        .asset_registrations
+                        .finish(entry_id, &source_uri, result);
+                }
+
+                send_crossbeam(
+                    &self.command_sender,
+                    Command::AssetsChanged {
+                        origin,
+                        entry_id,
+                        reload_segments,
+                        unregistered_asset: None,
+                    },
+                )
+                .ok();
+            }
+
+            Command::DismissAssetRegistration {
+                origin,
+                entry_id,
+                source_uri,
+            } => {
+                if let Some(server) = self.servers.get_mut(&origin) {
+                    server.asset_registrations.dismiss(entry_id, &source_uri);
+                }
+            }
+
+            Command::AssetUnregistrationStarted {
+                origin,
+                entry_id,
+                asset_id,
+            } => {
+                if let Some(server) = self.servers.get_mut(&origin) {
+                    server.asset_unregistrations.start(entry_id, asset_id);
+                }
+            }
+
+            Command::AssetUnregistrationFinished {
+                origin,
+                entry_id,
+                asset_id,
+                unregistered,
+            } => {
+                if let Some(server) = self.servers.get_mut(&origin) {
+                    server
+                        .asset_unregistrations
+                        .finish(entry_id, &asset_id, unregistered);
+
+                    if unregistered {
+                        server
+                            .asset_registrations
+                            .clear_failed_for_asset(entry_id, &asset_id);
+                    }
+                }
+
+                if unregistered {
+                    send_crossbeam(
+                        &self.command_sender,
+                        Command::AssetsChanged {
+                            origin,
+                            entry_id,
+                            reload_segments: true,
+                            unregistered_asset: Some(asset_id),
+                        },
+                    )
+                    .ok();
+                }
+            }
+
+            Command::AssetsChanged {
+                origin,
+                entry_id,
+                reload_segments,
+                unregistered_asset,
+            } => {
+                let Some(server) = self.servers.get(&origin) else {
+                    return;
+                };
+                server.entries.clear_entry_assets(entry_id);
+
+                if reload_segments {
+                    viewer_command_sender.send_system(SystemCommand::ReloadDatasetSegments {
+                        origin,
+                        dataset_id: entry_id,
+                        unregistered_asset,
+                    });
+                }
+            }
+
+            Command::AddServer(AddServerCommand {
+                origin,
+                credentials,
+                #[cfg(not(target_arch = "wasm32"))]
+                lifetime,
+                #[cfg(target_arch = "wasm32")]
+                    lifetime: _,
+                on_add,
+            }) => {
+                if let Some(credentials) = credentials {
+                    connection_registry.set_credentials(&origin, credentials);
+                }
+                // The browser remembers every server in the viewer's own state.
+                #[cfg(not(target_arch = "wasm32"))]
+                if lifetime == ServerLifetime::Remembered {
+                    self.remember(&origin);
+                }
+                if self.servers.contains_key(&origin) {
+                    // E.g. a URL opens a server that is already shown.
+                    re_log::debug!(
+                        "Tried to add pre-existing server at {:?}",
+                        origin.to_string()
+                    );
+                } else {
+                    self.servers.insert(
+                        origin.clone(),
+                        Server::new_remote(
+                            connection_registry.connection_handle(origin.clone()),
+                            runtime.clone(),
+                            egui_ctx.ui_waker(),
+                            self.command_sender.clone(),
+                        ),
+                    );
+                }
+                if let Some(on_add) = on_add {
+                    on_add();
+                }
+            }
+
+            Command::RefreshCollection(origin) => {
+                // A catalog event on the internal server means it has content worth showing.
+                if self.is_internal_server(&origin) {
+                    self.reveal_internal_catalog();
+                }
+                if let Some(server) = self.servers.get_mut(&origin) {
+                    server.refresh_entries();
+                }
+            }
+
+            Command::UseStoredCredentials(origin) => {
+                // Logging in to a server is as deliberate as adding it.
+                #[cfg(not(target_arch = "wasm32"))]
+                self.remember(&origin);
+                connection_registry.set_credentials(&origin, Credentials::Stored);
+                send_crossbeam(&self.command_sender, Command::RefreshCollection(origin)).ok();
+            }
+        }
+    }
+
+    pub fn server_central_panel_ui(
+        &mut self,
+        app_ctx: &AppContext<'_>,
+        ui: &mut egui::Ui,
+        origin: &re_uri::Origin,
+        table_blueprints: &re_dataframe_ui::TableBlueprints,
+        view_states: &mut ViewStates,
+    ) {
+        if let Some(server) = self.servers.get(origin) {
+            let ctx = Context {
+                command_sender: &self.command_sender,
+            };
+            server.server_ui(
+                app_ctx,
+                &ctx,
+                ui,
+                &mut self.inline_login_flow,
+                table_blueprints,
+                view_states,
+            );
+        } else {
+            app_ctx
+                .command_sender()
+                .send_system(SystemCommand::ResetRoute);
+        }
+    }
+
+    pub fn folder_central_panel_ui(
+        &self,
+        ctx: &AppContext<'_>,
+        ui: &mut egui::Ui,
+        origin: &re_uri::Origin,
+        path_prefix: &str,
+    ) {
+        if let Some(server) = self.servers.get(origin) {
+            server.folder_ui(ctx, ui, origin, path_prefix);
+        } else {
+            ctx.command_sender().send_system(SystemCommand::ResetRoute);
+        }
+    }
+
+    pub fn open_add_server_modal(&self) {
+        send_crossbeam(&self.command_sender, Command::OpenAddServerModal).ok();
+    }
+
+    pub fn open_edit_server_modal(&self, command: EditRedapServerModalCommand) {
+        send_crossbeam(&self.command_sender, Command::OpenEditServerModal(command)).ok();
+    }
+
+    pub fn entry_ui(
+        &self,
+        ctx: &AppContext<'_>,
+        ui: &mut egui::Ui,
+        origin: &re_uri::Origin,
+        active_entry: EntryId,
+        kind: Option<re_viewer_context::EntryKind>,
+        table_blueprints: &re_dataframe_ui::TableBlueprints,
+        view_states: &mut ViewStates,
+    ) {
+        let browser_ctx = Context {
+            command_sender: &self.command_sender,
+        };
+
+        if self.is_entry_kind_pending(origin, active_entry) {
+            Frame::new().inner_margin(16.0).show(ui, |ui| {
+                ui.loading_indicator("Loading entry…");
+            });
+            return;
+        }
+
+        // The same server can be connected under two origins, such as `localhost` and
+        // `127.0.0.1`, with the same entry ids. The entry is shown from the server of `origin`.
+        let Some(server) = self.servers.get(origin) else {
+            return;
+        };
+        let Some(entry) = server.find_entry(active_entry) else {
+            let details = match server.entries.state() {
+                Poll::Ready(Err(err)) => err.to_string().into(),
+                Poll::Ready(Ok(_)) => {
+                    let mut text = egui::text::LayoutJob::default();
+                    for part in [
+                        egui::RichText::new("Entry "),
+                        egui::RichText::new(active_entry.to_string()).monospace(),
+                        egui::RichText::new(" was not found on this server."),
+                    ] {
+                        part.append_to(
+                            &mut text,
+                            ui.style(),
+                            egui::FontSelection::Default,
+                            egui::Align::Center,
+                        );
+                    }
+                    text.into()
+                }
+                Poll::Pending => return,
+            };
+            entry_error_ui(ctx, ui, origin, "Could not open entry", details);
+            return;
+        };
+
+        match entry.inner() {
+            Ok(crate::entries::EntryInner::Dataset(dataset)) => {
+                server.dataset_entry_ui(
+                    ctx,
+                    &browser_ctx,
+                    ui,
+                    dataset,
+                    table_blueprints,
+                    view_states,
+                    kind,
+                );
+            }
+            Ok(crate::entries::EntryInner::Table(table)) => {
+                server.table_entry_ui(ctx, ui, table, table_blueprints, view_states);
+            }
+            Err(err) => {
+                entry_error_ui(
+                    ctx,
+                    ui,
+                    origin,
+                    &format!("Error loading entry {}", entry.name()),
+                    err.to_string().into(),
+                );
+            }
+        }
+    }
+
+    /// The segments of the dataset an asset modal points at, as the modal names and searches them.
+    fn asset_target_segments(
+        &self,
+        egui_ctx: &egui::Context,
+        target: &AssetTarget,
+    ) -> DatasetSegments {
+        self.servers
+            .get(&target.origin)
+            .map(|server| server.dataset_segments(egui_ctx, target.dataset_id))
+            .unwrap_or_default()
+    }
+
+    pub fn modals_ui(&mut self, app_ctx: &AppContext<'_>, ui: &egui::Ui) {
+        //TODO(ab): borrow checker doesn't let me use `with_ctx()` here, I should find a better way
+        let ctx = Context {
+            command_sender: &self.command_sender,
+        };
+
+        self.server_modal_ui.ui(app_ctx, &ctx, ui);
+
+        // Read every frame, so the open modal keeps up with the dataset.
+        let asset_slots = self
+            .register_asset_modal_ui
+            .target()
+            .and_then(|target| {
+                let server = self.servers.get(&target.origin)?;
+                Some(server.dataset_asset_slots(ui.ctx(), target.dataset_id))
+            })
+            .unwrap_or_default();
+
+        let register_segments = self
+            .register_asset_modal_ui
+            .target()
+            .map(|target| self.asset_target_segments(ui.ctx(), target))
+            .unwrap_or_default();
+        let stores_coverage = self
+            .register_asset_modal_ui
+            .target()
+            .and_then(|target| {
+                let server = self.servers.get(&target.origin)?;
+                Some(server.dataset_stores_coverage(ui.ctx(), target.dataset_id))
+            })
+            .unwrap_or(true);
+        let coverage_segments = self
+            .asset_coverage_modal_ui
+            .target()
+            .map(|target| self.asset_target_segments(ui.ctx(), target))
+            .unwrap_or_default();
+
+        let stored_coverage = Option::zip(
+            self.asset_coverage_modal_ui.target(),
+            self.asset_coverage_modal_ui.asset_id(),
+        )
+        .and_then(|(target, asset_id)| {
+            self.servers.get(&target.origin)?.dataset_asset_coverage(
+                ui.ctx(),
+                target.dataset_id,
+                asset_id,
+            )
+        });
+
+        self.register_asset_modal_ui.ui(
+            &ctx,
+            ui,
+            &asset_slots,
+            &register_segments,
+            stores_coverage,
+        );
+        self.asset_coverage_modal_ui
+            .ui(&ctx, ui, &coverage_segments, stored_coverage.as_ref());
+        self.asset_source_modal_ui.ui(ui);
+        self.unregister_asset_modal_ui.ui(&ctx, ui);
+    }
+
+    pub fn send_command(&self, command: Command) {
+        let result = send_crossbeam(&self.command_sender, command);
+
+        if let Err(err) = result {
+            re_log::warn_once!("Failed to send command: {err}");
+        }
+    }
+}
+
+/// Listens for catalog change events on a server and auto-refreshes its collection.
+///
+/// Reconnects with exponential backoff when the stream ends or errors. Stops if the server does
+/// not support event listening, and otherwise runs until cancelled, i.e. until the owning
+/// [`Server`] is dropped.
+async fn watch_events_loop(
+    connection: ConnectionHandle,
+    command_sender: crossbeam::channel::Sender<Command>,
+    waker: UiWaker,
+) {
+    let mut backoff = re_backoff::BackoffGenerator::new(
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("valid backoff range");
+
+    loop {
+        match run_event_listener(&connection, &command_sender, &waker, &mut backoff).await {
+            Ok(()) => {}
+            Err(err) if err.kind == re_redap_client::ApiErrorKind::Unimplemented => {
+                // Permanent condition (e.g. an older server), so don't keep reconnecting.
+                re_log::debug!(
+                    "{}",
+                    re_error::format_with_details(
+                        "Server does not support event listening",
+                        format!("Server: {}", connection.origin()),
+                    )
+                );
+                return;
+            }
+            Err(err) => {
+                re_log::trace!(
+                    "{}",
+                    re_error::format_with_details(
+                        format!("Event stream failed, will reconnect: {err}"),
+                        format!("Server: {}", connection.origin()),
+                    )
+                );
+            }
+        }
+        backoff.gen_next().sleep().await;
+    }
+}
+
+/// Connects and refreshes the collection whenever events arrive.
+///
+/// Returns when the stream ends or errors so the caller can reconnect.
+async fn run_event_listener(
+    connection: &ConnectionHandle,
+    command_sender: &crossbeam::channel::Sender<Command>,
+    waker: &UiWaker,
+    backoff: &mut re_backoff::BackoffGenerator,
+) -> re_redap_client::ApiResult<()> {
+    use futures::StreamExt as _;
+
+    let mut client = connection.client().await?;
+    let mut stream = client.watch_events().await?;
+
+    // We connected successfully, so a later reconnect (if any) should start fast again.
+    backoff.reset();
+
+    while let Some(event) = stream.next().await {
+        event?;
+        send_crossbeam(
+            command_sender,
+            Command::RefreshCollection(connection.origin().clone()),
+        )
+        .ok();
+        waker.wake();
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An entry on a server we don't know about is pending: the server is on its way in, and
+    /// nothing it holds can have reached us before it does.
+    #[test]
+    fn entry_on_an_unknown_server_is_pending() {
+        let servers = RedapServers::default();
+        let origin = "rerun+http://localhost:51234"
+            .parse::<re_uri::Origin>()
+            .expect("valid origin");
+
+        assert!(servers.is_entry_kind_pending(&origin, EntryId::new()));
+    }
+
+    fn origin(url: &str) -> re_uri::Origin {
+        url.parse().expect("valid origin")
+    }
+
+    /// The remote servers from the viewer's own persisted state move into the shared list, and
+    /// all of them are shown, along with those already in the list.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn known_servers_take_over_from_the_persisted_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known = re_redap_client::KnownServers::at(dir.path().join("servers.json"));
+        let from_cli = origin("rerun://cli.example.com:443");
+        known.add(&from_cli).expect("add");
+
+        let remote = origin("rerun://example.com:443");
+        let local = origin("rerun+http://127.0.0.1:51234");
+        let mut servers: RedapServers =
+            serde_json::from_value(serde_json::json!([remote, local])).expect("deserialize");
+        servers.set_known_servers(known.clone()).expect("migrate");
+
+        assert_eq!(
+            servers.pending_servers,
+            [remote.clone(), local, from_cli.clone()]
+        );
+        assert_eq!(known.load().expect("load"), [from_cli, remote]);
+    }
+
+    /// Once the shared list is used, the viewer's own persisted state holds no servers.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn known_servers_empty_the_persisted_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known = re_redap_client::KnownServers::at(dir.path().join("servers.json"));
+        let mut servers: RedapServers =
+            serde_json::from_value(serde_json::json!([origin("rerun://example.com:443")]))
+                .expect("deserialize");
+        servers.set_known_servers(known).expect("migrate");
+        assert_eq!(
+            serde_json::to_value(&servers).expect("serialize"),
+            serde_json::json!([])
+        );
+    }
+
+    /// A broken shared list is not used, so the servers stay in the viewer's own state.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_broken_known_servers_file_keeps_the_persisted_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("servers.json");
+        std::fs::write(&path, "not json").expect("write");
+        let from_app_state = origin("rerun://example.com:443");
+        let mut servers: RedapServers =
+            serde_json::from_value(serde_json::json!([from_app_state])).expect("deserialize");
+
+        servers
+            .set_known_servers(re_redap_client::KnownServers::at(path))
+            .expect_err("broken file");
+        assert!(servers.known_servers().is_none());
+        assert_eq!(servers.pending_servers, [from_app_state]);
+    }
+
+    /// Only servers the user adds are remembered; those a URL opened are not, and removing a
+    /// server forgets it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_added_servers_are_remembered() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known = re_redap_client::KnownServers::at(dir.path().join("servers.json"));
+        let connection_registry =
+            re_redap_client::ConnectionRegistry::new_without_stored_credentials();
+        let runtime =
+            AsyncRuntimeHandle::from_current_tokio_runtime_or_wasmbindgen().expect("tokio runtime");
+        let egui_ctx = egui::Context::default();
+        let (viewer_command_sender, _receiver) = re_viewer_context::command_channel();
+
+        let mut servers = RedapServers::default();
+        servers.set_known_servers(known.clone()).expect("use");
+        let opened = origin("rerun+http://127.0.0.1:51234");
+        let added = origin("rerun://example.com:443");
+        for (origin, lifetime) in [
+            (opened.clone(), ServerLifetime::ThisSession),
+            (added.clone(), ServerLifetime::Remembered),
+        ] {
+            servers.handle_command(
+                &connection_registry,
+                &runtime,
+                &egui_ctx,
+                Command::AddServer(AddServerCommand {
+                    origin,
+                    credentials: None,
+                    lifetime,
+                    on_add: None,
+                }),
+                false,
+                &viewer_command_sender,
+            );
+        }
+        assert!(servers.has_server(&opened));
+        assert_eq!(known.load().expect("load"), std::slice::from_ref(&added));
+
+        servers.remove_server(&added, &connection_registry);
+        assert_eq!(known.load().expect("load"), []);
+    }
+
+    /// Logging in to a server remembers it, like adding it does.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logging_in_remembers_the_server() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known = re_redap_client::KnownServers::at(dir.path().join("servers.json"));
+        let connection_registry =
+            re_redap_client::ConnectionRegistry::new_without_stored_credentials();
+        let runtime =
+            AsyncRuntimeHandle::from_current_tokio_runtime_or_wasmbindgen().expect("tokio runtime");
+        let (viewer_command_sender, _receiver) = re_viewer_context::command_channel();
+
+        let mut servers = RedapServers::default();
+        servers.set_known_servers(known.clone()).expect("use");
+        let opened = origin("rerun://example.com:443");
+        servers.handle_command(
+            &connection_registry,
+            &runtime,
+            &egui::Context::default(),
+            Command::UseStoredCredentials(opened.clone()),
+            false,
+            &viewer_command_sender,
+        );
+        assert_eq!(known.load().expect("load"), [opened]);
+    }
+
+    /// An entry that is newer than the listing of its server can only turn up in a new listing,
+    /// so refreshing it fetches the listing again.
+    #[tokio::test]
+    async fn refreshing_an_unknown_entry_fetches_the_entries_again() {
+        let origin = "rerun+http://localhost:51234"
+            .parse::<re_uri::Origin>()
+            .expect("valid origin");
+        let connection_registry =
+            re_redap_client::ConnectionRegistry::new_without_stored_credentials();
+        let runtime =
+            AsyncRuntimeHandle::from_current_tokio_runtime_or_wasmbindgen().expect("tokio runtime");
+        let egui_ctx = egui::Context::default();
+
+        let mut servers = RedapServers::default();
+        servers.add_internal_server(origin.clone(), &connection_registry, &runtime, &egui_ctx);
+        servers
+            .servers
+            .get_mut(&origin)
+            .expect("the server was just added")
+            .entries = crate::entries::Entries::settled_empty();
+
+        let entry_id = EntryId::new();
+        assert!(!servers.is_entry_kind_pending(&origin, entry_id));
+
+        servers.refresh_entry(&origin, entry_id, &egui_ctx);
+        assert!(servers.is_entry_kind_pending(&origin, entry_id));
+    }
+}

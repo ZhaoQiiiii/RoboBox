@@ -1,0 +1,791 @@
+#![expect(clippy::unwrap_used)]
+
+use super::common::{
+    DataSourcesDefinition, LayerDefinition, RerunCloudServiceExt as _, entry_name, prop,
+};
+use crate::tests::common::concat_record_batches;
+use crate::{FieldsTestExt as _, RecordBatchTestExt as _, SchemaTestExt as _};
+use arrow::array::RecordBatch;
+use arrow::datatypes::Schema;
+use futures::TryStreamExt as _;
+use itertools::Itertools as _;
+use re_arrow_util::RecordBatchExt as _;
+use re_protos::cloud::v1alpha1::ext::ScanDatasetManifestDataframe;
+use re_protos::cloud::v1alpha1::ext::ScanSegmentTableDataframe;
+use re_protos::cloud::v1alpha1::ext::{
+    ChunkCandidatesDataframe, ChunkMode, ContentSelection, FillMode, FindChunksRequest,
+    RangeSelection, SegmentSelection,
+};
+use re_protos::cloud::v1alpha1::rerun_cloud_service_server::RerunCloudService;
+use re_protos::cloud::v1alpha1::{
+    GetDatasetManifestSchemaRequest, GetDatasetSchemaRequest, GetSegmentTableSchemaRequest,
+    ReadDatasetEntryRequest, ScanDatasetManifestRequest, ScanSegmentTableRequest,
+};
+use re_protos::headers::RerunHeadersInjectorExt as _;
+use re_sdk_types::archetypes::TextLog;
+
+pub async fn unregister_simple(service: impl RerunCloudService) {
+    let data_sources_def = DataSourcesDefinition::new_with_tuid_prefix(
+        1,
+        [
+            LayerDefinition::simple("my_segment_id1", &["my/entity", "my/other/entity"]),
+            LayerDefinition::simple("my_segment_id2", &["my/entity"]),
+            LayerDefinition::simple(
+                "my_segment_id3",
+                &["my/entity", "another/one", "yet/another/one"],
+            ),
+        ],
+    );
+
+    let dataset_name = "my_dataset1";
+    service.create_dataset_entry_with_name(dataset_name).await;
+    service
+        .register_with_dataset_name_blocking(dataset_name, data_sources_def.to_data_sources())
+        .await;
+    let dataset_updated_at_1 = get_dataset_updated_at_nanos(&service, dataset_name).await;
+    {
+        let snapshot_name = "simple_1_register_all";
+        scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+        scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+    }
+
+    service
+        .unregister_from_dataset_name_blocking(dataset_name, &["my_segment_id2"], &["base"])
+        .await
+        .expect("removal should succeed");
+    let dataset_updated_at_2 = get_dataset_updated_at_nanos(&service, dataset_name).await;
+    {
+        let snapshot_name = "simple_2_remove_segment_id2";
+        scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+        scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+    }
+
+    service
+        .unregister_from_dataset_name_blocking(
+            dataset_name,
+            &["my_segment_id1", "my_segment_id3"],
+            &["base"],
+        )
+        .await
+        .expect("removal should succeed");
+    let dataset_updated_at_3 = get_dataset_updated_at_nanos(&service, dataset_name).await;
+    {
+        let snapshot_name = "simple_3_remove_remaining_segments";
+        scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+        scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+    }
+
+    // Make sure re-registering on top of an unregistered segment doesn't do anything weird.
+    service
+        .register_with_dataset_name_blocking(dataset_name, data_sources_def.to_data_sources())
+        .await;
+    let dataset_updated_at_4 = get_dataset_updated_at_nanos(&service, dataset_name).await;
+    {
+        let snapshot_name = "simple_4_reregister_all";
+        scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+        scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+    }
+
+    assert!(
+        dataset_updated_at_1 < dataset_updated_at_2,
+        "Timestamp should be updated after adding or removing a layer."
+    );
+    assert!(
+        dataset_updated_at_2 < dataset_updated_at_3,
+        "Timestamp should be updated after adding or removing a layer."
+    );
+    assert!(
+        dataset_updated_at_3 < dataset_updated_at_4,
+        "Timestamp should be updated after adding or removing a layer."
+    );
+}
+
+pub async fn unregister_products(service: impl RerunCloudService) {
+    let data_sources_def = DataSourcesDefinition::new_with_tuid_prefix(
+        1,
+        [
+            LayerDefinition::simple("my_segment_id1", &["my/entity"]).layer_name("A"), //
+            LayerDefinition::simple("my_segment_id1", &["my/entity"]).layer_name("B"),
+            LayerDefinition::simple("my_segment_id1", &["my/entity"]).layer_name("C"),
+            LayerDefinition::simple("my_segment_id1", &["my/entity"]).layer_name("D"),
+            //
+            LayerDefinition::simple("my_segment_id2", &["my/entity"]).layer_name("A"), //
+            LayerDefinition::simple("my_segment_id2", &["my/entity"]).layer_name("B"),
+            LayerDefinition::simple("my_segment_id2", &["my/entity"]).layer_name("C"),
+            LayerDefinition::simple("my_segment_id2", &["my/entity"]).layer_name("D"),
+            //
+            LayerDefinition::simple("my_segment_id3", &["my/entity"]).layer_name("A"), //
+            LayerDefinition::simple("my_segment_id3", &["my/entity"]).layer_name("B"),
+            LayerDefinition::simple("my_segment_id3", &["my/entity"]).layer_name("C"),
+            LayerDefinition::simple("my_segment_id3", &["my/entity"]).layer_name("D"),
+        ],
+    );
+
+    let dataset_name = "my_dataset1";
+    service.create_dataset_entry_with_name(dataset_name).await;
+    service
+        .register_with_dataset_name_blocking(dataset_name, data_sources_def.to_data_sources())
+        .await;
+    {
+        let snapshot_name = "products_1_register_all";
+        scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+        scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+    }
+
+    service
+        .unregister_from_dataset_name_blocking(
+            dataset_name,
+            &["my_segment_id1", "my_segment_id3"],
+            &["B", "D"],
+        )
+        .await
+        .expect("removal should succeed");
+    {
+        let snapshot_name = "products_2_remove_layers_BD_for_segments_13";
+        scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+        scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+    }
+
+    service
+        .unregister_from_dataset_name_blocking(dataset_name, &[], &["B", "D"])
+        .await
+        .expect("removal should succeed");
+    {
+        let snapshot_name = "products_3_remove_layers_BD_for_all_segments";
+        scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+        scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+    }
+
+    service
+        .unregister_from_dataset_name_blocking(
+            dataset_name,
+            &["my_segment_id2", "my_segment_id3"],
+            &[],
+        )
+        .await
+        .expect("removal should succeed");
+    {
+        let snapshot_name = "products_4_remove_all_layers_for_segments_23";
+        scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+        scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+    }
+}
+
+pub async fn unregister_missing_dataset(service: impl RerunCloudService) {
+    let dataset_name = "my_dataset_thats_not_there";
+
+    let err = service
+        .unregister_from_dataset_name_blocking(dataset_name, &["my_segment"], &[])
+        .await
+        .unwrap_err();
+    assert_eq!(tonic::Code::NotFound, err.code());
+}
+
+pub async fn unregister_missing_segment(service: impl RerunCloudService) {
+    let data_sources_def = DataSourcesDefinition::new_with_tuid_prefix(
+        1,
+        [LayerDefinition::simple(
+            "my_segment_id1",
+            &["my/entity", "my/other/entity"],
+        )],
+    );
+
+    let dataset_name = "my_dataset1";
+    service.create_dataset_entry_with_name(dataset_name).await;
+    service
+        .register_with_dataset_name_blocking(dataset_name, data_sources_def.to_data_sources())
+        .await;
+
+    let removed = service
+        .unregister_from_dataset_name_blocking(dataset_name, &["some_segment_thats_not_there"], &[])
+        .await;
+    {
+        let snapshot_name = "missing_1_should_be_empty";
+        snapshot_response(
+            &service,
+            dataset_name,
+            snapshot_name,
+            removed.expect("removal should succeed"),
+        )
+        .await;
+    }
+}
+
+pub async fn unregister_invalid_args(service: impl RerunCloudService) {
+    {
+        let dataset_name = "my_dataset_thats_not_there";
+
+        let err = service
+            .unregister_from_dataset_name_blocking(dataset_name, &[], &[])
+            .await
+            .unwrap_err();
+        assert_eq!(tonic::Code::NotFound, err.code());
+    }
+
+    {
+        let data_sources_def = DataSourcesDefinition::new_with_tuid_prefix(
+            1,
+            [LayerDefinition::simple(
+                "my_segment_id1",
+                &["my/entity", "my/other/entity"],
+            )],
+        );
+
+        let dataset_name = "my_dataset1";
+        service.create_dataset_entry_with_name(dataset_name).await;
+        service
+            .register_with_dataset_name_blocking(dataset_name, data_sources_def.to_data_sources())
+            .await;
+
+        let err = service
+            .unregister_from_dataset_name_blocking(dataset_name, &[], &[])
+            .await
+            .unwrap_err();
+        assert_eq!(tonic::Code::InvalidArgument, err.code());
+    }
+}
+
+// Make sure we cannot find any data when the `status=deleted`.
+pub async fn unregister_then_query(service: impl RerunCloudService) {
+    let data_sources_def = DataSourcesDefinition::new_with_tuid_prefix(
+        1,
+        [
+            LayerDefinition::simple("my_segment_id", &["my/entity", "my/other/entity"]), //
+        ],
+    );
+
+    let dataset_name = "my_dataset1";
+    service.create_dataset_entry_with_name(dataset_name).await;
+    service
+        .register_with_dataset_name_blocking(dataset_name, data_sources_def.to_data_sources())
+        .await;
+
+    find_chunks_snapshot(&service, dataset_name, "unregister_then_query_1_added").await;
+
+    service
+        .unregister_from_dataset_name_blocking(dataset_name, &["my_segment_id"], &[])
+        .await
+        .unwrap();
+
+    find_chunks_snapshot(&service, dataset_name, "unregister_then_query_2_removed").await;
+}
+
+/// Unregistering a segment removes the properties that only it logged from the segment table,
+/// the dataset manifest and the dataset schema. A property that a remaining segment also logs
+/// stays, with that segment's value.
+pub async fn unregister_segment_drops_its_logged_properties(service: impl RerunCloudService) {
+    let data_sources_def = DataSourcesDefinition::new_with_tuid_prefix(
+        1,
+        [
+            LayerDefinition::properties(
+                "drop_me",
+                [
+                    prop("shared", TextLog::new("shared, from drop_me")),
+                    prop("only_in_drop_me", TextLog::new("only in drop_me")),
+                ],
+            ),
+            LayerDefinition::properties(
+                "keep_me",
+                [
+                    prop("shared", TextLog::new("shared, from keep_me")),
+                    prop("only_in_keep_me", TextLog::new("only in keep_me")),
+                ],
+            ),
+        ],
+    );
+
+    let dataset_name = "my_dataset1";
+    service.create_dataset_entry_with_name(dataset_name).await;
+    service
+        .register_with_dataset_name_blocking(dataset_name, data_sources_def.to_data_sources())
+        .await;
+
+    for property in ["shared", "only_in_drop_me", "only_in_keep_me"] {
+        assert_property_visible(&service, dataset_name, property, true).await;
+    }
+
+    service
+        .unregister_from_dataset_name_blocking(dataset_name, &["drop_me"], &[])
+        .await
+        .expect("removal should succeed");
+
+    assert_property_visible(&service, dataset_name, "only_in_drop_me", false).await;
+    assert_property_visible(&service, dataset_name, "shared", true).await;
+    assert_property_visible(&service, dataset_name, "only_in_keep_me", true).await;
+
+    let snapshot_name = "logged_properties_segment_removed";
+    scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+    scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+}
+
+/// Unregistering one layer of a segment removes the properties that only that layer logged,
+/// while the segment survives through its other layer.
+pub async fn unregister_layer_drops_its_logged_properties(service: impl RerunCloudService) {
+    let data_sources_def = DataSourcesDefinition::new_with_tuid_prefix(
+        1,
+        [
+            LayerDefinition::properties(
+                "my_segment_id",
+                [prop("from_base", TextLog::new("from the base layer"))],
+            )
+            .layer_name("base"),
+            LayerDefinition::properties(
+                "my_segment_id",
+                [prop("from_extra", TextLog::new("from the extra layer"))],
+            )
+            .layer_name("extra"),
+        ],
+    );
+
+    let dataset_name = "my_dataset1";
+    service.create_dataset_entry_with_name(dataset_name).await;
+    service
+        .register_with_dataset_name_blocking(dataset_name, data_sources_def.to_data_sources())
+        .await;
+
+    assert_property_visible(&service, dataset_name, "from_base", true).await;
+    assert_property_visible(&service, dataset_name, "from_extra", true).await;
+
+    service
+        .unregister_from_dataset_name_blocking(dataset_name, &["my_segment_id"], &["extra"])
+        .await
+        .expect("removal should succeed");
+
+    assert_property_visible(&service, dataset_name, "from_extra", false).await;
+    assert_property_visible(&service, dataset_name, "from_base", true).await;
+
+    // The segment survives, and its layer list shows only `base`.
+    let snapshot_name = "logged_properties_layer_removed";
+    scan_segment_table_and_snapshot(&service, dataset_name, snapshot_name).await;
+    scan_dataset_manifest_and_snapshot(&service, dataset_name, snapshot_name).await;
+}
+
+// ---
+
+/// Asserts whether the property logged at `/__properties/<property>` shows up in the three
+/// places a client can see it: the segment table, the dataset manifest, and the dataset schema.
+async fn assert_property_visible(
+    service: &impl RerunCloudService,
+    dataset_name: &str,
+    property: &str,
+    expected: bool,
+) {
+    let column_prefix = format!("property:{property}:");
+    let has_property_column = |schema: &Schema| {
+        schema
+            .fields()
+            .iter()
+            .any(|field| field.name().starts_with(&column_prefix))
+    };
+
+    let segment_table = scan_segment_table(service, dataset_name).await;
+    assert_eq!(
+        has_property_column(segment_table.schema_ref()),
+        expected,
+        "`{property}` in the segment table:\n{}",
+        segment_table.schema().format_snapshot(),
+    );
+
+    let manifest = scan_dataset_manifest(service, dataset_name).await;
+    assert_eq!(
+        has_property_column(manifest.schema_ref()),
+        expected,
+        "`{property}` in the dataset manifest:\n{}",
+        manifest.schema().format_snapshot(),
+    );
+
+    let entity_path = format!("/__properties/{property}");
+    let dataset_schema = service
+        .get_dataset_schema(
+            tonic::Request::new(GetDatasetSchemaRequest::default())
+                .with_entry_name(entry_name(dataset_name)),
+        )
+        .await
+        .expect("get_dataset_schema should succeed")
+        .into_inner()
+        .schema()
+        .expect("the response carries a valid schema");
+    let in_dataset_schema = dataset_schema.fields().iter().any(|field| {
+        field
+            .metadata()
+            .get(re_sorbet::metadata::SORBET_ENTITY_PATH)
+            .map(String::as_str)
+            == Some(entity_path.as_str())
+    });
+    assert_eq!(
+        in_dataset_schema,
+        expected,
+        "`{property}` in the dataset schema:\n{}",
+        dataset_schema.format_snapshot(),
+    );
+}
+
+async fn scan_segment_table(service: &impl RerunCloudService, dataset_name: &str) -> RecordBatch {
+    let responses: Vec<_> = service
+        .scan_segment_table(
+            tonic::Request::new(ScanSegmentTableRequest::all())
+                .with_entry_name(entry_name(dataset_name)),
+        )
+        .await
+        .expect("scan_segment_table should succeed")
+        .into_inner()
+        .try_collect()
+        .await
+        .expect("the segment table stream should not fail");
+
+    let batches: Vec<RecordBatch> = responses
+        .into_iter()
+        .map(|resp| {
+            resp.data
+                .expect("every response carries data")
+                .try_into()
+                .expect("the response data is a valid record batch")
+        })
+        .collect_vec();
+
+    arrow::compute::concat_batches(
+        batches
+            .first()
+            .expect("there should be at least one batch")
+            .schema_ref(),
+        &batches,
+    )
+    .expect("the segment table batches should concatenate")
+}
+
+async fn scan_segment_table_and_snapshot(
+    service: &impl RerunCloudService,
+    dataset_name: &str,
+    snapshot_name: &str,
+) -> RecordBatch {
+    let batch = scan_segment_table(service, dataset_name).await;
+
+    // check that the _advertised_ schema is consistent with the actual data.
+    let alleged_schema: Schema = service
+        .get_segment_table_schema(
+            tonic::Request::new(GetSegmentTableSchemaRequest {})
+                .with_entry_name(entry_name(dataset_name)),
+        )
+        .await
+        .expect("get_segment_table_schema should succeed")
+        .into_inner()
+        .schema
+        .expect("the response carries a schema")
+        .try_into()
+        .expect("the schema is valid");
+
+    // Note: we check fields only because some schema-level sorbet metadata is injected in one of
+    // the paths and not the other. Anyway, that's what matters.
+    assert_eq!(
+        alleged_schema.fields(),
+        batch.schema_ref().fields(),
+        "The actual schema is not consistent with the schema advertised by \
+        `get_segment_table_schema`.\n\nActual:\n{}\n\nAlleged:\n{}\n",
+        batch.schema().format_snapshot(),
+        alleged_schema.format_snapshot(),
+    );
+
+    let required_fields = ScanSegmentTableDataframe::min_schema().fields().to_vec();
+    assert!(
+        batch.schema().fields().contains_unordered(&required_fields),
+        "the schema should contain all the required fields, but it doesn't",
+    );
+
+    let unstable_column_names = vec![
+        ScanSegmentTableDataframe::COLUMN_RERUN_STORAGE_URLS_NAME,
+        ScanSegmentTableDataframe::COLUMN_RERUN_SIZE_BYTES_NAME,
+        ScanSegmentTableDataframe::COLUMN_RERUN_LAST_UPDATED_AT_NAME,
+    ];
+    let filtered_batch = batch
+        .remove_columns(&unstable_column_names)
+        .auto_sort_rows()
+        .expect("sorting the rows should succeed")
+        .sort_property_columns()
+        .sort_index_columns();
+
+    insta::assert_snapshot!(
+        format!("{snapshot_name}_segments_schema"),
+        filter_out_index_ranges(batch.clone()).format_schema_snapshot()
+    );
+    insta::assert_snapshot!(
+        format!("{snapshot_name}_segments_data"),
+        filter_out_index_ranges(filtered_batch.clone()).format_snapshot(false)
+    );
+
+    batch
+}
+
+async fn scan_dataset_manifest(
+    service: &impl RerunCloudService,
+    dataset_name: &str,
+) -> RecordBatch {
+    let responses: Vec<_> = service
+        .scan_dataset_manifest(
+            tonic::Request::new(ScanDatasetManifestRequest::all())
+                .with_entry_name(entry_name(dataset_name)),
+        )
+        .await
+        .expect("scan_dataset_manifest should succeed")
+        .into_inner()
+        .try_collect()
+        .await
+        .expect("the dataset manifest stream should not fail");
+
+    let batches: Vec<RecordBatch> = responses
+        .into_iter()
+        .map(|resp| {
+            resp.data
+                .expect("every response carries data")
+                .try_into()
+                .expect("the response data is a valid record batch")
+        })
+        .collect_vec();
+
+    arrow::compute::concat_batches(
+        batches
+            .first()
+            .expect("there should be at least one batch")
+            .schema_ref(),
+        &batches,
+    )
+    .expect("the dataset manifest batches should concatenate")
+}
+
+async fn scan_dataset_manifest_and_snapshot(
+    service: &impl RerunCloudService,
+    dataset_name: &str,
+    snapshot_name: &str,
+) -> RecordBatch {
+    let batch = scan_dataset_manifest(service, dataset_name).await;
+
+    // check that the _advertised_ schema is consistent with the actual data.
+    let alleged_schema: Schema = service
+        .get_dataset_manifest_schema(
+            tonic::Request::new(GetDatasetManifestSchemaRequest {})
+                .with_entry_name(entry_name(dataset_name)),
+        )
+        .await
+        .expect("get_dataset_manifest_schema should succeed")
+        .into_inner()
+        .schema
+        .expect("the response carries a schema")
+        .try_into()
+        .expect("the schema is valid");
+
+    // Note: we check fields only because some schema-level sorbet metadata is injected in one of
+    // the paths and not the other. Anyway, that's what matters.
+    assert_eq!(
+        alleged_schema.fields(),
+        batch.schema_ref().fields(),
+        "The actual schema is not consistent with the schema advertised by \
+        `get_dataset_manifest_schema`.\n\nActual:\n{}\n\nAlleged:\n{}\n",
+        batch.schema().format_snapshot(),
+        alleged_schema.format_snapshot(),
+    );
+
+    let required_fields = ScanDatasetManifestDataframe::min_schema().fields().to_vec();
+    assert!(
+        batch.schema().fields().contains_unordered(&required_fields),
+        "the schema should contain all the required fields, but it doesn't",
+    );
+
+    let unstable_column_names = vec![
+        // implementation-dependent
+        ScanDatasetManifestDataframe::COLUMN_RERUN_STORAGE_URL_NAME,
+        ScanDatasetManifestDataframe::COLUMN_RERUN_SIZE_BYTES_NAME,
+        // unstable
+        ScanDatasetManifestDataframe::COLUMN_RERUN_LAST_UPDATED_AT_NAME,
+        ScanDatasetManifestDataframe::COLUMN_RERUN_REGISTRATION_TIME_NAME,
+    ];
+    let filtered_batch = batch
+        .remove_columns(&unstable_column_names)
+        .auto_sort_rows()
+        .expect("sorting the rows should succeed")
+        .sort_property_columns()
+        .sort_index_columns();
+
+    insta::assert_snapshot!(
+        format!("{snapshot_name}_manifest_schema"),
+        batch.format_schema_snapshot()
+    );
+    insta::assert_snapshot!(
+        format!("{snapshot_name}_manifest_data"),
+        filtered_batch.format_snapshot(false)
+    );
+
+    batch
+}
+
+async fn snapshot_response(
+    service: &impl RerunCloudService,
+    dataset_name: &str,
+    snapshot_name: &str,
+    batch: RecordBatch,
+) {
+    // check that the _advertised_ schema is consistent with the actual data.
+    let alleged_schema: Schema = service
+        .get_dataset_manifest_schema(
+            tonic::Request::new(GetDatasetManifestSchemaRequest {})
+                .with_entry_name(entry_name(dataset_name)),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .schema
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    // The response only guarantees the base manifest columns, not the per-dataset property and
+    // index-range columns that `get_dataset_manifest_schema` advertises.
+    // Note: we check fields only because some schema-level sorbet metadata is injected in one of
+    // the paths and not the other. Anyway, that's what matters.
+    assert!(
+        alleged_schema
+            .fields()
+            .contains_unordered(batch.schema().fields()),
+        "The actual schema is not a subset of the schema advertised by \
+        `get_dataset_manifest_schema`.\n\nActual:\n{}\n\nAlleged:\n{}\n",
+        batch.schema().format_snapshot(),
+        alleged_schema.format_snapshot(),
+    );
+
+    let required_fields = ScanDatasetManifestDataframe::min_schema().fields().to_vec();
+    assert!(
+        batch.schema().fields().contains_unordered(&required_fields),
+        "the schema should contain all the required fields, but it doesn't",
+    );
+
+    let unstable_column_names = vec![
+        // implementation-dependent
+        ScanDatasetManifestDataframe::COLUMN_RERUN_STORAGE_URL_NAME,
+        ScanDatasetManifestDataframe::COLUMN_RERUN_SIZE_BYTES_NAME,
+        // unstable
+        ScanDatasetManifestDataframe::COLUMN_RERUN_LAST_UPDATED_AT_NAME,
+        ScanDatasetManifestDataframe::COLUMN_RERUN_REGISTRATION_TIME_NAME,
+    ];
+    let filtered_batch = batch
+        .remove_columns(&unstable_column_names)
+        .auto_sort_rows()
+        .unwrap()
+        .sort_property_columns();
+
+    insta::assert_snapshot!(
+        format!("{snapshot_name}_response_schema"),
+        batch.format_schema_snapshot()
+    );
+    insta::assert_snapshot!(
+        format!("{snapshot_name}_response_data"),
+        filtered_batch.format_snapshot(false)
+    );
+}
+
+async fn find_chunks_snapshot(
+    service: &impl RerunCloudService,
+    dataset_name: &str,
+    snapshot_name: &str,
+) {
+    use futures::StreamExt as _;
+
+    // An unbounded Range on the fixture's `frame_nr` timeline selects every temporal and
+    // static chunk.
+    let find_chunks_request = FindChunksRequest {
+        contents: ContentSelection::All,
+        mode: ChunkMode::Range {
+            segments: SegmentSelection::All,
+            range: RangeSelection {
+                timeline: "frame_nr".into(),
+                start_inclusive: None,
+                end_inclusive: None,
+                fill_mode: FillMode::None,
+            },
+        },
+        direct_url_mode: re_protos::cloud::v1alpha1::ext::DirectUrlMode::Omit,
+        scope: re_protos::cloud::v1alpha1::DatasetQueryScope::Full,
+    };
+
+    let chunk_info = service
+        .find_chunks(
+            tonic::Request::new(find_chunks_request.into())
+                .with_entry_name(entry_name(dataset_name)),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .flat_map(|resp| futures::stream::iter(resp.unwrap().data))
+        .map(|dfp| dfp.try_into().unwrap())
+        .collect::<Vec<_>>()
+        .await;
+
+    let merged_chunk_info = concat_record_batches(&chunk_info);
+
+    // these are the only columns guaranteed to be returned by `find_chunks`
+    let required_field = ChunkCandidatesDataframe::min_schema().fields().to_vec();
+
+    assert!(
+        merged_chunk_info
+            .schema()
+            .fields()
+            .contains_unordered(&required_field),
+        "find_chunks must return all guaranteed fields\nExpected: {:#?}\nGot: {:#?}",
+        required_field,
+        merged_chunk_info.schema().fields(),
+    );
+
+    let required_column_names = required_field
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect::<Vec<_>>();
+    let required_chunk_info = merged_chunk_info
+        .project_columns(required_column_names.iter().copied())
+        .unwrap();
+
+    insta::assert_snapshot!(
+        format!("{snapshot_name}_schema"),
+        required_chunk_info.format_schema_snapshot()
+    );
+
+    // these columns are not stable, so we cannot snapshot them
+    let filtered_chunk_info = required_chunk_info
+        .remove_columns(&[
+            ChunkCandidatesDataframe::COLUMN_CHUNK_KEY_NAME,
+            ChunkCandidatesDataframe::COLUMN_CHUNK_BYTE_LEN_NAME,
+            ChunkCandidatesDataframe::COLUMN_CHUNK_BYTE_SIZE_UNCOMPRESSED_NAME,
+        ])
+        .auto_sort_rows()
+        .unwrap();
+
+    insta::assert_snapshot!(
+        format!("{snapshot_name}_data"),
+        filtered_chunk_info.format_snapshot(false)
+    );
+}
+
+/// Removes index-range columns, such as `frame_nr:start` and `frame_nr:end`.
+///
+/// These snapshots check which segments and layers survive unregistration, not index ranges.
+fn filter_out_index_ranges(batch: RecordBatch) -> RecordBatch {
+    batch
+        .filter_columns_by(|f| f.metadata().get("rerun:index_marker").is_none())
+        .unwrap()
+}
+
+async fn get_dataset_updated_at_nanos(service: &impl RerunCloudService, dataset_name: &str) -> i64 {
+    service
+        .read_dataset_entry(
+            tonic::Request::new(ReadDatasetEntryRequest {})
+                .with_entry_name(entry_name(dataset_name)),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .dataset
+        .unwrap()
+        .details
+        .as_ref()
+        .unwrap()
+        .updated_at
+        .as_ref()
+        .map(|ts| ts.seconds * 1_000_000_000 + ts.nanos as i64)
+        .unwrap()
+}

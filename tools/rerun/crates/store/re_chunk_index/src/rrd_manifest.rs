@@ -1,0 +1,955 @@
+use std::collections::BTreeSet;
+use std::sync::{Arc, OnceLock};
+
+use arrow::array::RecordBatch;
+use re_chunk::external::nohash_hasher::IntMap;
+use re_chunk::{ChunkId, ComponentIdentifier, EntityPath};
+use re_log_types::StoreId;
+use re_sorbet::{SchemaId, SorbetSchema};
+use re_types_core::{LayerName, SegmentId};
+
+use crate::{
+    ChunkIndexError, ChunkIndexResult, RawRrdManifest, RrdManifestStaticMap, RrdManifestTemporalMap,
+};
+
+/// Concatenates one typed column per manifest, keeping the logical type and the column name.
+fn concat_columns<'a, L: quiver::LogicalType + 'a>(
+    columns: impl IntoIterator<Item = &'a quiver::Column<L>>,
+) -> ChunkIndexResult<quiver::Column<L>> {
+    let columns = columns.into_iter().collect::<Vec<_>>();
+
+    let Some(first_column) = columns.first() else {
+        return Err(ChunkIndexError::Merge(
+            "concat_columns: no columns to concatenate".to_owned(),
+        ));
+    };
+    // Each input is the same column of a different manifest, so they should all carry the same name.
+    let name = first_column.name().to_owned();
+
+    let arrays: Vec<&dyn arrow::array::Array> = columns
+        .iter()
+        .map(|column| column.as_arrow().as_ref())
+        .collect();
+
+    let concatenated = re_arrow_util::concat_arrays(&arrays)
+        .map_err(|err| ChunkIndexError::Merge(format!("concat {name:?}: {err}")))?;
+
+    quiver::Column::try_new(name.as_str(), concatenated)
+        .map_err(|err| ChunkIndexError::Merge(format!("concat {name:?}: {err}")))
+}
+
+/// The heap size of a column's arrow array.
+fn column_heap_size_bytes<L: quiver::LogicalType>(column: &quiver::Column<L>) -> u64 {
+    re_byte_size::SizeBytes::heap_size_bytes(column.as_arrow().as_ref())
+}
+
+/// A pre-validated and parsed [`RawRrdManifest`].
+///
+/// This struct provides a more ergonomic interface to access manifest data without
+/// having to handle `ChunkIndexResult` errors on every access. All validation and column
+/// extraction is performed during construction.
+///
+/// The Arrow arrays stored here are clones of those in the underlying manifest,
+/// but since Arrow uses `Arc` internally, this is just a reference count increment
+/// and does not duplicate the actual data.
+///
+/// Use [`RrdManifest::try_new`] to create an instance from a [`RawRrdManifest`].
+#[derive(Clone)]
+pub struct RrdManifest {
+    // NOTE: the `chunk_fetcher_rb` only contains the columns listed in
+    // [`Self::CHUNK_FETCHER_COLUMNS`]. All other manifest columns are pre-extracted
+    // into the typed fields below (or into the static/temporal maps).
+    chunk_fetcher_rb: RecordBatch,
+
+    store_id: StoreId,
+    recording_schema: SorbetSchema,
+    sorbet_schema: arrow::datatypes::Schema,
+
+    /// Hash of `sorbet_schema`, to compare two schemas without walking their fields.
+    /// See [`RawRrdManifest::compute_sorbet_schema_sha256`].
+    sorbet_schema_sha256: SchemaId,
+
+    /// False once a merge kept the schema of the first part because the schemas of the parts
+    /// could not be unified.
+    schema_covers_all_chunks: bool,
+
+    chunk_ids: quiver::Column<ChunkId>,
+    chunk_entity_paths: quiver::Column<EntityPath>,
+    chunk_is_static: quiver::Column<bool>,
+    chunk_num_rows: quiver::Column<u64>,
+    chunk_byte_offsets: quiver::Column<u64>,
+    chunk_byte_sizes: quiver::Column<u64>,
+    chunk_byte_sizes_uncompressed: quiver::Column<u64>,
+
+    /// The values are optional: merging a keyed manifest with an unkeyed one leaves nulls behind.
+    chunk_keys: Option<quiver::Column<Option<quiver::Binary>>>,
+
+    static_data_map: RrdManifestStaticMap,
+    temporal_data_map: RrdManifestTemporalMap,
+
+    /// Row of every chunk, keyed by id; see [`Self::chunk_row`].
+    ///
+    /// Built on first use: it costs one hash entry per chunk, and most holders of a manifest
+    /// never look chunks up by id.
+    chunk_rows: OnceLock<ahash::HashMap<ChunkId, usize>>,
+
+    /// The layers of every component on every entity; see [`Self::layers_of_component`].
+    component_layers: IntMap<EntityPath, IntMap<ComponentIdentifier, BTreeSet<SegmentLayer>>>,
+}
+
+/// A layer of a segment that chunks in a manifest come from.
+///
+/// In the manifest of a dataset segment, chunks of an asset have the asset's segment id.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SegmentLayer {
+    pub segment_id: SegmentId,
+    pub layer: LayerName,
+}
+
+impl re_byte_size::SizeBytes for SegmentLayer {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self { segment_id, layer } = self;
+        segment_id.heap_size_bytes() + layer.heap_size_bytes()
+    }
+}
+
+/// The schema of [`RrdManifest::merge`].
+struct MergedSchema {
+    recording_schema: SorbetSchema,
+    sorbet_schema: arrow::datatypes::Schema,
+
+    /// Hash of `sorbet_schema`.
+    /// See [`RawRrdManifest::compute_sorbet_schema_sha256`].
+    sorbet_schema_sha256: SchemaId,
+
+    /// False when the schemas of the parts could not be unified and the schema of the first part
+    /// was kept, or when a part's own schema already did not cover all its chunks.
+    covers_all_chunks: bool,
+}
+
+impl PartialEq for RrdManifest {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructure to get a compile error when new fields are added,
+        // ensuring we consciously decide whether to include them.
+        let Self {
+            chunk_fetcher_rb,
+            store_id,
+            recording_schema,
+            // We skip `sorbet_schema` (the raw `arrow::datatypes::Schema`) because it is
+            // redundant with `recording_schema` for semantic equality, and its field order
+            // is not preserved through protobuf round-trips. Its hash is skipped along with it.
+            sorbet_schema: _,
+            sorbet_schema_sha256: _,
+            schema_covers_all_chunks: _,
+            chunk_ids,
+            chunk_entity_paths,
+            chunk_is_static,
+            chunk_num_rows,
+            chunk_byte_offsets,
+            chunk_byte_sizes,
+            chunk_byte_sizes_uncompressed,
+            chunk_keys,
+            static_data_map,
+            temporal_data_map,
+            chunk_rows: _,       // derived from `chunk_ids`
+            component_layers: _, // derived from the layer column and the data maps
+        } = self;
+
+        *chunk_fetcher_rb == other.chunk_fetcher_rb
+            && *store_id == other.store_id
+            && *recording_schema == other.recording_schema
+            && *chunk_ids == other.chunk_ids
+            && *chunk_entity_paths == other.chunk_entity_paths
+            && *chunk_is_static == other.chunk_is_static
+            && *chunk_num_rows == other.chunk_num_rows
+            && *chunk_byte_offsets == other.chunk_byte_offsets
+            && *chunk_byte_sizes == other.chunk_byte_sizes
+            && *chunk_byte_sizes_uncompressed == other.chunk_byte_sizes_uncompressed
+            && *chunk_keys == other.chunk_keys
+            && *static_data_map == other.static_data_map
+            && *temporal_data_map == other.temporal_data_map
+    }
+}
+
+impl std::fmt::Debug for RrdManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RrdManifest").finish_non_exhaustive()
+    }
+}
+
+impl re_byte_size::SizeBytes for RrdManifest {
+    fn heap_size_bytes(&self) -> u64 {
+        re_tracing::profile_function!();
+
+        let Self {
+            chunk_fetcher_rb,
+            store_id: _,
+            recording_schema: _, // same fields as `sorbet_schema`
+            sorbet_schema,
+            sorbet_schema_sha256: _,
+            schema_covers_all_chunks: _,
+            chunk_ids,
+            chunk_entity_paths,
+            chunk_is_static,
+            chunk_num_rows,
+            chunk_byte_offsets,
+            chunk_byte_sizes,
+            chunk_byte_sizes_uncompressed,
+            chunk_keys,
+            static_data_map,
+            temporal_data_map,
+            chunk_rows,
+            component_layers,
+        } = self;
+
+        // The columns that are also in `chunk_fetcher_rb` can share their buffers with it,
+        // in which case this counts them twice.
+        chunk_fetcher_rb.heap_size_bytes()
+            + column_heap_size_bytes(chunk_ids)
+            + column_heap_size_bytes(chunk_entity_paths)
+            + column_heap_size_bytes(chunk_is_static)
+            + column_heap_size_bytes(chunk_byte_offsets)
+            + chunk_keys.as_ref().map_or(0, column_heap_size_bytes)
+            + column_heap_size_bytes(chunk_num_rows)
+            + column_heap_size_bytes(chunk_byte_sizes)
+            + column_heap_size_bytes(chunk_byte_sizes_uncompressed)
+            + sorbet_schema.heap_size_bytes()
+            + static_data_map.heap_size_bytes()
+            + temporal_data_map.heap_size_bytes()
+            + chunk_rows.get().map_or(0, |rows| rows.heap_size_bytes())
+            + component_layers.heap_size_bytes()
+    }
+}
+
+// Columns retained in the pruned `chunk_fetcher_rb`.
+//
+// The full manifest can have 1000+ sparse columns (one per timeline x component pair).
+// After extracting all indexing data into typed fields and maps, we prune the
+// `RecordBatch` down to only the columns needed for chunk fetching. This list is the
+// single source of truth for which columns survive that pruning — it is used by
+// [`RawRrdManifest::chunk_fetcher_record_batch`] to do the pruning, and should be
+// referenced by any code that accesses the pruned batch (e.g. sorting, sending over gRPC).
+impl RrdManifest {
+    pub const COLUMN_CHUNK_ID: quiver::ColumnDesc<ChunkId> = RawRrdManifest::COLUMN_CHUNK_ID;
+    pub const COLUMN_CHUNK_KEY: quiver::ColumnDesc<quiver::Binary> =
+        RawRrdManifest::COLUMN_CHUNK_KEY;
+    pub const COLUMN_CHUNK_IS_STATIC: quiver::ColumnDesc<bool> =
+        RawRrdManifest::COLUMN_CHUNK_IS_STATIC;
+    pub const COLUMN_CHUNK_BYTE_OFFSET: quiver::ColumnDesc<u64> =
+        RawRrdManifest::COLUMN_CHUNK_BYTE_OFFSET;
+    pub const COLUMN_CHUNK_PARTITION_ID: quiver::ColumnDesc<re_types_core::SegmentId> =
+        RawRrdManifest::COLUMN_CHUNK_PARTITION_ID;
+    pub const COLUMN_RERUN_PARTITION_LAYER: quiver::ColumnDesc<re_types_core::LayerName> =
+        RawRrdManifest::COLUMN_RERUN_PARTITION_LAYER;
+
+    /// All columns present in the pruned batch returned by [`Self::chunk_fetcher_rb()`].
+    pub const CHUNK_FETCHER_COLUMNS: &[&str] = &[
+        Self::COLUMN_CHUNK_ID.name,
+        Self::COLUMN_CHUNK_KEY.name,
+        Self::COLUMN_CHUNK_IS_STATIC.name,
+        Self::COLUMN_CHUNK_BYTE_OFFSET.name,
+        Self::COLUMN_CHUNK_PARTITION_ID.name,
+        Self::COLUMN_RERUN_PARTITION_LAYER.name,
+    ];
+}
+
+impl RrdManifest {
+    /// Creates a new [`RrdManifest`].
+    ///
+    /// This validates the manifest and extracts all columns. If validation fails
+    /// or any required column is missing/malformed, an error is returned.
+    ///
+    /// All arrays must be non-null (no missing values).
+    pub fn try_new(manifest: &RawRrdManifest) -> ChunkIndexResult<Self> {
+        re_tracing::profile_function!();
+
+        manifest.sanity_check_cheap()?;
+        if cfg!(debug_assertions) {
+            manifest.sanity_check_heavy()?;
+        }
+
+        let chunk_ids = manifest.col_chunk_id()?;
+        let chunk_entity_paths = manifest.col_chunk_entity_path()?;
+        let chunk_is_static = manifest.col_chunk_is_static()?;
+        let chunk_num_rows = manifest.col_chunk_num_rows()?;
+        let chunk_byte_offsets = manifest.col_chunk_byte_offset()?;
+        let chunk_byte_sizes = manifest.col_chunk_byte_size()?;
+        let chunk_byte_sizes_uncompressed = manifest.col_chunk_byte_size_uncompressed()?;
+
+        // The chunk-key column is optional: local RRDs have no keys, and merging a keyed manifest
+        // with an unkeyed one leaves nulls behind. A column that is present but malformed is an
+        // error though, not a manifest without keys.
+        let chunk_keys = manifest
+            .data
+            .schema_ref()
+            .column_with_name(RawRrdManifest::COLUMN_CHUNK_KEY.name)
+            .is_some()
+            .then(|| manifest.col_chunk_key())
+            .transpose()?;
+
+        let static_data_map = manifest.calc_static_map()?;
+        let temporal_data_map = manifest.calc_temporal_map()?;
+
+        let mut recording_schema =
+            SorbetSchema::try_from_raw_arrow_schema(Arc::new(manifest.sorbet_schema.clone()))?;
+        // Sort columns so that PartialEq is stable across protobuf round-trips,
+        // which do not preserve column ordering.
+        recording_schema.sort_columns();
+
+        let pruned_batch = manifest.chunk_fetcher_record_batch();
+
+        let mut parsed = Self {
+            chunk_fetcher_rb: pruned_batch,
+            store_id: manifest.store_id.clone(),
+            recording_schema,
+            sorbet_schema: manifest.sorbet_schema.clone(),
+            sorbet_schema_sha256: manifest.sorbet_schema_sha256,
+            schema_covers_all_chunks: true,
+            chunk_ids,
+            chunk_entity_paths,
+            chunk_is_static,
+            chunk_num_rows,
+            chunk_byte_offsets,
+            chunk_byte_sizes,
+            chunk_byte_sizes_uncompressed,
+            chunk_keys,
+            static_data_map,
+            temporal_data_map,
+            chunk_rows: OnceLock::new(),
+            component_layers: IntMap::default(),
+        };
+        parsed.component_layers = parsed.collect_component_layers();
+
+        Ok(parsed)
+    }
+
+    /// The schema for the entire recording.
+    pub fn recording_schema(&self) -> &SorbetSchema {
+        &self.recording_schema
+    }
+
+    /// The chunk fetcher batches of every manifest, concatenated in the given order.
+    ///
+    /// See [`Self::CHUNK_FETCHER_COLUMNS`] for the columns these pruned batches keep.
+    fn concat_chunk_fetcher_rb(manifests: &[&Self]) -> ChunkIndexResult<RecordBatch> {
+        re_tracing::profile_function!();
+
+        let first = manifests
+            .first()
+            .ok_or_else(|| ChunkIndexError::Merge("No manifests to concatenate".to_owned()))?;
+
+        if manifests.len() == 1 {
+            return Ok(first.chunk_fetcher_rb.clone());
+        }
+
+        let any_has_chunk_keys = manifests.iter().any(|m| m.chunk_keys.is_some());
+
+        // When some manifests have `chunk_key` and others don't, we must normalize
+        // the schemas before calling `concat_batches` (which requires matching schemas).
+        let normalized_batches: Vec<RecordBatch>;
+        let batches_to_concat: Vec<&RecordBatch> =
+            if any_has_chunk_keys && manifests.iter().any(|m| m.chunk_keys.is_none()) {
+                // Some have chunk_key, some don't — normalize by adding a null column.
+                normalized_batches = manifests
+                    .iter()
+                    .map(|m| {
+                        if m.chunk_keys.is_some() {
+                            m.chunk_fetcher_rb.clone()
+                        } else {
+                            Self::add_null_chunk_key_column(&m.chunk_fetcher_rb)
+                        }
+                    })
+                    .collect();
+                normalized_batches.iter().collect()
+            } else {
+                manifests.iter().map(|m| &m.chunk_fetcher_rb).collect()
+            };
+
+        let combined_schema = batches_to_concat
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| first.chunk_fetcher_rb.schema());
+
+        arrow::compute::concat_batches(&combined_schema, batches_to_concat).map_err(|err| {
+            ChunkIndexError::Merge(format!("Failed to concatenate RRD manifest parts: {err}"))
+        })
+    }
+
+    /// The schema covering the columns of every manifest, and its hash.
+    ///
+    /// Manifests that share a schema keep it as it is. Ones that do not have their columns unified,
+    /// so the entities and components of all of them can be read off the result. The metadata stays
+    /// that of the first manifest.
+    ///
+    /// Manifests that disagree on the type of a column they both have cannot be unified. The schema
+    /// of the first is then used as it is, with a warning, and no longer covers all chunks.
+    fn merge_schemas(manifests: &[&Self]) -> ChunkIndexResult<MergedSchema> {
+        let first = manifests
+            .first()
+            .ok_or_else(|| ChunkIndexError::Merge("No manifests to concatenate".to_owned()))?;
+
+        let all_parts_cover_their_chunks = manifests.iter().all(|m| m.schema_covers_all_chunks);
+        let schema_of_first = |covers_all_chunks| MergedSchema {
+            recording_schema: first.recording_schema.clone(),
+            sorbet_schema: first.sorbet_schema.clone(),
+            sorbet_schema_sha256: first.sorbet_schema_sha256,
+            covers_all_chunks,
+        };
+
+        if manifests
+            .iter()
+            .all(|m| m.sorbet_schema_sha256 == first.sorbet_schema_sha256)
+        {
+            return Ok(schema_of_first(all_parts_cover_their_chunks));
+        }
+
+        re_tracing::profile_function!();
+
+        match Self::unify_columns(manifests) {
+            Ok(mut unified) => {
+                unified.covers_all_chunks = all_parts_cover_their_chunks;
+                Ok(unified)
+            }
+            Err(err) => {
+                re_log::warn_once!(
+                    "Failed to merge the schemas of the manifests, using the first one: {err}"
+                );
+                Ok(schema_of_first(false))
+            }
+        }
+    }
+
+    /// The columns of every manifest in one schema, with the metadata of the first.
+    fn unify_columns(manifests: &[&Self]) -> ChunkIndexResult<MergedSchema> {
+        let first = manifests
+            .first()
+            .ok_or_else(|| ChunkIndexError::Merge("No manifests to concatenate".to_owned()))?;
+
+        let mut merger = re_arrow_util::SchemaFieldsMerger::default();
+        for manifest in manifests {
+            merger = merger.try_merge(&manifest.sorbet_schema).map_err(|err| {
+                ChunkIndexError::Merge(format!("Failed to merge manifest schemas: {err}"))
+            })?;
+        }
+        let sorbet_schema = merger
+            .finish()
+            .with_metadata(first.sorbet_schema.metadata.clone());
+
+        let sorbet_schema_sha256 = RawRrdManifest::compute_sorbet_schema_sha256(&sorbet_schema)
+            .map_err(ChunkIndexError::ArrowSerialization)?;
+
+        let mut recording_schema =
+            SorbetSchema::try_from_raw_arrow_schema(Arc::new(sorbet_schema.clone()))?;
+        // Sorted for the same reason as in `try_new`: to keep `PartialEq` stable.
+        recording_schema.sort_columns();
+
+        Ok(MergedSchema {
+            recording_schema,
+            sorbet_schema,
+            sorbet_schema_sha256,
+            covers_all_chunks: true,
+        })
+    }
+
+    /// One manifest describing every chunk of every part, in the given order.
+    ///
+    /// The parts can be the pieces of one segment's manifest, or the manifests of several
+    /// segments. The store id is that of the first part, and the schema covers the columns of all
+    /// of them.
+    pub fn merge(manifests: &[&Self]) -> ChunkIndexResult<Self> {
+        re_tracing::profile_function!();
+
+        let first = manifests
+            .first()
+            .ok_or_else(|| ChunkIndexError::Merge("No manifests to concatenate".to_owned()))?;
+
+        let any_has_chunk_keys = manifests.iter().any(|m| m.chunk_keys.is_some());
+
+        let MergedSchema {
+            recording_schema,
+            sorbet_schema,
+            sorbet_schema_sha256,
+            covers_all_chunks: schema_covers_all_chunks,
+        } = Self::merge_schemas(manifests)?;
+
+        let combined_batches = Self::concat_chunk_fetcher_rb(manifests)?;
+
+        // Concatenate pre-extracted columns directly, avoiding a round-trip through `try_new`
+        // which would fail on pruned data (missing sparse columns).
+        let chunk_ids = concat_columns(manifests.iter().map(|m| &m.chunk_ids))?;
+        let chunk_entity_paths = concat_columns(manifests.iter().map(|m| &m.chunk_entity_paths))?;
+        let chunk_is_static = concat_columns(manifests.iter().map(|m| &m.chunk_is_static))?;
+        let chunk_num_rows = concat_columns(manifests.iter().map(|m| &m.chunk_num_rows))?;
+        let chunk_byte_offsets = concat_columns(manifests.iter().map(|m| &m.chunk_byte_offsets))?;
+        let chunk_byte_sizes = concat_columns(manifests.iter().map(|m| &m.chunk_byte_sizes))?;
+        let chunk_byte_sizes_uncompressed =
+            concat_columns(manifests.iter().map(|m| &m.chunk_byte_sizes_uncompressed))?;
+
+        // When some manifests have chunk keys and others don't, the keyless ones contribute
+        // all-null columns, to keep the rows aligned.
+        //
+        let null_keys: Vec<quiver::Column<Option<quiver::Binary>>> = manifests
+            .iter()
+            .filter(|m| m.chunk_keys.is_none())
+            .map(|m| {
+                RawRrdManifest::COLUMN_CHUNK_KEY
+                    .optional()
+                    .new_null(m.num_chunks())
+            })
+            .collect();
+        let mut null_keys = null_keys.iter();
+        let chunk_keys = any_has_chunk_keys
+            .then(|| {
+                let columns = manifests.iter().map(|m| {
+                    m.chunk_keys
+                        .as_ref()
+                        .or_else(|| null_keys.next())
+                        .ok_or_else(|| {
+                            ChunkIndexError::Merge(
+                                "concat chunk_keys: row count mismatch".to_owned(),
+                            )
+                        })
+                });
+                concat_columns(columns.collect::<ChunkIndexResult<Vec<_>>>()?)
+            })
+            .transpose()?;
+
+        // Merge pre-computed maps.
+        let mut static_data_map = first.static_data_map.clone();
+        for m in &manifests[1..] {
+            for (entity, components) in &m.static_data_map {
+                let entry = static_data_map.entry(entity.clone()).or_default();
+                for (component, chunk_id) in components {
+                    entry
+                        .entry(*component)
+                        .and_modify(|id| *id = *chunk_id)
+                        .or_insert(*chunk_id);
+                }
+            }
+        }
+
+        let mut temporal_data_map = first.temporal_data_map.clone();
+        for m in &manifests[1..] {
+            for (entity, timelines) in &m.temporal_data_map {
+                let entity_entry = temporal_data_map.entry(entity.clone()).or_default();
+                for (timeline, components) in timelines {
+                    let timeline_entry = entity_entry.entry(*timeline).or_default();
+                    for (component, chunks) in components {
+                        let component_entry = timeline_entry.entry(*component).or_default();
+                        for (chunk_id, map_entry) in chunks {
+                            component_entry.insert(*chunk_id, *map_entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut merged = Self {
+            chunk_fetcher_rb: combined_batches,
+            store_id: first.store_id.clone(),
+            recording_schema,
+            sorbet_schema,
+            sorbet_schema_sha256,
+            schema_covers_all_chunks,
+            chunk_ids,
+            chunk_entity_paths,
+            chunk_is_static,
+            chunk_num_rows,
+            chunk_byte_offsets,
+            chunk_byte_sizes,
+            chunk_byte_sizes_uncompressed,
+            chunk_keys,
+            static_data_map,
+            temporal_data_map,
+            chunk_rows: OnceLock::new(),
+            component_layers: IntMap::default(),
+        };
+        merged.component_layers = merged.collect_component_layers();
+
+        Ok(merged)
+    }
+
+    /// Builds an [`RrdManifest`] for in-memory chunks (useful for tests).
+    ///
+    /// This is a convenience wrapper around [`RawRrdManifest::build_in_memory_from_chunks`].
+    ///
+    /// Chunk offsets will start at 0 and increment from there according to their heap size.
+    /// There are no chunk keys whatsoever.
+    pub fn build_in_memory_from_chunks<'a>(
+        store_id: StoreId,
+        chunks: impl Iterator<Item = &'a re_chunk::Chunk>,
+    ) -> ChunkIndexResult<Arc<Self>> {
+        let raw = RawRrdManifest::build_in_memory_from_chunks(store_id, chunks)?;
+        Ok(Arc::new(Self::try_new(&raw)?))
+    }
+
+    /// Returns the store ID this manifest belongs to.
+    #[inline]
+    pub fn store_id(&self) -> &StoreId {
+        &self.store_id
+    }
+
+    /// Returns the number of chunks (rows) in this manifest.
+    #[inline]
+    pub fn num_chunks(&self) -> usize {
+        self.chunk_ids.len()
+    }
+
+    /// Returns the Sorbet schema of the recording.
+    #[inline]
+    pub fn sorbet_schema(&self) -> &arrow::datatypes::Schema {
+        &self.sorbet_schema
+    }
+
+    /// The hash of [`Self::sorbet_schema`], see [`RawRrdManifest::compute_sorbet_schema_sha256`].
+    ///
+    /// Two manifests with the same hash only describe the same columns if
+    /// [`Self::schema_covers_all_chunks`] is true for both.
+    #[inline]
+    pub fn sorbet_schema_sha256(&self) -> SchemaId {
+        self.sorbet_schema_sha256
+    }
+
+    /// Whether [`Self::sorbet_schema`] has the columns of every chunk in the manifest.
+    ///
+    /// False when [`Self::merge`] could not unify the schemas of its parts and kept the schema of
+    /// the first one.
+    #[inline]
+    pub fn schema_covers_all_chunks(&self) -> bool {
+        self.schema_covers_all_chunks
+    }
+
+    /// Returns the `RecordBatch` with only the columns needed to do a `FetchChunk` request.
+    ///
+    /// See [`Self::CHUNK_FETCHER_COLUMNS`].
+    #[inline]
+    pub fn chunk_fetcher_rb(&self) -> &arrow::array::RecordBatch {
+        &self.chunk_fetcher_rb
+    }
+
+    /// Returns all the chunk ids
+    #[inline]
+    pub fn col_chunk_ids(&self) -> &[ChunkId] {
+        self.chunk_ids.as_slice()
+    }
+
+    /// The row of a chunk in this manifest, or `None` if the chunk is not part of it.
+    ///
+    /// The lookup is built on the first call and kept, so reading a manifest's chunks in many
+    /// batches pays for it once, not once per batch.
+    pub fn chunk_row(&self, chunk_id: ChunkId) -> Option<usize> {
+        let rows = self.chunk_rows.get_or_init(|| {
+            re_tracing::profile_scope!("RrdManifest::chunk_rows");
+            self.col_chunk_ids()
+                .iter()
+                .enumerate()
+                .map(|(row, &id)| (id, row))
+                .collect()
+        });
+        rows.get(&chunk_id).copied()
+    }
+
+    /// Returns the chunk id column of a batch that has a [`Self::COLUMN_CHUNK_ID`] column.
+    ///
+    /// Use [`quiver::Column::as_slice`] for a zero-copy `&[ChunkId]` view of the result.
+    pub fn col_chunk_ids_of(batch: &RecordBatch) -> Option<quiver::Column<ChunkId>> {
+        Self::COLUMN_CHUNK_ID.extract(batch).ok()
+    }
+
+    /// Returns the entity path column.
+    #[inline]
+    pub fn col_chunk_entity_path(&self) -> &quiver::Column<EntityPath> {
+        &self.chunk_entity_paths
+    }
+
+    /// Returns an iterator over the decoded Arrow data for the entity path column.
+    ///
+    /// This might incur interning costs, but is otherwise basically free.
+    pub fn col_chunk_entity_path_iter(&self) -> impl Iterator<Item = EntityPath> {
+        self.chunk_entity_paths.iter_owned()
+    }
+
+    /// Returns the is-static column.
+    #[inline]
+    pub fn col_chunk_is_static(&self) -> &quiver::Column<bool> {
+        &self.chunk_is_static
+    }
+
+    /// Returns an iterator over the is-static values.
+    #[inline]
+    pub fn col_chunk_is_static_iter(&self) -> impl Iterator<Item = bool> + '_ {
+        self.chunk_is_static.iter()
+    }
+
+    /// Returns the num-rows column.
+    #[inline]
+    pub fn col_chunk_num_rows(&self) -> &[u64] {
+        &self.chunk_num_rows
+    }
+
+    /// Returns the chunk byte offsets column.
+    #[inline]
+    pub fn col_chunk_byte_offset(&self) -> &[u64] {
+        &self.chunk_byte_offsets
+    }
+
+    /// Returns the chunk byte sizes column (compressed if applicable).
+    ///
+    /// See also the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
+    #[inline]
+    pub fn col_chunk_byte_size(&self) -> &[u64] {
+        &self.chunk_byte_sizes
+    }
+
+    /// Returns the uncompressed chunk byte sizes column.
+    ///
+    /// See also the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
+    #[inline]
+    pub fn col_chunk_byte_size_uncompressed(&self) -> &[u64] {
+        &self.chunk_byte_sizes_uncompressed
+    }
+
+    /// Returns the chunk key column, if present.
+    ///
+    /// Chunk keys are backend-specific identifiers that can be used to fetch chunk data.
+    #[inline]
+    pub fn col_chunk_key(&self) -> Option<&quiver::Column<Option<quiver::Binary>>> {
+        self.chunk_keys.as_ref()
+    }
+
+    /// The segment each chunk comes from, row-aligned with [`Self::col_chunk_ids`].
+    ///
+    /// A manifest served from a server always has this column, since `FetchChunks`
+    /// needs it. One read from an RRD file doesn't.
+    pub fn col_chunk_partition_id(&self) -> Option<quiver::Column<re_types_core::SegmentId>> {
+        Self::COLUMN_CHUNK_PARTITION_ID
+            .extract(&self.chunk_fetcher_rb)
+            .ok()
+    }
+
+    /// The layer each chunk comes from, row-aligned with [`Self::col_chunk_ids`].
+    ///
+    /// A manifest served from a server always has this column, since `FetchChunks`
+    /// needs it. One read from an RRD file doesn't.
+    pub fn col_rerun_partition_layer(&self) -> Option<quiver::Column<LayerName>> {
+        Self::COLUMN_RERUN_PARTITION_LAYER
+            .extract(&self.chunk_fetcher_rb)
+            .ok()
+    }
+
+    /// The segment layers of the chunks that hold `component` on `entity`, static or on any
+    /// timeline.
+    ///
+    /// Empty for a manifest without a layer column, like one read from an RRD file.
+    pub fn layers_of_component(
+        &self,
+        entity: &EntityPath,
+        component: ComponentIdentifier,
+    ) -> &BTreeSet<SegmentLayer> {
+        static NO_LAYERS: BTreeSet<SegmentLayer> = BTreeSet::new();
+
+        self.component_layers
+            .get(entity)
+            .and_then(|per_component| per_component.get(&component))
+            .unwrap_or(&NO_LAYERS)
+    }
+
+    /// The layers of every component on every entity, read off the segment id and layer columns
+    /// and the data maps.
+    fn collect_component_layers(
+        &self,
+    ) -> IntMap<EntityPath, IntMap<ComponentIdentifier, BTreeSet<SegmentLayer>>> {
+        re_tracing::profile_function!();
+
+        let (Some(segment_ids), Some(layers)) = (
+            self.col_chunk_partition_id(),
+            self.col_rerun_partition_layer(),
+        ) else {
+            return IntMap::default();
+        };
+        let layer_of = |chunk_id: &ChunkId| {
+            let row = self.chunk_row(*chunk_id)?;
+            Some(SegmentLayer {
+                segment_id: segment_ids.get_owned(row)?,
+                layer: layers.get_owned(row)?,
+            })
+        };
+
+        let mut component_layers: IntMap<EntityPath, IntMap<ComponentIdentifier, BTreeSet<_>>> =
+            IntMap::default();
+
+        for (entity, per_component) in &self.static_data_map {
+            let entity_layers = component_layers.entry(entity.clone()).or_default();
+            for (component, chunk_id) in per_component {
+                if let Some(layer) = layer_of(chunk_id) {
+                    entity_layers.entry(*component).or_default().insert(layer);
+                }
+            }
+        }
+
+        for (entity, per_timeline) in &self.temporal_data_map {
+            let entity_layers = component_layers.entry(entity.clone()).or_default();
+            for per_component in per_timeline.values() {
+                for (component, per_chunk) in per_component {
+                    let layers_of_component = entity_layers.entry(*component).or_default();
+                    layers_of_component.extend(per_chunk.keys().filter_map(layer_of));
+                }
+            }
+        }
+
+        component_layers
+    }
+
+    /// Returns the map-based representation of the static data in this RRD manifest.
+    #[inline]
+    pub fn static_map(&self) -> &RrdManifestStaticMap {
+        &self.static_data_map
+    }
+
+    /// Returns the map-based representation of the temporal data in this RRD manifest.
+    #[inline]
+    pub fn temporal_map(&self) -> &RrdManifestTemporalMap {
+        &self.temporal_data_map
+    }
+
+    /// Add an all-null `chunk_key` column to a `RecordBatch` that doesn't have one.
+    ///
+    /// Used by [`Self::merge`] to normalize schemas when some manifests have chunk keys
+    /// and others don't.
+    fn add_null_chunk_key_column(batch: &RecordBatch) -> RecordBatch {
+        let num_rows = batch.num_rows();
+
+        let schema = batch.schema();
+        let mut fields: Vec<_> = schema.fields().iter().cloned().collect();
+        let mut columns: Vec<_> = batch.columns().to_vec();
+
+        // The field comes off the same descriptor as the array, so the two cannot disagree.
+        // It is nullable because every row of the added column is null.
+        let (field, array) = Self::COLUMN_CHUNK_KEY
+            .optional()
+            .new_null(num_rows)
+            .into_dyn()
+            .into_parts();
+        fields.push(field);
+        columns.push(array);
+
+        RecordBatch::try_new_with_options(
+            Arc::new(arrow::datatypes::Schema::new_with_metadata(
+                fields,
+                schema.metadata().clone(),
+            )),
+            columns,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )
+        .expect("adding a null column to a valid batch should not fail")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use re_chunk::{Chunk, RowId, TimePoint, Timeline};
+    use re_log_types::StoreKind;
+    use re_log_types::example_components::{MyColor, MyPoint, MyPoints};
+
+    use super::*;
+
+    /// A manifest of the given chunks, with segment id and layer columns naming `segment_layer`
+    /// on every row, or without those columns for `None`.
+    fn manifest_of_layer(segment_layer: Option<(&str, &str)>, chunks: &[Chunk]) -> RrdManifest {
+        let store_id = StoreId::new(StoreKind::Recording, "app", "segment");
+        let raw = RawRrdManifest::build_in_memory_from_chunks(store_id, chunks.iter()).unwrap();
+
+        let Some((segment_id, layer)) = segment_layer else {
+            return RrdManifest::try_new(&raw).unwrap();
+        };
+
+        let num_rows = raw.data.num_rows();
+        let raw = raw
+            .with_segment_layers(
+                std::iter::repeat_n(segment_id, num_rows),
+                std::iter::repeat_n(layer, num_rows),
+            )
+            .unwrap();
+
+        RrdManifest::try_new(&raw).unwrap()
+    }
+
+    /// A base layer logs points and colors over time, a second layer adds static points to the
+    /// same entity, and an asset adds static colors. Merged, the points come from both layers of
+    /// the segment and the colors from the base layer and the asset. A manifest without a layer
+    /// column has no layers for any component.
+    #[test]
+    fn layers_of_component_across_merged_layers() {
+        let entity_path = EntityPath::from("points");
+        let timeline = Timeline::new_sequence("frame");
+        let point = MyPoint::new(1.0, 1.0);
+
+        let base_chunk = Chunk::builder(entity_path.clone())
+            .with_component_batches(
+                RowId::new(),
+                TimePoint::from_iter([(timeline, 1)]),
+                [
+                    (MyPoints::descriptor_points(), &[point] as _),
+                    (MyPoints::descriptor_colors(), &[MyColor(0xFF0000FF)] as _),
+                ],
+            )
+            .build()
+            .unwrap();
+        let annotation_chunk = Chunk::builder(entity_path.clone())
+            .with_component_batch(
+                RowId::new(),
+                TimePoint::STATIC,
+                (MyPoints::descriptor_points(), &[point] as _),
+            )
+            .build()
+            .unwrap();
+
+        let asset_chunk = Chunk::builder(entity_path.clone())
+            .with_component_batch(
+                RowId::new(),
+                TimePoint::STATIC,
+                (MyPoints::descriptor_colors(), &[MyColor(0x00FF00FF)] as _),
+            )
+            .build()
+            .unwrap();
+
+        let base = manifest_of_layer(Some(("segment", "base")), std::slice::from_ref(&base_chunk));
+        let annotations = manifest_of_layer(
+            Some(("segment", "annotations")),
+            std::slice::from_ref(&annotation_chunk),
+        );
+        let asset = manifest_of_layer(Some(("robot", "mesh")), std::slice::from_ref(&asset_chunk));
+        let merged = RrdManifest::merge(&[&base, &annotations, &asset]).unwrap();
+
+        let points = MyPoints::descriptor_points().component;
+        let colors = MyPoints::descriptor_colors().component;
+        let layers = |names: &[(&str, &'static str)]| -> BTreeSet<SegmentLayer> {
+            names
+                .iter()
+                .map(|&(segment_id, layer)| SegmentLayer {
+                    segment_id: segment_id.into(),
+                    layer: LayerName::from(layer),
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            *merged.layers_of_component(&entity_path, points),
+            layers(&[("segment", "annotations"), ("segment", "base")])
+        );
+        assert_eq!(
+            *merged.layers_of_component(&entity_path, colors),
+            layers(&[("robot", "mesh"), ("segment", "base")])
+        );
+        assert_eq!(
+            *merged.layers_of_component(&EntityPath::from("unknown"), points),
+            layers(&[])
+        );
+
+        let without_layers = manifest_of_layer(None, &[base_chunk, annotation_chunk]);
+        assert_eq!(
+            *without_layers.layers_of_component(&entity_path, points),
+            layers(&[])
+        );
+    }
+}
