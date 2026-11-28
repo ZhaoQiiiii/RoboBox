@@ -2,6 +2,20 @@
 # robokit:latest 入口分发：gsplat、lidar 或 both。
 set -euo pipefail
 
+start_rerun_bridge() {
+    [ "${ROBOKIT_RERUN:-0}" = "1" ] || return 0
+    [ -e /tmp/robokit-rerun.started ] && return 0
+    touch /tmp/robokit-rerun.started
+    log_dir="${ROBOKIT_LOG_DIR:-/logs}"
+    if [ -d "$log_dir" ] && [ -w "$log_dir" ]; then
+        /opt/rerun-bridge/docker/entrypoint.sh >>"$log_dir/rerun_bridge.log" 2>&1 &
+    else
+        /opt/rerun-bridge/docker/entrypoint.sh &
+    fi
+}
+
+start_rerun_bridge
+
 tool="${1:-}"
 case "$tool" in
     gsplat)
@@ -39,6 +53,8 @@ case "$tool" in
         cleanup() {
             local status=$?
             trap - EXIT TERM INT
+            pkill -f rerun_sink.py 2>/dev/null || true
+            pkill -f ros_tee.py 2>/dev/null || true
             for pid in "$lidar_pid" "$gsplat_pid"; do
                 [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
             done

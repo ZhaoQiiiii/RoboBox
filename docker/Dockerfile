@@ -1,15 +1,5 @@
 # =====================================================================
-# RoboKit tools image: robokit:latest
-#
-# 一个镜像同时包含 GsplatRender 与 LidarRender：
-#   docker run robokit:latest gsplat /data/scene.ply
-#   docker run robokit:latest lidar  /data/scene.pcd
-#
-# Build context: runtime/RoboKit
-# =====================================================================
-
-# =====================================================================
-# Stage 1: gsplat builder —— 编译 gsplat，产出一个可整体复制的 Python 3.10 venv
+# Stage 1: gsplat builder —— 编译 gsplat
 # =====================================================================
 FROM nvidia/cuda:12.8.1-devel-ubuntu20.04 AS gsplat-builder
 
@@ -83,8 +73,54 @@ assert int(numpy_version.split('.')[0]) < 2, numpy_version; \
 import gsplat, scipy, plyfile, yaml, numpy; \
 print('renderer deps ok:', torch_version, 'numpy', numpy_version)"
 
+# Rerun sink 独立 venv：rerun-sdk 0.32 要求 numpy>=2，而 gsplat venv 锁定 numpy 1.26.4。
+RUN uv venv --python 3.10 /opt/rerun-venv && \
+    uv pip install --python /opt/rerun-venv/bin/python --no-cache \
+      rerun-sdk==0.32.0 && \
+    /opt/rerun-venv/bin/python -c "\
+from importlib.metadata import version; \
+import numpy, rerun; \
+assert version('rerun-sdk') == '0.32.0', version('rerun-sdk'); \
+assert int(numpy.__version__.split('.')[0]) >= 2, numpy.__version__; \
+print('rerun deps ok', version('rerun-sdk'), 'numpy', numpy.__version__)"
+
 # =====================================================================
-# Stage 2: runtime base —— CUDA runtime + ROS Noetic bridge + EGL/GL
+# Stage 2: lidar builder —— C++ marsim_render + TCP renderer
+# =====================================================================
+FROM ubuntu:20.04 AS lidar-builder
+
+ARG HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy
+ARG UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i "s|archive.ubuntu.com|${UBUNTU_MIRROR}|g; s|security.ubuntu.com|${UBUNTU_MIRROR}|g" /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      build-essential \
+      cmake \
+      pkg-config \
+      libeigen3-dev \
+      libpcl-dev \
+      libopencv-dev \
+      libglfw3-dev \
+      libyaml-cpp-dev \
+      libjsoncpp-dev \
+      libomp-dev \
+      libglvnd-dev \
+      libgl1-mesa-dev \
+      libegl1-mesa-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY tools/LidarRender /src/LidarRender
+RUN cmake -S /src/LidarRender -B /build \
+      -DLIDAR_RENDER_ROOT_DIR=/opt/lidar-render/marsim_render/ \
+      -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /build -j"$(nproc)"
+
+# =====================================================================
+# Stage 3: runtime base —— CUDA runtime + ROS Noetic bridge + EGL/GL
 # =====================================================================
 FROM nvidia/cuda:12.8.1-runtime-ubuntu20.04 AS robokit-runtime-base
 
@@ -151,47 +187,13 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # =====================================================================
-# Stage 3: lidar builder —— C++ marsim_render + TCP renderer
-# =====================================================================
-FROM ubuntu:20.04 AS lidar-builder
-
-ARG HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy
-ARG UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN sed -i "s|archive.ubuntu.com|${UBUNTU_MIRROR}|g; s|security.ubuntu.com|${UBUNTU_MIRROR}|g" /etc/apt/sources.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-      ca-certificates \
-      build-essential \
-      cmake \
-      pkg-config \
-      libeigen3-dev \
-      libpcl-dev \
-      libopencv-dev \
-      libglfw3-dev \
-      libyaml-cpp-dev \
-      libjsoncpp-dev \
-      libomp-dev \
-      libglvnd-dev \
-      libgl1-mesa-dev \
-      libegl1-mesa-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY tools/LidarRender /src/LidarRender
-RUN cmake -S /src/LidarRender -B /build \
-      -DLIDAR_RENDER_ROOT_DIR=/opt/lidar-render/marsim_render/ \
-      -DCMAKE_BUILD_TYPE=Release && \
-    cmake --build /build -j"$(nproc)"
-
-# =====================================================================
 # Stage 4: robokit:latest
 # =====================================================================
 FROM robokit-runtime-base AS robokit
 
 COPY --from=gsplat-builder /opt/uv-python /opt/uv-python
 COPY --from=gsplat-builder /opt/gsplat-venv /opt/gsplat-venv
+COPY --from=gsplat-builder /opt/rerun-venv /opt/rerun-venv
 
 WORKDIR /opt/gsplat-render
 COPY tools/GsplatRender/runtime/ ./runtime/
@@ -207,10 +209,12 @@ COPY tools/LidarRender/runtime/ /opt/lidar-render/runtime/
 COPY tools/LidarRender/docker/entrypoint.sh /opt/lidar-render/docker/entrypoint.sh
 COPY tools/LidarRender/README.md tools/LidarRender/README-SOURCE.md /opt/lidar-render/
 
+COPY tools/RerunBridge /opt/rerun-bridge
 COPY docker/entrypoint.sh /opt/robokit/docker/entrypoint.sh
 RUN chmod 0755 /opt/robokit/docker/entrypoint.sh \
       /opt/gsplat-render/docker/entrypoint.sh \
-      /opt/lidar-render/docker/entrypoint.sh
+      /opt/lidar-render/docker/entrypoint.sh \
+      /opt/rerun-bridge/docker/entrypoint.sh
 
 EXPOSE 19080 19081 19082 19083
 ENTRYPOINT ["/opt/robokit/docker/entrypoint.sh"]

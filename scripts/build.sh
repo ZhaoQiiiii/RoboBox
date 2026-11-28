@@ -1,13 +1,14 @@
 #!/bin/bash
-# 构建 RoboKit 统一工具镜像 robokit:latest（GsplatRender + LidarRender）。
+# 构建 RoboKit 统一工具镜像 robokit:latest
 #
 # 用法:
-#   bash docker/build.sh [--no-proxy] [--pull]
+#   bash scripts/build.sh [--no-proxy] [--pull]
 #
 # 环境变量:
 #   UBUNTU_MIRROR          默认 mirrors.tuna.tsinghua.edu.cn
 #   ROS_APT_MIRROR         默认 https://mirrors.tuna.tsinghua.edu.cn/ros/ubuntu
 #   HTTP_PROXY/HTTPS_PROXY 构建期代理；未设置时尝试 127.0.0.1:7890
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
