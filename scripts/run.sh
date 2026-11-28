@@ -283,7 +283,7 @@ done
 
 [ -n "$PLY_FILE" ] || [ -n "$PCD_FILE" ] || { usage; exit 2; }
 
-# 点云默认跟随 LidarRender 的 local 话题（ZeroSim 四足传 /go2/cloud）。
+# 点云默认跟随 LidarRender 的 local 话题（ZeroAgent 四足传 /go2/cloud）。
 [ -n "$RERUN_CLOUD_TOPICS" ] || RERUN_CLOUD_TOPICS="$LIDAR_LOCAL_TOPIC"
 
 PLY_ABS=""

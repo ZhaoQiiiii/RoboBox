@@ -33,7 +33,7 @@ bash scripts/run.sh --ply /path/to/scene.ply --pcd /path/to/scene.pcd
 - `--pcd`：激光地图，给 LidarRender，接受 `.pcd` 或点云 `.ply`（启动时转成 binary PCD）；
 - 至少给一个；只给一个时只启动对应工具；两个都给时在同一容器内并行运行；
 - 默认容器名 `robokit`，前台运行；加 `-d` 后台运行，`docker logs -f robokit` 查看日志；
-- 需要外部 ROS master 与 odom 源；ZeroSim 主链路由仓库根目录的 `scripts/run.sh` 负责启动它们并调用本目录的脚本。
+- 需要外部 ROS master 与 odom 源；ZeroAgent 主链路由仓库根目录的 `scripts/run.sh` 负责启动它们并调用本目录的脚本。
 
 ### Rerun 可视化（可选）
 
